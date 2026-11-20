@@ -1,6 +1,7 @@
-> **Branch `poc-4x-p100`: UNVERIFIED PROOF OF CONCEPT. Nobody has run it on four cards.** It adds a build for four Tesla
-> P100 behind one PCIe switch (`bash build.sh --4x`): [docs/POC-4X.md](docs/POC-4X.md). Everything else is `main` as of
-> commit `1183c37`; for the measured two-card release use the `main` branch.
+> **Branch `poc-4x-p100`: PROOF OF CONCEPT, checked on one machine only.** It adds a build for four Tesla P100 behind one
+> PCIe switch (`bash build.sh --4x`): [docs/POC-4X.md](docs/POC-4X.md). KaneQuah ran it on four P100
+> ([issue #1](https://github.com/Megla123/Scream-P100/issues/1)); with his fixes IQ3_S's output matches llama.cpp and our
+> two-card engine. Everything else is `main` as of commit `1183c37`; for the measured two-card release use the `main` branch.
 
 <div align="center">
 

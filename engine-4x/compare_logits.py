@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UNVERIFIED PROOF OF CONCEPT, nobody has run it on four cards: compares the first-token logits of two runs, for example the
+"""UNVERIFIED PROOF OF CONCEPT, its answers on four cards are not verified: compares the first-token logits of two runs, for example the
 4-card engine against the 2-card one on the same machine (docs/POC-4X.md, "Turning it into a verified build").
 
     python3 engine-4x/compare_logits.py /tmp/logits-2 /tmp/logits-4

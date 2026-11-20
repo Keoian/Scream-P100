@@ -1,12 +1,12 @@
 # Four Tesla P100 behind one PCIe switch: an unverified proof of concept
 
-> **UNVERIFIED PROOF OF CONCEPT. Nobody has run this on four cards.** We have one machine with two P100, so this build has
-> never loaded a model, never produced a token and never been timed. What we checked: `bash build.sh --4x` compiles
-> it for sm_60 (our server, CUDA 12.4, g++-13, 19 Nov 2026; `strata-split-4`, SHA-256 `2d9cef00dd7bae49`), and the new
-> gather's flags were simulated on the CPU for 2 to 8 cards (`engine-4x/sim_gather.py`). The two-card build is unchanged:
-> `engine/` is not touched and `bash build.sh` passes the same values as before. Everything below
-> about speed is an estimate from arithmetic. If you run it, the section "Turning it into a verified build" says what to
-> send back.
+> **PROOF OF CONCEPT, checked on one machine only.** We have two P100 and have not run it ourselves. KaneQuah ran it on four
+> P100 behind a PEX8748 on a chipset x4 ([issue #1](https://github.com/Megla123/Scream-P100/issues/1)): with the fixes from that run, his
+> `ff64_patch.py`, `FNX_PEER_IOMMU_TRUST` and `prompt_peer_patch.py`, IQ3_S's first-token logits matched llama.cpp and our
+> two-card engine, and it wrote as fast as our two cards ("Measured on four cards" below). Not checked: other machines,
+> UD-Q4_K_XL's exact output on four cards, the 512k profile, `FF4X=32` (below). The two-card build is unchanged: `engine/`
+> is not touched and `bash build.sh` passes the same values as before. If you run it, "Checking this version" says what
+> helps most.
 
 This is a build of our two-card engine (a Tesla P100 port of Strata's split engine, which is built from
 [sFNX](https://github.com/johnfink8/sfnx)) for one particular machine:
@@ -18,6 +18,28 @@ This is a build of our two-card engine (a Tesla P100 port of Strata's split engi
 - ISTA-DASLab's GSQ-RCO IQ3_S (the model this repository runs fastest).
 
 It lives in [`engine-4x/`](../engine-4x/README.md) and `build.sh --4x`. `engine/` and the two-card build are not changed.
+
+## Measured on four cards (KaneQuah)
+
+KaneQuah's machine ([issue #1](https://github.com/Megla123/Scream-P100/issues/1), comments 2 and 3): four Tesla P100 16 GB, each Gen3 x8 to a PEX8748 on a chipset Gen3
+x4 (3.3 GB/s for all four), 62 GiB of RAM, a translating IOMMU (`DMA-FQ`), 150 W a card, CUDA 12.9. IQ3_S, 128k,
+`FNX_PEER=1` with `FNX_PEER_IOMMU_TRUST=1` (all 12 pairs passed the probe), the 64-column FF split, `bench/bench.py`, one
+run each:
+
+| tok/s | four cards, prompt path through host memory | four cards, `FNX_PF_PEER=1` | our two cards (x16 each) |
+|---|---:|---:|---:|
+| fresh writing | 66.3 | 66.5 | 66.5 |
+| edit, Python | 109.4 | 110.7 | 110.7 |
+| edit, Markdown | 132.0 | 132.1 | 115.8 |
+| reading a 38.9k-token prompt | 338 | 889 | 1,012 |
+| writing right after that read | 38.7 | 38.2 | 61.5 |
+
+First-token logits (`FNX_DUMP_FIRST_LOGITS`, temperature 0): five prompts against llama.cpp b11851 and our two-card engine,
+the same top and second tokens, probabilities within a few hundredths; 12 prompts of 60 to about 26k tokens over four loads
+(host exchange, `FNX_PF_PEER=1` twice, with the attention partials too) bit-identical in every pairing. The first build
+(`1eb2d54`, 160-column slices) was wrong on every prompt; why is in point 3 below. Writing right after a long read is the one
+row well below two cards; nobody has looked into it yet. The fast UD-Q4_K_XL on the same machine with `engine-32g/`'s patches
+stacked on these (by hand, not a `build.sh` option): [issue #4](https://github.com/Megla123/Scream-P100/issues/4).
 
 ## What limits this machine
 
@@ -43,9 +65,9 @@ the experts must stay on the cards, and that decides the profile.
 
 ### The engine (`engine-4x/`, `bash build.sh --4x`)
 
-`build.sh --4x` copies `engine/` to `build-4x/engine-4x`, applies three patches and builds `strata-split-4`
+`build.sh --4x` copies `engine/` to `build-4x/engine-4x`, applies the patches below and builds `strata-split-4`
 (`STRATA_SPLIT_CARDS=4`). The engine was written for 2, 3, 4, 6 or 8 cards (sFNX, then Strata, ran it on three and four
-cards); our P100 additions assumed two in three places, and four cards need one kernel change:
+cards); our P100 additions assumed two in three places, and four cards need two kernel changes:
 
 1. **`pf_gather` (`FNX_PF_SP`), `ncard4_patch.py`.** The exchange that trades the rows each card reads `hc` for was
    written for two cards (a `static_assert`). Now each card's finished part goes once to its own host rows and every other
@@ -63,10 +85,18 @@ cards); our P100 additions assumed two in three places, and four cards need one 
    ([Kenzu/qwen3.8-flash-next-2x-p100](https://github.com/Kenzu/qwen3.8-flash-next-2x-p100), branch `x99-p100`, commit
    `c43e4b8`), applied unchanged: mode 5's tile loads zeros past the slice's last column. Kenzu's GPU test compares compact
    and zero-padded slices for the four weight types the load converts down experts to, widths 32 to 320 (160 among them),
-   1 to 96 tokens: 392 cases passed on their P100s. We have not run it again. On a four-P100 machine the first-token logits
-   of this 160-column build were wrong (a different top token on 5 of 5 prompts, against llama.cpp and the two-card engine), so
-   `ff64_patch.py` cuts four cards' FF slices in 64-column units (192, 192, 128, 128) and the tail path is not used; the cause
-   inside the tail kernel is not found.
+   1 to 96 tokens: 392 cases passed on their P100s. We have not run it again.
+
+   On four P100 the first-token logits of this 160-column build were wrong (a different top token on 5 of 5 prompts, against
+   llama.cpp and the two-card engine) and differed from run to run. KaneQuah's `ff64_patch.py` cuts four cards' FF slices in
+   64-column units instead (192, 192, 128, 128), and then they match; it is the default (`FF4X=64`). The fault was not the
+   tail kernel but the decode windows' row kernel (`k_moe_rows`), which also reads short prompts: for the down types with four
+   32-column runs a group (Q4_0, IQ4_NL, Q5_1, Q8_0) it checked runs 2 and 3 against the slice's end but not run 1, so a slice
+   of five runs (160 columns) added a sixth: 32 columns of the next row's bytes times the next token's activations, or
+   whatever lay past the last one. Two cards (ten runs), three (seven and six), six and eight cards never leave run 1 past the
+   end. `rows_tail_patch.py` adds the check; with 64-column slices it is always true, so the sums are the same. `FF4X=32 bash
+   build.sh --4x` builds the even split (160 each, no `ff64_patch.py`) with that check: not run yet, and it may be faster,
+   since the widest card carries 160 columns instead of 192.
 4. **Peer access on NVIDIA (`FNX_PEER`), `peer_patch.py` and `cuda_peer.hpp`.** On AMD the engine already pushes the
    decode windows' sums (`k_ring_a2a_push`) and attention merge (`k_att_merge_a2a`) into the other cards' memory when every
    pair passes a start probe, else it uses the host exchange. These kernels are plain CUDA; only the decision and the
@@ -81,7 +111,7 @@ cards); our P100 additions assumed two in three places, and four cards need one 
      P2P read the platform does not route can end the CUDA context;
    - any failure: peer access off again on every pair, the host exchange for the whole run, one line in the log saying why.
 
-   The prompt path still exchanges through host memory, with or without peer access (see "Not done").
+   The prompt path exchanges through host memory unless `FNX_PF_PEER=1` (`prompt_peer_patch.py`, KaneQuah's; see "Not done").
 
 `build.sh` refuses a two-card binary that can call a peer-access function, as before; for `--4x` it checks that the
 binary can (the patch took) and lists the functions.
@@ -98,6 +128,7 @@ Our IQ3_S 512k profile with these changes:
 | `FNX_PF_SP` | 1 | 0 | see above |
 | `FNX_PLE_RAM` | 1 (default) | 1, written out | the lookup table in RAM, not read from a disk behind the same chipset |
 | `FNX_PEER` | (none) | 1 | try peer access, fall back by itself; `0` forces the host exchange |
+| `FNX_PF_PEER` | (none) | not set (off) | `1`: the prompt path's sums and attention partials card to card (KaneQuah: reading 338 -> 889 tok/s); opt-in, see "Not done". Needs the probe to pass; with a translating IOMMU that takes `FNX_PEER_IOMMU_TRUST=1` |
 | `--max-context` | 524288 (YaRN x2) | 262144 by default, no YaRN | the K/V pool grows into the experts' slots as a conversation gets longer (`FNX_ARENA`): at 512k up to about 3 GiB a card (a quarter of what experts get), at 256k half of that. Short conversations keep the same experts either way. `--context 512k` gives our production's 524,288 with YaRN, `--context 128k` 131,072 |
 
 Everything else is our production's (`FNX_PREFETCH_WANT=6`, `FNX_PF_JOBV=7`, `FNX_PF_TAIL_MIB=3000` ...). Not tuned for
@@ -111,8 +142,9 @@ this machine, because we cannot measure on it; "Expectations" names the switches
   one machine (four P100 behind a PEX8748 on a chipset x4) the first-token logits were bit-identical to the host exchange on 12
   prompts of 60 to about 26k tokens over four loads, and reading a 38.9k-token prompt went from 338 to 889 tok/s. One machine
   and one platform are not a proof; the flags in device memory would remove the question.
-- **UD-Q4_K_XL and Edge0-145B.** UD-Q4_K_XL's experts are 72 GiB, so about 40 % would stay in RAM behind the x4 link;
-  Edge0 is refused (above).
+- **UD-Q4_K_XL and Edge0-145B.** No 4-card profile for UD-Q4_K_XL here: its experts are 72 GiB, so about 40 % would stay
+  in RAM behind the x4 link. KaneQuah ran the fast UD-Q4_K_XL with `engine-32g/`'s patches stacked by hand on 62 GiB
+  ([issue #4](https://github.com/Megla123/Scream-P100/issues/4)). Edge0 is refused (above).
 - **`setup.sh`.** It still writes the two-card profile and wants the two-card engine; the 4-card profile comes from
   `engine-4x/fill_profile_4x.py`.
 
@@ -160,15 +192,18 @@ comfortable; below that see "Less RAM".
    all four at once. All four at once shows the shared link: about 3.2-3.5 GB/s together on PCIe 3.0 x4.
 7. **At the engine's start**, its log (`logs/strata-split-4.log`) says which exchange it took:
    - `fnx: Peer push between the cards is on (all 12 directed pairs: 4 MiB stored and compared in full on the receiving card, A to B GB/s, flag round trip at most C us).`
-     followed by `fnx: engine-4x: the decode windows' sums and attention merge go card to card; ...`
+     followed by `fnx: engine-4x: the decode windows' sums and attention merge go card to card; ...` (with
+     `FNX_PEER_IOMMU_TRUST=1` and a translating IOMMU the first line ends `(IOMMU group type not checked: ...)`, and with
+     `FNX_PF_PEER=1` two more lines say the prompt path's sums and attention partials go card to card)
    - or `fnx: The cards cannot push into each other's memory here (<why>): using the host exchange for this run.` followed
      by `fnx: engine-4x: the cards exchange through page-locked host memory (no peer access)`.
    - and how many experts went where: `fnx: N of 24576 routed experts (X GiB) in RAM, ranked by ...`.
 
-## Expectations (estimates, not measurements)
+## Expectations (estimates, written before the first run)
 
-Nobody has run this. These numbers come from the byte counts above and from our two-card machine's measurements
-(IQ3_S 512k: writing 66.5 tok/s, edits 110.7 / 115.8, reading a 38k prompt 1,012 tok/s); they may be wrong by a lot.
+These numbers came from the byte counts above and from our two-card machine's measurements (IQ3_S 512k: writing 66.5 tok/s,
+edits 110.7 / 115.8, reading a 38k prompt 1,012 tok/s), before anyone ran it. KaneQuah's measurements are above: writing with
+peer access came out inside the estimate (66.5 against 60-95), and reading over host memory below it (338 against 450-850).
 
 | | Two cards, x16 each (ours, measured) | Four cards behind x4, host exchange (estimate) | Same with peer access (estimate) |
 |---|---|---|---|
@@ -198,20 +233,23 @@ explains the switch on two cards). The K/V pool and the prompt path borrow only 
 256k (estimate: about 1.5 GiB of K/V and 3 GiB of prompt buffers a card). If the load stops with `FNX_EXPERT_DYN_GIB: VRAM short by ...`, raise `FNX_EXPERT_RAM_GIB` by what it says. Keep
 `FNX_PLE_RAM=1` if it fits; the lookup table from the disk crosses the chipset too.
 
-## Turning it into a verified build
+## Checking this version
 
-On the four-card machine, after the checks above:
+On the four-card machine, after the checks above. `engine-4x/logit_requests.py` writes run configs with `env` entries
+changed and sends the same four requests every run (short, about 2k, about 6-7k and about 20-25k tokens), one token each at
+temperature 0; start the engine fresh for each run, since the conversation cache would serve a repeated prompt unread.
 
-1. Run the two-card engine on two of the four cards (`bash build.sh`, `bash setup.sh DATA`, `"gpu": "0,1"`) with
-   `"FNX_DUMP_FIRST_LOGITS": "/tmp/logits-2"` added to its profile's `env`, send it a few requests at temperature 0, stop it.
-2. Run the 4-card engine with `"FNX_DUMP_FIRST_LOGITS": "/tmp/logits-4"`, send the same requests in the same order.
+1. Run the two-card engine on two of the four cards (`bash build.sh`, `bash setup.sh DATA`, `"gpu": "0,1"`; with less than
+   96 GB of RAM `--ram 64`) with `FNX_DUMP_FIRST_LOGITS=/tmp/logits-2`, then
+   `python3 engine-4x/logit_requests.py send`, and stop it.
+2. Run the 4-card engine with `FNX_DUMP_FIRST_LOGITS=/tmp/logits-4` and the same requests.
 3. `python3 engine-4x/compare_logits.py /tmp/logits-2 /tmp/logits-4`: the top token should be the same and the KL small
-   (the cards add their parts in another order, so the logits are not bit-equal). Do it once with `FNX_PEER=0` and once
-   with peer access, if the machine allows it.
+   (four cards round four fp16 addends where two round two, so the logits are not bit-equal). Two runs of the 4-card engine
+   should be bit-identical, with `FNX_PF_PEER=1` or without.
 4. `python3 bench/bench.py ...` ([GUIDE.md, "Benchmark and compare"](GUIDE.md#benchmark-and-compare)) for the speeds.
 
 Send back the start of `logs/strata-split-4.log` (the `fnx:` lines), `tune/check.py --cards 4`'s report, the comparison and
-the speeds. Until then this is a proof of concept.
+the speeds. Still open on KaneQuah's machine: the even split (`FF4X=32`) against the default, in logits and speed.
 
 ## Credits
 
@@ -221,3 +259,7 @@ the speeds. Until then this is a proof of concept.
   peer push this build turns on for NVIDIA.
 - Kenzu ([Kenzu/qwen3.8-flash-next-2x-p100](https://github.com/Kenzu/qwen3.8-flash-next-2x-p100), `x99-p100`): the down
   kernel's 32-column tail and its GPU test, from their three-P100 port.
+- KaneQuah: the first runs on four P100 and every measurement in "Measured on four cards", the logit comparison against
+  llama.cpp that found the wrong output, `FNX_PEER_IOMMU_TRUST`, `ff64_patch.py` and `prompt_peer_patch.py`
+  ([#1](https://github.com/Megla123/Scream-P100/issues/1), [#2](https://github.com/Megla123/Scream-P100/pull/2), [#3](https://github.com/Megla123/Scream-P100/pull/3),
+  [#4](https://github.com/Megla123/Scream-P100/issues/4)).

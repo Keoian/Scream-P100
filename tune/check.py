@@ -141,21 +141,40 @@ def pci_path(bdf):
 def topo_matrix(kind):
     """nvidia-smi topo -m (kind "m": PIX, PXB, PHB, NODE, SYS ...) or topo -p2p w (kind "w": OK, CNS, TNS, NS ...) as
     {(i, j): value} for the cards nvidia-smi numbers i != j; {} when it cannot be read"""
-    try:
-        txt = sh(["nvidia-smi", "topo", "-m"] if kind == "m" else ["nvidia-smi", "topo", "-p2p", kind])
-    except Exception:
+    try:   # its output even when it exits non-zero
+        r = subprocess.run(["nvidia-smi", "topo", "-m"] if kind == "m" else ["nvidia-smi", "topo", "-p2p", kind],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
         return {}
-    rows = [ln.split() for ln in txt.splitlines() if ln.strip().startswith("GPU")]
-    if not rows:
-        return {}
-    head = [x for x in rows[0] if x.startswith("GPU")]
-    out = {}
-    for r in rows[1:]:
-        if not r[0][3:].isdigit():
+    return parse_topo(r.stdout)
+
+
+def parse_topo(txt):
+    """nvidia-smi topo's matrix as {(i, j): value}: the header is the first line of GPU<n> names (the columns after them, CPU
+    Affinity or NIC0, are left out), a row is a line that starts with one GPU<n> and goes on with values; any other line (a
+    warning, the legend) is skipped. nvidia-smi underlines the header with terminal escapes even into a pipe ("\\x1b[4mGPU0");
+    the parser before took the first card's row for the header then, so every pair without card 0 read '?' (KaneQuah's
+    report, issue #1 on Megla123/Scream-P100)"""
+    gpu = re.compile(r"GPU\d+$")
+    head, out = None, {}
+    txt = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", txt)
+    for ln in txt.splitlines():
+        t = ln.split()
+        if len(t) < 2 or not gpu.match(t[0]):
+            continue
+        if gpu.match(t[1]):   # the header: GPU0 GPU1 ... (then other columns)
+            if head is None:
+                head = []
+                for x in t:
+                    if not gpu.match(x):
+                        break
+                    head.append(x[3:])
+            continue
+        if head is None:
             continue
         for j, name in enumerate(head):
-            if j + 1 < len(r) and name[3:].isdigit() and name != r[0]:
-                out[(r[0][3:], name[3:])] = r[j + 1]
+            if j + 1 < len(t) and name != t[0][3:]:
+                out[(t[0][3:], name)] = t[j + 1]
     return out
 
 

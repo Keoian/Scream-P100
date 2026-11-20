@@ -12,11 +12,12 @@
 # UD-Q4_K_XL's 64 GB mode, docs/GUIDE.md), built into build-32g. engine/ and build/ stay as they are, so every other profile
 # keeps its engine. Needs python3.
 #
-# --4x: UNVERIFIED PROOF OF CONCEPT, nobody has run it on four cards. The engine for four Tesla P100 16 GB (docs/POC-4X.md): a
-# fresh copy of engine/ in build-4x/engine-4x with engine-4x/'s three patches applied, built for four cards into
-# build-4x/split/strata-split-4 (bash build.sh --4x; B_4X: another build directory). engine/ and build/ stay as they are.
-# Needs python3. Its binary may call CUDA's peer-access functions (FNX_PEER: the decode windows' sums pushed card to card when
-# a start probe passes, else the host exchange), so for it the check below lists them instead of refusing them.
+# --4x: UNVERIFIED PROOF OF CONCEPT: we have not run it; KaneQuah ran it on one machine with four P100 (issue #1). The engine for
+# four Tesla P100 16 GB (docs/POC-4X.md): a fresh copy of engine/ in build-4x/engine-4x with engine-4x/'s patches applied,
+# built for four cards into build-4x/split/strata-split-4 (bash build.sh --4x; B_4X: another build directory). engine/ and
+# build/ stay as they are. Needs python3. Its binary may call CUDA's peer-access functions (FNX_PEER: the decode windows' sums
+# pushed card to card when a start probe passes, else the host exchange; FNX_PF_PEER=1: the prompt path's too), so for it the
+# check below lists them instead of refusing them.
 #
 # Environment:
 #   PF_JOB    rows of one expert per prompt-path job, a compile-time constant: 96 (default: our production for all three
@@ -28,6 +29,9 @@
 #             on a box whose RAM the engine fills (it pins most of it).
 #   B         build directory (default ./build, with --32g ./build-32g; another one needs profile/fill_profile.py --exe)
 #   GG        llama.cpp checkout (default ./third_party/llama.cpp); fetched at the pinned commit when missing.
+#   FF4X      --4x only: the experts' FF slices on four cards. 64 (default): 192, 192, 128, 128 columns (ff64_patch.py, the
+#             build KaneQuah checked against llama.cpp); 32: 160 each, the even split (no ff64_patch.py), not checked since
+#             rows_tail_patch.py.
 #
 # Steps: fetch and check the pinned llama.cpp headers (only headers are used; ggml is not built), regenerate
 # engine/src/iq3s_x.cuh from them and compare, configure, build, then refuse a binary that can call a CUDA peer-access
@@ -47,6 +51,7 @@ CARDS=2
 if [ "$V4X" = 1 ]; then B=${B_4X:-$HERE/build-4x}; CARDS=4; fi   # the 4-card proof of concept
 JOBS=${JOBS:-8}
 PF_JOB=${PF_JOB:-96}
+FF4X=${FF4X:-64}
 GG=${GG:-$HERE/third_party/llama.cpp}
 LLAMA_REPO=${LLAMA_REPO:-https://github.com/ggml-org/llama.cpp.git}
 LLAMA_COMMIT=3cf03257f219afbe7334045ff7c6a06ac68c627d   # the commit Strata v0.2.9 and v0.2.10 both pin (third_party/ggml/VERSION.txt)
@@ -55,6 +60,7 @@ say() { echo "build.sh: $*"; }
 die() { echo "build.sh: $*" >&2; exit 1; }
 
 case $PF_JOB in 64|96) ;; *) die "PF_JOB=$PF_JOB: 64 or 96 (the P100 kernels' jobs fill at most two tiles of 48 rows)";; esac
+case $FF4X in 32|64) ;; *) die "FF4X=$FF4X: 64 (192/192/128/128 columns) or 32 (160 each)";; esac
 
 # --- toolchain
 . "$HERE/scripts/toolchain.sh"
@@ -96,9 +102,11 @@ if [ "$V4X" = 1 ]; then
   mkdir -p "$B"
   rm -rf "$ENGINE"
   cp -r "$HERE/engine" "$ENGINE"
-  (cd "$ENGINE" && for p in ff64_patch ncard4_patch tail_patch peer_patch prompt_peer_patch; do python3 "$HERE/engine-4x/$p.py" || exit 1; done) ||
+  P4X="ncard4_patch tail_patch rows_tail_patch peer_patch prompt_peer_patch"
+  if [ "$FF4X" = 64 ]; then P4X="ff64_patch $P4X"; fi   # ff64_patch.py first (KaneQuah)
+  (cd "$ENGINE" && for p in $P4X; do python3 "$HERE/engine-4x/$p.py" || exit 1; done) ||
     die "engine-4x/'s patches did not apply to engine/"
-  say "UNVERIFIED PROOF OF CONCEPT: the 4-card engine's sources in $ENGINE (nobody has run it on four cards)"
+  say "UNVERIFIED PROOF OF CONCEPT: the 4-card engine's sources in $ENGINE (FF in units of $FF4X columns; checked on one machine only)"
 fi
 
 # --- configure and build (the production build: Release, sm_60, 2 cards, prompt-path jobs of 96 rows)
@@ -128,5 +136,5 @@ if [ -n "$missing" ]; then
   say "WARNING: $EXE cannot find the libraries above; add the toolkit's lib64 to LD_LIBRARY_PATH when you run it"
 fi
 if [ "$V32" = 1 ]; then say "built $EXE (the low-RAM engine; setup.sh --ram 32, and --ram 64 with UD-Q4_K_XL, name it)"; else say "built $EXE"; fi
-if [ "$V4X" = 1 ]; then say "UNVERIFIED PROOF OF CONCEPT, not run on four cards; engine-4x/fill_profile_4x.py writes its profile"; fi
+if [ "$V4X" = 1 ]; then say "UNVERIFIED PROOF OF CONCEPT, checked on one machine only; engine-4x/fill_profile_4x.py writes its profile"; fi
 sha256sum "$EXE"
