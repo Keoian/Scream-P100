@@ -22,10 +22,13 @@
 #   bash setup.sh /data/flash-next-q4-fast --models /data/flash-next-q4/models --model q4_k_xl --fast   # the fast UD-Q4_K_XL, lossy
 #   bash setup.sh /data/flash-next-q4-32 --models /data/flash-next-q4/models --model q4_k_xl --fast --ram 32   # the same with 32 GB of RAM
 #   bash setup.sh /data/flash-next-q4-64 --models /data/flash-next-q4/models --model q4_k_xl --ram 64   # the exact UD-Q4_K_XL, 64 GB
+#   bash setup.sh /data/flash-next-m40 --model iq3_xxs        # TEST BUILD: two Tesla M40 24 GB, 32 GB of RAM (docs/M40.md)
 #
 # Options:
 #   --model M        iq3_s (default): ISTA-DASLab's GSQ-RCO IQ3_S; q4_k_xl: Unsloth's UD-Q4_K_XL (512k, needs 96 GB of RAM, or
-#                    64 GB with --ram 64); edge0: Edge0's Edge0-145B-NVFP4 (512k, needs 96 GB of RAM)
+#                    64 GB with --ram 64); edge0: Edge0's Edge0-145B-NVFP4 (512k, needs 96 GB of RAM); iq3_xxs: ISTA-DASLab's
+#                    GSQ-RCO IQ3_XXS for the TEST BUILD on two Tesla M40 24 GB (256k, 32 GB of RAM; run 'bash build.sh --m40'
+#                    first; docs/M40.md)
 #   --models DIR     the model files somewhere else (for example already downloaded); missing ones are downloaded there
 #   --strata DIR     an existing Strata checkout at v0.2.9 instead of DATA/strata-v0.2.9
 #   --no-pictures    no projector download, no encoder build, a profile without pictures
@@ -62,12 +65,16 @@ Q4_K_XL=(Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf Qwen3.8-Flash-Next-UD
 # lookup table is the IQ3_S's second shard (the same table)
 EDGE0_FILES=(edge0-145b/model-skeleton.gguf edge0-145b/experts.bin edge0-145b/latent_dense_q8.bin edge0-145b/labels.bin)
 MMPROJ=mmproj-Qwen3.8-Flash-Next-BF16.gguf   # ISTA-DASLab's projector, also for UD-Q4_K_XL and Edge0 (ours runs it with all three)
-declare -A SIZE=([${IQ3_S[0]}]=54817524224 [${IQ3_S[1]}]=28800138432
+# the 2 x M40 test build's file: its second shard is the same table as the IQ3_S's (the same SHA-256) under its own name
+IQ3_XXS=(Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf)
+declare -A SIZE=([${IQ3_S[0]}]=54817524224 [${IQ3_S[1]}]=28800138432 [${IQ3_XXS[0]}]=47039860096 [${IQ3_XXS[1]}]=28800138432
                  [${Q4_K_XL[0]}]=10946618 [${Q4_K_XL[1]}]=49720539552 [${Q4_K_XL[2]}]=32803030176 [${Q4_K_XL[3]}]=28800138432
                  [${EDGE0_FILES[0]}]=5991569248 [${EDGE0_FILES[1]}]=47563800576 [${EDGE0_FILES[2]}]=3743416320 [${EDGE0_FILES[3]}]=98304
                  [$MMPROJ]=907543008)
 declare -A SHA=([${IQ3_S[0]}]=4c1eb2ceb4915e1192f4f386021897bde56a97f40a0bb78bb86465e0f7d2aca3
                 [${IQ3_S[1]}]=316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113
+                [${IQ3_XXS[0]}]=219ea929900dfa9ef091f3aa473fdba6874b65fcb36526d7d851ac9e95856d15
+                [${IQ3_XXS[1]}]=316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113
                 [${Q4_K_XL[0]}]=acc44040f74d0e55fb89c3967056cce5dbda1bcc52e909c3ba6fc72b5e9c0858
                 [${Q4_K_XL[1]}]=45792ae869072d8229384c51c7c73dd959e191505252b41dd71852d9746f5ce4
                 [${Q4_K_XL[2]}]=8c76e79d444b16a663d9c8db54e585ed3b1da13eebd2619c37b0c355da803c82
@@ -78,13 +85,13 @@ declare -A SHA=([${IQ3_S[0]}]=4c1eb2ceb4915e1192f4f386021897bde56a97f40a0bb78bb8
                 [${EDGE0_FILES[3]}]=ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06
                 [$MMPROJ]=b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0)
 
-[ $# -ge 1 ] && [ "${1#-}" = "$1" ] || die "usage: bash setup.sh DATA [--model iq3_s|q4_k_xl|edge0] [--models DIR] [--strata DIR] [--no-pictures] [--route-prior X] [--ram 96|64|32] [--coder] [--fast] [--check]"
+[ $# -ge 1 ] && [ "${1#-}" = "$1" ] || die "usage: bash setup.sh DATA [--model iq3_s|q4_k_xl|edge0|iq3_xxs] [--models DIR] [--strata DIR] [--no-pictures] [--route-prior X] [--ram 96|64|32] [--coder] [--fast] [--check]"
 DATA=$1
 shift
 MODEL=iq3_s MODELS='' STRATA='' PICTURES=1 PRIOR=0 RAM=96 CODER=0 FAST=0 CHECK=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --model) MODEL=${2:?--model iq3_s, q4_k_xl or edge0}; case "$MODEL" in iq3_s|q4_k_xl|edge0) ;; *) die "--model: iq3_s, q4_k_xl or edge0" ;; esac; shift 2 ;;
+    --model) MODEL=${2:?--model iq3_s, q4_k_xl, edge0 or iq3_xxs}; case "$MODEL" in iq3_s|q4_k_xl|edge0|iq3_xxs) ;; *) die "--model: iq3_s, q4_k_xl, edge0 or iq3_xxs" ;; esac; shift 2 ;;
     --models) MODELS=${2:?--models DIR}; shift 2 ;;
     --strata) STRATA=${2:?--strata DIR}; shift 2 ;;
     --no-pictures) PICTURES=0; shift ;;
@@ -102,6 +109,8 @@ done
 [ "$CODER" = 0 ] || [ "$MODEL" != edge0 ] || die "--coder: not with --model edge0 (the Coder's list names Flash-Next's experts, not Edge0's)"
 [ "$FAST" = 0 ] || [ "$MODEL" = q4_k_xl ] || die "--fast: only with --model q4_k_xl (the settings were measured on UD-Q4_K_XL only)"
 [ "$FAST" = 0 ] || [ "$PRIOR" = 0 ] || die "--fast sets FNX_ROUTE_PRIOR=1.0 itself: leave --route-prior out"
+[ "$MODEL" != iq3_xxs ] || { [ "$RAM" = 96 ] && [ "$CODER" = 0 ] && [ "$FAST" = 0 ]; } ||
+  die "--model iq3_xxs (the 2 x M40 test build) has one profile (32 GB of RAM): no --ram, --coder or --fast"
 abspath() { case "$1" in /*) echo "$1" ;; *) echo "$PWD/$1" ;; esac; }
 DATA=$(abspath "$DATA")
 MODELS=$(abspath "${MODELS:-$DATA/models}")
@@ -112,15 +121,20 @@ BUILD_CMD="bash build.sh"
 if [ "$RAM" = 32 ] || { [ "$RAM" = 64 ] && [ "$MODEL" = q4_k_xl ]; }; then   # the low-RAM engine
   EXE=$HERE/build-32g/split/strata-split-2; BUILD_CMD="bash build.sh --32g"
 fi
+if [ "$MODEL" = iq3_xxs ]; then   # the 2 x M40 test build's own engine (engine-m40/, sm_52)
+  EXE=$HERE/build-m40/split/strata-split-2; BUILD_CMD="bash build.sh --m40"
+fi
 GG=$HERE/third_party/llama.cpp
 declare -A URL=([$MMPROJ]=$ISTA/$MMPROJ)
 for f in "${IQ3_S[@]}"; do URL[$f]=$ISTA/IQ3_S/$f; done   # the shards sit in the IQ3_S folder at this revision (found by Kenzu)
+for f in "${IQ3_XXS[@]}"; do URL[$f]=$ISTA/IQ3_XXS/$f; done
 for f in "${Q4_K_XL[@]}"; do URL[$f]=$UNSLOTH/$f; done
 for f in "${EDGE0_FILES[@]}"; do URL[$f]=$EDGE0/${f#edge0-145b/}; done
 case $MODEL in
   iq3_s) NEEDED=("${IQ3_S[@]}") ;;
   q4_k_xl) NEEDED=("${Q4_K_XL[@]}") ;;
   edge0) NEEDED=("${EDGE0_FILES[@]}" "${IQ3_S[1]}") ;;   # the skeleton first: the tokenizer comes from it
+  iq3_xxs) NEEDED=("${IQ3_XXS[@]}") ;;
 esac
 SHARD1=${NEEDED[0]}
 [ "$PICTURES" = 1 ] && NEEDED+=("$MMPROJ")
@@ -139,19 +153,25 @@ if grep -qs '^STRATA_SPLIT_PF_JOB:[A-Z]*=64$' "$HERE/build/CMakeCache.txt"; then
 fi
 
 GPU_LIST=0,1
+CARD=P100
+[ "$MODEL" = iq3_xxs ] && CARD=M40   # the 2 x M40 test build
 if command -v nvidia-smi >/dev/null; then
-  p100=$( (nvidia-smi --query-gpu=index,name --format=csv,noheader || true) | awk -F', ' '/P100/ && n < 2 {print $1; n++}' | paste -sd, -)
+  p100=$( (nvidia-smi --query-gpu=index,name --format=csv,noheader || true) | awk -F', ' -v c="$CARD" '$2 ~ c && n < 2 {print $1; n++}' | paste -sd, -)
   if [ "$(echo "$p100" | tr ',' '\n' | grep -c .)" = 2 ]; then
     GPU_LIST=$p100
-    ok "two Tesla P100: cards $GPU_LIST"
+    ok "two Tesla $CARD: cards $GPU_LIST"
   else
-    say "WARNING: nvidia-smi does not show two Tesla P100 (found: ${p100:-none}); the profile names cards 0,1"
+    say "WARNING: nvidia-smi does not show two Tesla $CARD (found: ${p100:-none}); the profile names cards 0,1"
   fi
 else
   say "WARNING: no nvidia-smi; the profile names cards 0,1"
 fi
 mem_gib=$(awk '/^MemTotal:/ {print int($2 / 1048576)}' /proc/meminfo)
-if [ "$RAM" = 96 ] && [ "$MODEL" = q4_k_xl ] && [ "$mem_gib" -lt 88 ]; then
+if [ "$MODEL" = iq3_xxs ]; then
+  # ours: 32 GB (Linux saw 30 GiB) and an 8 GiB swap file; the load's peak left 3.9 GiB free and used 1.8 GB of swap
+  if [ "$mem_gib" -lt 29 ]; then say "WARNING: $mem_gib GiB of RAM; the M40 test build was run with 32 GB (30 GiB seen) and swap"
+  else ok "$mem_gib GiB of RAM"; fi
+elif [ "$RAM" = 96 ] && [ "$MODEL" = q4_k_xl ] && [ "$mem_gib" -lt 88 ]; then
   say "WARNING: $mem_gib GiB of RAM; this profile needs 96 GB; with 64 GB use --ram 64 (with --fast: --ram 32)"
 elif [ "$RAM" = 96 ] && [ "$MODEL" != iq3_s ] && [ "$mem_gib" -lt 88 ]; then
   say "WARNING: $mem_gib GiB of RAM; this model needs 96 GB; with 64 GB use the IQ3_S file and --ram 64"
@@ -276,7 +296,9 @@ else
 fi
 # its experts as Q4_0 from the BF16 tensors (scripts/mtp_q4.py; the UD-Q4_K_XL profiles use them: writing +10 %, the same
 # answers): the expert tensors are fetched again if mtp-bf16 is gone
-if [ -f "$PREP/mtp-rt/experts-q4_0.bin" ]; then
+if [ "$MODEL" = iq3_xxs ]; then
+  ok "no Q4_0 draft experts (the M40 test build drafts with the Q2_0 ones, as we ran it)"
+elif [ -f "$PREP/mtp-rt/experts-q4_0.bin" ]; then
   ok "Q4_0 draft experts at $PREP/mtp-rt/experts-q4_0.bin"
 elif [ "$CHECK" = 1 ]; then
   todo "the Q4_0 draft experts $PREP/mtp-rt/experts-q4_0.bin (5 GB from Qwen's checkpoint unless $PREP/mtp-bf16 is there)"
@@ -305,9 +327,11 @@ else
   HOSTCC=$(dirname "$HOSTCXX")/$(basename "$HOSTCXX" | sed 's/g++/gcc/')
   [ -x "$HOSTCC" ] || HOSTCC=$(command -v gcc || true)
   [ -n "$HOSTCC" ] || die "no C compiler for the picture encoder (install gcc-13)"
-  say "building the picture encoder (nvcc $CUDA_VER, $HOSTCXX)"
+  VARCH=60
+  [ "$MODEL" = iq3_xxs ] && VARCH=52   # the M40 test build (the encoder runs on the CPU either way)
+  say "building the picture encoder (nvcc $CUDA_VER, $HOSTCXX, sm_$VARCH)"
   cmake -S "$STRATA/tools/vision" -B "$STRATA/build-vision" -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR="$GG" \
-    -DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=60 -DCMAKE_CUDA_COMPILER="$NVCC" \
+    -DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$VARCH -DCMAKE_CUDA_COMPILER="$NVCC" \
     -DCMAKE_CUDA_HOST_COMPILER="$HOSTCXX" -DCMAKE_C_COMPILER="$HOSTCC" -DCMAKE_CXX_COMPILER="$HOSTCXX"
   nice -n 10 cmake --build "$STRATA/build-vision" --target strata-vision -j "${JOBS:-6}"
   [ -x "$VISION" ] || die "the build gave no $VISION"

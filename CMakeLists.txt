@@ -25,14 +25,19 @@ set(STRATA_SPLIT_ARCH "60" CACHE STRING "compute capability the engine is built 
 set(STRATA_SPLIT_CARDS "2" CACHE STRING "card counts to build (only 2 has been run on P100)")
 set(STRATA_SPLIT_PF_JOB "64" CACHE STRING "rows of one expert per prompt-path job (build.sh passes 96, our production for all three models)")
 set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout at the pinned commit (its ggml-cuda headers)")
-# the engine's sources: engine/, or for the 32 GB mode's engine a copy of it with engine-32g/'s patches (build.sh --32g)
+# the engine's sources: engine/, or for the 32 GB mode's engine a copy of it with engine-32g/'s patches (build.sh --32g), or
+# the 2 x Tesla M40 test build's own tree engine-m40/ (build.sh --m40, sm_52, with its own p100_compat.h)
 set(SCREAM_ENGINE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/engine" CACHE PATH "the engine's source folder (default engine/)")
+set(SCREAM_COMPAT_H "${CMAKE_CURRENT_SOURCE_DIR}/engine/p100_compat.h" CACHE FILEPATH
+    "the header force-included in every CUDA source (default engine/p100_compat.h; build.sh --m40: engine-m40/p100_compat.h)")
 
 if(NOT STRATA_GGML_DIR OR NOT EXISTS "${STRATA_GGML_DIR}/ggml/src/ggml-cuda/vecdotq.cuh")
   message(FATAL_ERROR "-DSTRATA_GGML_DIR=<llama.cpp checkout at 3cf03257f219afbe7334045ff7c6a06ac68c627d> is required "
                       "(build.sh fetches it); got '${STRATA_GGML_DIR}'")
 endif()
-if(NOT STRATA_SPLIT_ARCH STREQUAL "60")
+if(STRATA_SPLIT_ARCH STREQUAL "52")
+  message(STATUS "STRATA_SPLIT_ARCH=52: the 2 x Tesla M40 24 GB TEST BUILD (docs/M40.md)")
+elseif(NOT STRATA_SPLIT_ARCH STREQUAL "60")
   message(WARNING "STRATA_SPLIT_ARCH=${STRATA_SPLIT_ARCH}: this release has only been built and run for sm_60 (Tesla P100)")
 endif()
 
@@ -45,6 +50,6 @@ add_subdirectory(${SCREAM_ENGINE_DIR} split)
 foreach(_t strata-split-2 strata-split-3 strata-split-4 split_fnx_run split_moe_tile_test)
   if(TARGET ${_t})
     target_compile_options(${_t} PRIVATE
-                           "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/engine/p100_compat.h>")
+                           "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:-include ${SCREAM_COMPAT_H}>")
   endif()
 endforeach()

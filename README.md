@@ -1,3 +1,8 @@
+> **Branch `m40-2x`: TEST BUILD for two Tesla M40 24 GB (Maxwell, sm_52), measured on one machine only.** It adds the
+> engine we ran on our second server until we sold it (`bash build.sh --m40`, `setup.sh --model iq3_xxs`):
+> [docs/M40.md](docs/M40.md). ISTA-DASLab's IQ3_XXS, 256k, 32 GB of RAM: 45.7 tok/s writing, 63-67 tok/s edits, 420 tok/s
+> reading 38.9k tokens. Everything else is `main` as of commit `dad10e8`; for the P100 release use the `main` branch.
+
 <div align="center">
 
 # 😱 Scream P100

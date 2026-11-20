@@ -1,0 +1,1533 @@
+diff -ruN varne/p100-izvor/engine.cu upstream/src/split/src/engine.cu
+--- varne/p100-izvor/engine.cu	2026-11-06 17:15:48.211018760 +0100
++++ upstream/src/split/src/engine.cu	2026-11-06 18:52:55.917781282 +0100
+@@ -8,6 +8,7 @@
+ #include "p100_over.hpp"
+ 
+ #include <cuda_runtime.h>
++#include <sys/mman.h>
+ #include <unistd.h>
+ 
+ #include <algorithm>
+@@ -180,11 +181,14 @@
+             ck(cudaMemcpy(b->dense[T], &j, sizeof j, cudaMemcpyHostToDevice), "dense job");
+         }
+         if (w.ec.n_slots) b->cache_list = dalloc<int>(1 + P);
+-        b->gu = dalloc<float>((size_t) (P + MAXT) * 2 * ffs);
++        // Maxwell: gate|up of a small window comes as 5 partial slices (m40_moe_rows.cuh, m40_ks)
++        b->gu = dalloc<float>((size_t) (P + MAXT) * 2 * ffs * (FNX_ARCH < 53 ? 5 : 1));
+         b->part = dalloc<float>((size_t) (P + MAXT) * N);
+         if (p100_rows_on()) {
+-            b->xh16 = dalloc<uint16_t>((size_t) MAXT * N);
+-            b->h16 = dalloc<uint16_t>((size_t) (P + MAXT) * ffs);
++            // Maxwell's rows kernel (m40_moe_rows.cuh) reads f32 rows: the same buffers hold floats there, twice the halves
++            constexpr size_t hw = FNX_ARCH < 53 ? 2 : 1;
++            b->xh16 = dalloc<uint16_t>(hw * MAXT * N);
++            b->h16 = dalloc<uint16_t>(hw * (P + MAXT) * ffs);
+         }
+         b->sh_gu = dalloc<float>((size_t) MAXT * 2 * ffs);
+         b->sh_hq = dalloc<uint8_t>((size_t) MAXT * q8_1_bytes(ffs));
+@@ -356,6 +360,9 @@
+             }
+             if (!more) break;
+             if (round == 8) throw std::runtime_error("FNX_ARENA: VRAM still short after placing the experts again 8 times");
++            if (!m.perm.empty())   // the permanent experts have no host copy: they cannot be placed again
++                throw std::runtime_error("FNX_EXPERT_DYN_GIB: VRAM short by " + std::to_string(short_mib) + " MiB on a card (" + std::to_string(more) +
++                                         " slots): raise FNX_EXPERT_RAM_GIB by about " + std::to_string((short_mib * NCARD + 1023) / 1024) + " GiB");
+             // two 32 GB cards are short by design; on three or more the experts fit unless something else holds VRAM
+             std::fprintf(stderr, "fnx: VRAM short by %zu MiB on a card%s: %d more of the coldest experts to RAM\n", short_mib,
+                          NCARD >= 3 ? " (another process on it?)" : "", more);
+@@ -580,8 +587,10 @@
+         if (ec.pool_of[l] == p)
+             for (int e = 0; e < NEXP; ++e) {
+                 const size_t i = (size_t) l * NEXP + e;
+-                epg[i] = w.ec_host_gu[i];
+-                epd[i] = w.ec_host_dn[i];
++                // FNX_EXPERT_DYN_GIB: a permanent expert has no host copy and never leaves its own VRAM block
++                const bool perm = !w.perm_gu.empty() && w.perm_gu[i];
++                epg[i] = perm ? w.perm_gu[i] : w.ec_host_gu[i];
++                epd[i] = perm ? w.perm_dn[i] : w.ec_host_dn[i];
+             }
+     // the slots' experts in one kernel reading their host copies (a copy call each ran the cards one after another)
+     std::vector<int> list{n};
+@@ -1116,10 +1125,10 @@
+         const int t = tok_at_cell(q);
+         return t >= IMAGE_TOK ? m_.ple_image : t;
+     };
++    // every PLE row of the T tokens: n-grams of each token and the PLE_ORDERS - 1 before it (EOS / sequence start cut the window)
++    std::vector<uint64_t> rows((size_t) T * 2 * 8);
+     for (int t = 0; t < T; ++t) {
+         const int p = p0 + t;
+-        embed_token(tok_at_cell(p), p, emb + (size_t) t * N);
+-        // PLE rows: n-grams of this token and the PLE_ORDERS - 1 before it (EOS / sequence start cut the window)
+         int64_t ctx[PLE_ORDERS];
+         ctx[0] = tok_at(p);
+         bool cut = false;
+@@ -1134,7 +1143,29 @@
+             for (int j = 1; j < n; ++j) mixed ^= (uint64_t) ctx[j] * m_.ple_mult[j];
+             for (int gi = 0; gi < 8; ++gi) {
+                 const int h = (n - 2) * 8 + gi;
+-                const uint64_t r = mixed % m_.ple_vocab[h] + m_.ple_off[h];
++                rows[(size_t) t * 16 + (size_t) h] = mixed % m_.ple_vocab[h] + m_.ple_off[h];
++            }
++        }
++    }
++    // FNX_PLE_RAM=0: the table is the file's mapping (model_loaded), so a row not in the page cache is a disk read; asked for all at
++    // once the reads overlap (MADV_WILLNEED starts them and returns), where the loop below alone would wait for one at a time
++    static const bool ple_file = env_int("FNX_PLE_RAM", 1) == 0;
++    if (ple_file) {
++        uintptr_t last = 0;
++        for (const uint64_t r : rows) {
++            const uintptr_t a = (uintptr_t) (pt.data + r * prb), p0a = a & ~(uintptr_t) 4095, e = (a + prb + 4095) & ~(uintptr_t) 4095;
++            if (p0a == last) continue;
++            madvise((void*) p0a, e - p0a, MADV_WILLNEED);
++            last = p0a;
++        }
++    }
++    for (int t = 0; t < T; ++t) {
++        const int p = p0 + t;
++        embed_token(tok_at_cell(p), p, emb + (size_t) t * N);
++        for (int n = 2; n <= PLE_ORDERS; ++n) {
++            for (int gi = 0; gi < 8; ++gi) {
++                const int h = (n - 2) * 8 + gi;
++                const uint64_t r = rows[(size_t) t * 16 + (size_t) h];
+                 const uint8_t* src = pt.data + r * prb;
+                 for (int b = 0; b < PLE_DIM / 32; ++b) {
+                     float* dst = &ple[(size_t) t * N + h * PLE_DIM + b * 32];
+@@ -1434,7 +1465,7 @@
+         if (prefetch_ && dma && T >= prefetch_min_t_) p100_dma_wait2(b.dma, b.st);   // FNX_PREFETCH: this layer's guessed experts, copied since the layer before
+         p100_moe_rows_phase(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, T, b.xh16, b.gu, 1, b.st);
+         prof_mark(b, PK_DOWN);
+-        swiglu_h16(b.gu, ffs, P, b.h16, b.st);
++        p100_swiglu_rows(b.gu, ffs, P, b.h16, b.st);
+         p100_moe_rows_phase(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, T, b.h16, b.part, 1, b.st);
+         prof_mark(b, PK_CACHE);
+         if (dma) p100_dma_wait(b.dma, b.st);
+@@ -1452,7 +1483,7 @@
+     if (!over) prof_mark(b, PK_DOWN);
+     if (over) {
+     } else if (b.xh16 && !sh_in) {
+-        swiglu_h16(b.gu, ffs, P, b.h16, b.st);
++        p100_swiglu_rows(b.gu, ffs, P, b.h16, b.st);
+         p100_moe_rows(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, T, b.h16, b.part, b.st);
+     } else moe_down(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
+     prof_mark(b, PK_JOIN);
+diff -ruN varne/p100-izvor/gguf.cpp upstream/src/split/src/gguf.cpp
+--- varne/p100-izvor/gguf.cpp	2026-11-06 17:15:48.238018943 +0100
++++ upstream/src/split/src/gguf.cpp	2026-11-06 18:44:52.071422949 +0100
+@@ -1,4 +1,5 @@
+ #include "gguf.hpp"
++#include "env.hpp"
+ 
+ #include <fcntl.h>
+ #include <sys/mman.h>
+@@ -35,6 +36,8 @@
+         case T_Q5_K: return {256, 176};
+         case T_Q6_K: return {256, 210};
+         case T_IQ4_NL: return {32, 18};
++        case T_IQ2_XXS: return {256, 66};
++        case T_IQ2_XS: return {256, 74};
+         case T_IQ3_XXS: return {256, 98};
+         case T_IQ3_S: return {256, 110};
+         case T_IQ2_S: return {256, 82};
+@@ -118,11 +121,21 @@
+ void Gguf::convert_small_tensors() {
+     bool mixed = false;
+     for (const auto& kv : tensors_)
+-        mixed |= kv.second.type == T_IQ2_S || kv.second.type == T_IQ3_XXS || kv.second.type == T_IQ3_S || kv.second.type == T_Q2_0;
++        mixed |= kv.second.type == T_IQ2_S || kv.second.type == T_IQ3_XXS || kv.second.type == T_IQ3_S || kv.second.type == T_Q2_0 ||
++                 kv.second.type == T_IQ2_XS || kv.second.type == T_IQ2_XXS;
+     if (!mixed) return;
++    // Maxwell (the M40's GSQ IQ3_XXS: down Q2_0 in 30 layers): its expert kernels read Q2_0 as it is, so the experts keep half the
++    // bytes in VRAM and RAM and the load holds no 13 GiB repacked copy. FNX_Q2_0_NATIVE=0 repacks as on the P100
++#if defined(FNX_ARCH) && FNX_ARCH < 60
++    const bool q2_native = env_int("FNX_Q2_0_NATIVE", 1) != 0;
++#else
++    const bool q2_native = env_int("FNX_Q2_0_NATIVE", 0) != 0;
++#endif
+     for (auto& kv : tensors_) {
+         Tensor& t = kv.second;
+-        if (t.type == T_Q2_0) {   // the routed down experts of some layers: the same values as Q4_0 blocks
++        const bool routed = kv.first.find("_exps.") != std::string::npos;
++        if (t.type == T_Q2_0 && routed && q2_native) continue;
++        if (t.type == T_Q2_0 && routed) {   // the routed down experts of some layers: the same values as Q4_0 blocks
+             owned_.emplace_back();
+             conv::repack_q2_0_to_q4_0(t, owned_.back());
+             ++converted_;
+@@ -484,3 +497,14 @@
+ }
+ 
+ }  // namespace fnx
++
++// the IQ3_S grid for tensor_convert.hpp's host dequantizer (the M40's GSQ IQ3_XXS keeps its token embedding and some dense matrices
++// in IQ3_S), from ggml-common.h's own table
++#define GGML_COMMON_DECL_CPP
++#define GGML_COMMON_IMPL_CPP
++#include "ggml-common.h"
++namespace fnx {
++namespace conv {
++const uint32_t* iq3s_grid_host() { return iq3s_grid; }
++}  // namespace conv
++}  // namespace fnx
+diff -ruN varne/p100-izvor/gguf.hpp upstream/src/split/src/gguf.hpp
+--- varne/p100-izvor/gguf.hpp	2026-11-06 17:15:48.325019532 +0100
++++ upstream/src/split/src/gguf.hpp	2026-11-06 17:46:11.689180639 +0100
+@@ -22,7 +22,7 @@
+ 
+ enum GgmlType : uint32_t {
+     T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q4_1 = 3, T_Q5_0 = 6, T_Q5_1 = 7, T_Q8_0 = 8, T_Q8_1 = 9, T_Q2_K = 10,
+-    T_Q3_K = 11, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_Q8_K = 15, T_IQ3_XXS = 18, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22,
++    T_Q3_K = 11, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_Q8_K = 15, T_IQ2_XXS = 16, T_IQ2_XS = 17, T_IQ3_XXS = 18, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22,
+     T_IQ4_XS = 23, T_BF16 = 30, T_Q2_0 = 42,   // 42: Strata's 64-value 2-bit blocks (not in llama.cpp)
+ };
+ 
+diff -ruN varne/p100-izvor/kernels.cu upstream/src/split/src/kernels.cu
+--- varne/p100-izvor/kernels.cu	2026-11-06 17:15:48.202018699 +0100
++++ upstream/src/split/src/kernels.cu	2026-11-06 17:46:11.659180430 +0100
+@@ -1866,7 +1866,8 @@
+     cache_plan(jobs, njobs[0], layer, ec, list);
+ }
+ // the listed experts' matrices (gu_bytes and dn_bytes each, multiples of 16: the layer's) from their host copies to
+-// their slots in pool p
++// their slots in pool p. A padded pool (plan_pools) lists experts of several sizes: each copies its own layer's bytes
++// (ec.gu_b / dn_b), the rest of its slot is not read
+ __global__ void __launch_bounds__(256) k_cache_copy(ExpertCache ec, int p, const int* list, size_t gu_bytes, size_t dn_bytes) {
+     const int n = list[0];
+     const size_t ug = gu_bytes / 16, per = ug + dn_bytes / 16;
+@@ -1874,6 +1875,8 @@
+         const int k = (int) (i / per);
+         const size_t o = i % per;
+         const int g = list[1 + k];
++        const int l = g / NEXP;
++        if (ec.gu_b[l] && (o < ug ? o >= (size_t) ec.gu_b[l] / 16 : o - ug >= (size_t) ec.dn_b[l] / 16)) continue;
+         char* at = ec.pool[p] + (size_t) (ec.slot_of[g] - ec.s0[p]) * ec.slot_bytes[p];
+         if (o < ug) reinterpret_cast<uint4*>(at)[o] = reinterpret_cast<const uint4*>(ec.host_gu[g])[o];
+         else reinterpret_cast<uint4*>(at + ec.dn_off[p])[o - ug] = reinterpret_cast<const uint4*>(ec.host_dn[g])[o - ug];
+@@ -1886,8 +1889,8 @@
+ }
+ void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, int* list, void* st, const Job* jobs, const int* njobs) {
+     const int p = ec.pool_of[layer];
+-    if (gu_stride != ec.dn_off[p] || ec.dn_off[p] + dn_stride != ec.slot_bytes[p])
+-        throw std::runtime_error("moe_cache: the layer's experts are not its pool's size");
++    if (gu_stride > ec.dn_off[p] || dn_stride > ec.slot_bytes[p] - ec.dn_off[p])
++        throw std::runtime_error("moe_cache: the layer's experts do not fit its pool's slots");
+     if (jobs) k_cache_plan<<<1, 32, 0, (cudaStream_t) st>>>(jobs, njobs, layer, ec, list);
+     k_cache_copy<<<160, 256, 0, (cudaStream_t) st>>>(ec, p, list, gu_stride, dn_stride);
+     ck_launch("moe_cache");
+diff -ruN varne/p100-izvor/kernels.hpp upstream/src/split/src/kernels.hpp
+--- varne/p100-izvor/kernels.hpp	2026-11-06 17:15:48.314019458 +0100
++++ upstream/src/split/src/kernels.hpp	2026-11-06 17:46:11.675180541 +0100
+@@ -314,6 +314,8 @@
+ // GP100: the decode window's routed experts, a lane per row (p100_moe_rows.cuh); x: FP16 rows
+ bool p100_rows_on();
+ void p100_f32_f16(const float* x, size_t n, uint16_t* out, void* st);
++// the rows kernel's down input from gate|up's output: swiglu_h16, or on Maxwell (FNX_ARCH < 53) the same values as f32
++void p100_swiglu_rows(const float* gu, int ffs, int P, uint16_t* h16, void* st);
+ void p100_moe_rows(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_cap, int T, const uint16_t* x, float* out, void* st);
+ // T rows of [gate (ffs) | up (ffs)] -> silu(gate) * up as q8_1 rows of ffs (the shared expert)
+ void swiglu_stacked_q8_1(const float* gu, void* hq, int ffs, int T, void* st);
+diff -ruN varne/p100-izvor/m40_moe_rows.cuh upstream/src/split/src/m40_moe_rows.cuh
+--- varne/p100-izvor/m40_moe_rows.cuh	1970-01-01 01:00:00.000000000 +0100
++++ upstream/src/split/src/m40_moe_rows.cuh	2026-11-06 20:33:28.750599858 +0100
+@@ -0,0 +1,397 @@
++// m40_moe_rows.cuh: a decode window's routed experts on Maxwell (sm_52, ai-streznik-m40), a row a lane. Maxwell has no f16 arithmetic,
++// converts at a quarter of its FMA rate, and its shared memory serves 128 bytes a clock to the whole SM, so (m40_rows_test, 2026-11-06:
++// the first version, f32 tables of 16-byte entries and the rows read from global memory in the inner loop, made 18-90 GB/s):
++//   - the job's window rows are f32 and staged, a group's worth at a time, in shared memory, where every lane reads the same address;
++//   - the grids stay ggml's bytes (8 or 4 bytes an entry, in shared memory), a byte becomes a float with a byte permute into 2^23 and
++//     one add, and a sign is a shift and an xor of the value's bit (no sign tables);
++//   - a run's grid products are summed unscaled per token and its scale goes on once (twice for the types with a scale a half run).
++// Types: the M40's GSQ IQ3_XXS (gate|up IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S; down IQ4_NL and Strata's Q2_0) and the draft layer's Q4_0.
++#pragma once
++
++#include "env.hpp"
++
++namespace fnx {
++namespace {
++
++using namespace strata::kernels::p100f::iqg;   // h2f, the group sizes (kGrBytes, kRunsGr, kSU); g16, g8, group_load from p100_moe_rows.cuh
++
++constexpr int kM40T = 128;   // threads (rows) a block
++
++// the type's table in shared memory, in 16-byte units: ggml's grids as they are (8 bytes or 4 an entry), IQ4_NL's 16 values as floats
++template <int TY> struct M40TabU { static constexpr int n = 0; };
++template <> struct M40TabU<16> { static constexpr int n = 256 * 8 / 16; };
++template <> struct M40TabU<17> { static constexpr int n = 512 * 8 / 16; };
++template <> struct M40TabU<22> { static constexpr int n = 1024 * 8 / 16; };
++template <> struct M40TabU<18> { static constexpr int n = 256 * 4 / 16; };
++template <> struct M40TabU<21> { static constexpr int n = 512 * 4 / 16; };
++template <> struct M40TabU<20> { static constexpr int n = 4; };
++
++template <int TY, int NT = kM40T>
++__device__ __forceinline__ void m40_stage(uint4* tab, const int tid) {
++    auto cp = [&](const void* from, int n) {   // 8 bytes a load: ggml's tables are 8-byte aligned, not 16
++        for (int i = tid; i < 2 * n; i += NT) reinterpret_cast<uint2*>(tab)[i] = __ldg(reinterpret_cast<const uint2*>(from) + i);
++    };
++    if constexpr (TY == 16) cp(iq2xxs_grid, M40TabU<16>::n);
++    else if constexpr (TY == 17) cp(iq2xs_grid, M40TabU<17>::n);
++    else if constexpr (TY == 22) cp(iq2s_grid, M40TabU<22>::n);
++    else if constexpr (TY == 18) cp(iq3xxs_grid, M40TabU<18>::n);
++    else if constexpr (TY == 21) cp(iq3s_grid, M40TabU<21>::n);
++    else if constexpr (TY == 20) {
++        if (tid < 16) reinterpret_cast<float*>(tab)[tid] = float(kvalues_iq4nl[tid]);
++    }
++}
++
++// byte k of w as a float: the byte into the mantissa of 2^23, then 2^23 off (a permute and an add; I2F is quarter rate)
++__device__ __forceinline__ float m40_byte(const uint32_t w, const int k) { return __uint_as_float(__byte_perm(w, 0x4B000000u, 0x7440u | k)) - 8388608.0f; }
++// a small integer as a float the same way
++__device__ __forceinline__ float m40_i(const uint32_t u) { return __uint_as_float(0x4B000000u | u) - 8388608.0f; }
++// 8 grid bytes (g.x: values 0-3, g.y: 4-7) with value j negative where bit j of s8 is set
++__device__ __forceinline__ void m40_g8(const uint2 g, const uint32_t s8, float (&v)[8]) {
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        v[i] = __uint_as_float(__float_as_uint(m40_byte(g.x, i)) ^ ((s8 << (31 - i)) & 0x80000000u));
++        v[4 + i] = __uint_as_float(__float_as_uint(m40_byte(g.y, i)) ^ ((s8 << (27 - i)) & 0x80000000u));
++    }
++}
++// ksigns_iq2xs: 7 sign bits and an eighth that makes their count even
++__device__ __forceinline__ uint32_t m40_s7(const uint32_t s7) { return s7 | ((__popc(s7) & 1u) << 7); }
++
++// the staged rows (xs: [token][XS] floats) at value `at` of the chunk times v, into each token's partial sum
++template <int TT, int XS>
++__device__ __forceinline__ void m40_mac(const float (&v)[8], const float* xs, const int at, const int n, float (&p)[TT]) {
++#pragma unroll
++    for (int k = 0; k < TT; ++k) {
++        if (k >= n) continue;
++        const float4 a = *reinterpret_cast<const float4*>(xs + k * XS + at), b = *reinterpret_cast<const float4*>(xs + k * XS + at + 4);
++        float q0 = p[k], q1 = 0.0f;   // two chains: half the dependent adds
++        q0 = fmaf(v[0], a.x, q0); q1 = fmaf(v[1], a.y, q1); q0 = fmaf(v[2], a.z, q0); q1 = fmaf(v[3], a.w, q1);
++        q0 = fmaf(v[4], b.x, q0); q1 = fmaf(v[5], b.y, q1); q0 = fmaf(v[6], b.z, q0); q1 = fmaf(v[7], b.w, q1);
++        p[k] = q0 + q1;
++    }
++}
++template <int TT>
++__device__ __forceinline__ void m40_scale(const float d, float (&p)[TT], float (&s)[TT], const int n) {
++#pragma unroll
++    for (int k = 0; k < TT; ++k)
++        if (k < n) s[k] = fmaf(d, p[k], s[k]), p[k] = 0.0f;
++}
++
++// run IB of the group W (its first byte at word 0): ggml's dequantize_row_* in f32, piece by piece of 8 values; xs holds the chunk
++template <int TY, int TT, int XS, int IB>
++__device__ __forceinline__ void m40_run(const uint32_t (&W)[kGrW<TY>], const uint4* tab, const float* xs, const int n, float (&s)[TT]) {
++    float p[TT];
++#pragma unroll
++    for (int k = 0; k < TT; ++k) p[k] = 0.0f;
++    constexpr int AT = 32 * IB;   // the run's first value in the chunk
++    float v[8];
++    if constexpr (TY == 16) {   // IQ2_XXS: 4 grid bytes, then 4 x 7 sign bits and the scale's 4
++        const uint2* grid = reinterpret_cast<const uint2*>(tab);
++        const uint32_t gi = g16<2 + 8 * IB>(W) | (g16<4 + 8 * IB>(W) << 16), aux = g16<6 + 8 * IB>(W) | (g16<8 + 8 * IB>(W) << 16);
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            m40_g8(grid[(gi >> (8 * j)) & 255], m40_s7((aux >> (7 * j)) & 127), v);
++            m40_mac<TT, XS>(v, xs, AT + 8 * j, n, p);
++        }
++        m40_scale<TT>(h2f(uint16_t(g16<0>(W))) * (0.5f + float(aux >> 28)) * 0.25f, p, s, n);
++    } else if constexpr (TY == 17) {   // IQ2_XS: 4 x (9-bit grid index, 7 sign bits), a scale nibble a half run
++        const uint2* grid = reinterpret_cast<const uint2*>(tab);
++        const uint32_t q01 = g16<2 + 8 * IB>(W) | (g16<4 + 8 * IB>(W) << 16), q23 = g16<6 + 8 * IB>(W) | (g16<8 + 8 * IB>(W) << 16);
++        const uint32_t sc = g8<66 + IB>(W);
++        const float d = h2f(uint16_t(g16<0>(W))) * 0.25f;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const uint32_t q = ((j < 2 ? q01 : q23) >> (16 * (j & 1))) & 0xffff;
++            m40_g8(grid[q & 511], m40_s7(q >> 9), v);
++            m40_mac<TT, XS>(v, xs, AT + 8 * j, n, p);
++            if (j == 1) m40_scale<TT>(d * (0.5f + float(sc & 15)), p, s, n);
++        }
++        m40_scale<TT>(d * (0.5f + float(sc >> 4)), p, s, n);
++    } else if constexpr (TY == 22) {   // IQ2_S: grid low bytes, sign bytes, 2 high bits a piece in qh, a scale nibble a half run
++        const uint2* grid = reinterpret_cast<const uint2*>(tab);
++        const uint32_t lo = g16<2 + 4 * IB>(W) | (g16<4 + 4 * IB>(W) << 16), sb = g16<34 + 4 * IB>(W) | (g16<36 + 4 * IB>(W) << 16);
++        const uint32_t qh = g8<66 + IB>(W), sc = g8<74 + IB>(W);
++        const float d = h2f(uint16_t(g16<0>(W))) * 0.25f;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            m40_g8(grid[((lo >> (8 * j)) & 255) | ((qh << (8 - 2 * j)) & 0x300u)], (sb >> (8 * j)) & 255, v);
++            m40_mac<TT, XS>(v, xs, AT + 8 * j, n, p);
++            if (j == 1) m40_scale<TT>(d * (0.5f + float(sc & 15)), p, s, n);
++        }
++        m40_scale<TT>(d * (0.5f + float(sc >> 4)), p, s, n);
++    } else if constexpr (TY == 18) {   // IQ3_XXS: 8 grid bytes (4 values each), then the signs and scale word
++        const uint32_t* grid = reinterpret_cast<const uint32_t*>(tab);
++        const uint32_t w0 = g16<2 + 8 * IB>(W), w1 = g16<4 + 8 * IB>(W), w2 = g16<6 + 8 * IB>(W), w3 = g16<8 + 8 * IB>(W);
++        const uint32_t aux = g16<66 + 4 * IB>(W) | (g16<68 + 4 * IB>(W) << 16);
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const uint32_t wj = j == 0 ? w0 : j == 1 ? w1 : j == 2 ? w2 : w3;
++            m40_g8(make_uint2(grid[wj & 255], grid[wj >> 8]), m40_s7((aux >> (7 * j)) & 127), v);
++            m40_mac<TT, XS>(v, xs, AT + 8 * j, n, p);
++        }
++        m40_scale<TT>(h2f(uint16_t(g16<0>(W))) * (0.5f + float(aux >> 28)) * 0.5f, p, s, n);
++    } else if constexpr (TY == 21) {   // IQ3_S: 8 grid bytes and a ninth bit each in qh, sign bytes, a scale nibble a run
++        const uint32_t* grid = reinterpret_cast<const uint32_t*>(tab);
++        const uint32_t w0 = g16<2 + 8 * IB>(W), w1 = g16<4 + 8 * IB>(W), w2 = g16<6 + 8 * IB>(W), w3 = g16<8 + 8 * IB>(W);
++        const uint32_t sb = g16<74 + 4 * IB>(W) | (g16<76 + 4 * IB>(W) << 16), qh = g8<66 + IB>(W);
++        const uint32_t sc = (g8<106 + IB / 2>(W) >> (4 * (IB & 1))) & 15;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const uint32_t wj = j == 0 ? w0 : j == 1 ? w1 : j == 2 ? w2 : w3;
++            const uint32_t i1 = (wj & 255) | ((qh << (8 - 2 * j)) & 256), i2 = (wj >> 8) | ((qh << (7 - 2 * j)) & 256);
++            m40_g8(make_uint2(grid[i1], grid[i2]), (sb >> (8 * j)) & 255, v);
++            m40_mac<TT, XS>(v, xs, AT + 8 * j, n, p);
++        }
++        m40_scale<TT>(h2f(uint16_t(g16<0>(W))) * float(1 + 2 * sc), p, s, n);
++    } else if constexpr (TY == 20 || TY == 2) {   // IQ4_NL (kvalues) or Q4_0 (nibble - 8): blocks of 32, value i low nibble of qs[i], 16 + i high
++        constexpr int B = 18 * IB;
++        const uint32_t q0 = g16<B + 2>(W) | (g16<B + 4>(W) << 16), q1 = g16<B + 6>(W) | (g16<B + 8>(W) << 16);
++        const uint32_t q2 = g16<B + 10>(W) | (g16<B + 12>(W) << 16), q3 = g16<B + 14>(W) | (g16<B + 16>(W) << 16);
++        const float* kv = reinterpret_cast<const float*>(tab);
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const uint32_t a = j & 1 ? q2 : q0, b = j & 1 ? q3 : q1, sh = j < 2 ? 0 : 4;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                const uint32_t na = (a >> (8 * i + sh)) & 15, nb = (b >> (8 * i + sh)) & 15;
++                if constexpr (TY == 20) v[i] = kv[na], v[4 + i] = kv[nb];
++                else v[i] = m40_i(na) - 8.0f, v[4 + i] = m40_i(nb) - 8.0f;
++            }
++            m40_mac<TT, XS>(v, xs, AT + 8 * j, n, p);
++        }
++        m40_scale<TT>(h2f(uint16_t(g16<B>(W))), p, s, n);
++    } else {   // Q2_0: blocks of 64, 2 bits a value (code - 1); run IB is half IB & 1 of block IB >> 1
++        constexpr int B = 18 * (IB >> 1), H = 8 * (IB & 1);
++        const uint32_t ql = g16<B + 2 + H>(W) | (g16<B + 4 + H>(W) << 16), qh = g16<B + 6 + H>(W) | (g16<B + 8 + H>(W) << 16);
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const uint32_t c = ((j < 2 ? ql : qh) >> (16 * (j & 1))) & 0xffff;
++#pragma unroll
++            for (int i = 0; i < 8; ++i) v[i] = m40_i((c >> (2 * i)) & 3) - 1.0f;
++            m40_mac<TT, XS>(v, xs, AT + 8 * j, n, p);
++        }
++        m40_scale<TT>(h2f(uint16_t(g16<B>(W))), p, s, n);
++    }
++}
++
++// FNX_M40_KS=5: gate|up rows split by columns for small windows (few jobs, so few blocks): a 2560-column row's 10 groups in 5 blocks of 2
++// (blockIdx.z), each writing its partial sums to slice z of Y, a.slice floats apart; k_m40_swiglu adds them in a fixed order, so the sums
++// stay the same from run to run. Off by default: m40_rows_test (2026-11-06) had it faster at T = 4 for IQ2_XXS / IQ2_XS / IQ3_XXS (259 -> 182
++// us for 10 jobs) but slower at T = 1 (IQ3_S 122 -> 202 us): the cost is the decode a weight, not the blocks
++inline int m40_ks(int T, int K) {
++    static const int ks = (int) env_int("FNX_M40_KS", 1);
++    return ks == 5 && T <= 6 && K == 2560 ? 5 : 1;
++}
++
++template <int TY, int TT, int XS>
++__device__ __forceinline__ void m40_group(const uint32_t (&W)[kGrW<TY>], const uint4* tab, const float* xs, const int n, const int cw, float (&s)[TT]) {
++    if constexpr (kRunsGr<TY> == 8) {
++        m40_run<TY, TT, XS, 0>(W, tab, xs, n, s);
++        m40_run<TY, TT, XS, 1>(W, tab, xs, n, s);
++        m40_run<TY, TT, XS, 2>(W, tab, xs, n, s);
++        m40_run<TY, TT, XS, 3>(W, tab, xs, n, s);
++        m40_run<TY, TT, XS, 4>(W, tab, xs, n, s);
++        m40_run<TY, TT, XS, 5>(W, tab, xs, n, s);
++        m40_run<TY, TT, XS, 6>(W, tab, xs, n, s);
++        m40_run<TY, TT, XS, 7>(W, tab, xs, n, s);
++    } else {
++        m40_run<TY, TT, XS, 0>(W, tab, xs, n, s);
++        m40_run<TY, TT, XS, 1>(W, tab, xs, n, s);
++        if (cw > 64) m40_run<TY, TT, XS, 2>(W, tab, xs, n, s);
++        if (cw > 96) m40_run<TY, TT, XS, 3>(W, tab, xs, n, s);
++    }
++}
++
++// a row a lane, kM40T rows a block; the K columns a group (one IQ super-block, or 4 IQ4_NL / Q4_0 blocks, or 2 Q2_0 blocks) at a time:
++// the job's rows for those columns go to shared memory first, then each lane loads its row's group and runs it. KS > 1: this block's two
++// groups of the row (m40_ks), both loaded at once, into slice blockIdx.z of Y
++template <int TY, int TT, int KS>
++__global__ void __launch_bounds__(kM40T) k_m40_rows(RowArgs a) {
++    constexpr int RUNS = kRunsGr<TY>, GB = kGrBytes<TY>, CH = 32 * RUNS, XS = KS > 1 ? 2 * CH : CH;
++    __shared__ __align__(16) float xs[TT * XS];
++    __shared__ int ys[TT];
++    extern __shared__ uint4 tab[];
++    const int tid = int(threadIdx.x), ji = int(blockIdx.y);
++    if (ji >= *a.njobs) return;
++    const Job* const J = a.jobs + ji;
++    int we_i = __ldg(&J->w);
++    if (a.phase == 1 && we_i < 0) return;
++    if (a.phase == 2) {
++        if (we_i >= 0) return;
++        we_i = ~we_i;
++    }
++    m40_stage<TY>(tab, tid);
++    const int n = min(TT, __ldg(&J->n));
++    if (tid < n) ys[tid] = __ldg(&J->y[tid]);
++    const int row = int(blockIdx.x) * kM40T + tid, N = a.N, K = a.K;
++    const float* const X = reinterpret_cast<const float*>(a.X);
++    const char* base = a.ep ? a.ep[we_i] : a.wa + size_t(we_i) * a.sa;
++    const uint8_t* rowp = reinterpret_cast<const uint8_t*>(base) + size_t(row < N ? row : 0) * a.row_bytes;
++    float s[TT];
++#pragma unroll
++    for (int k = 0; k < TT; ++k) s[k] = 0.0f;
++    if constexpr (KS > 1) {
++        const int g0 = 2 * int(blockIdx.z), c0 = g0 * CH;
++        uint32_t W0[kGrW<TY>], W1[kGrW<TY>];
++        if (row < N) {   // both groups' bytes in flight while the rows are staged
++            group_load<TY>(rowp + g0 * GB, int(a.row_bytes) - g0 * GB, W0);
++            group_load<TY>(rowp + (g0 + 1) * GB, int(a.row_bytes) - (g0 + 1) * GB, W1);
++        }
++        __syncthreads();   // the tables and ys
++        for (int i = tid; i < n * (XS / 4); i += kM40T) {
++            const int k = i / (XS / 4), c = i % (XS / 4);
++            reinterpret_cast<float4*>(xs)[k * (XS / 4) + c] = __ldg(reinterpret_cast<const float4*>(X + size_t(ys[k]) * K + c0) + c);
++        }
++        __syncthreads();
++        if (row < N) {
++            m40_group<TY, TT, XS>(W0, tab, xs, n, CH, s);
++            m40_group<TY, TT, XS>(W1, tab, xs + CH, n, CH, s);
++#pragma unroll
++            for (int k = 0; k < TT; ++k)
++                if (k < n) a.Y[size_t(blockIdx.z) * a.slice + size_t(__ldg(&J->out[k])) * N + row] = s[k];
++        }
++        return;
++    }
++    const int nch = (K + CH - 1) / CH;
++    for (int ch = 0; ch < nch; ++ch) {
++        const int c0 = ch * CH, cw = min(CH, K - c0);
++        __syncthreads();   // the last chunk's rows are done with (the first time: the tables and ys are in place)
++        for (int i = tid; i < n * (cw / 4); i += kM40T) {
++            const int k = i / (cw / 4), c = i % (cw / 4);
++            reinterpret_cast<float4*>(xs)[k * (XS / 4) + c] = __ldg(reinterpret_cast<const float4*>(X + size_t(ys[k]) * K + c0) + c);
++        }
++        __syncthreads();
++        if (row < N) {
++            uint32_t W[kGrW<TY>];
++            group_load<TY>(rowp + ch * GB, int(a.row_bytes) - ch * GB, W);
++            m40_group<TY, TT, XS>(W, tab, xs, n, cw, s);
++        }
++    }
++    if (row < N) {
++#pragma unroll
++        for (int k = 0; k < TT; ++k)
++            if (k < n) a.Y[size_t(__ldg(&J->out[k])) * N + row] = s[k];
++    }
++}
++
++// FNX_M40_LPR=5 or 10 (1: off): gate|up of a small window (T <= 4; 10 lanes only to T = 2, for shared memory) with L lanes a row, lane l
++// the row's groups l, l + L, ...: with a row a lane only 8-13 warps an SM run at T = 1-2 (640 rows of 10-16 jobs) and the kernel waits on
++// its loads (m40_rows_test, 2026-11-06: IQ3_XXS 113 us for what its instructions do in ~35; v4's second set of registers made it worse).
++// A block is kM40LR rows; the rows' chunks of a round sit CH + 4 floats apart (the L lanes' float4 reads in different banks). The lanes'
++// sums meet in shared memory and lane 0 adds them in lane order, so a row's sum does not change from run to run
++constexpr int kM40LR = 32;
++inline int m40_lpr(int T, int K, int CH) {
++    static const int lpr = (int) env_int("FNX_M40_LPR", 1);
++    if (lpr <= 1 || T > 4 || K % CH) return 1;
++    if (lpr >= 10 && T <= 2 && (K / CH) % 10 == 0) return 10;
++    return (K / CH) % 5 == 0 ? 5 : 1;
++}
++
++template <int TY, int TT, int L>
++__global__ void __launch_bounds__(kM40LR * L) k_m40_rows_l(RowArgs a) {
++    constexpr int RUNS = kRunsGr<TY>, GB = kGrBytes<TY>, CH = 32 * RUNS, CS = CH + 4, XS = L * CS, NT = kM40LR * L;
++    __shared__ __align__(16) float xs[TT * XS];
++    __shared__ float red[kM40LR * L * TT];
++    __shared__ int ys[TT];
++    extern __shared__ uint4 tab[];
++    const int tid = int(threadIdx.x), ji = int(blockIdx.y), r = tid / L, l = tid - r * L;
++    if (ji >= *a.njobs) return;
++    const Job* const J = a.jobs + ji;
++    int we_i = __ldg(&J->w);
++    if (a.phase == 1 && we_i < 0) return;
++    if (a.phase == 2) {
++        if (we_i >= 0) return;
++        we_i = ~we_i;
++    }
++    m40_stage<TY, NT>(tab, tid);
++    const int n = min(TT, __ldg(&J->n));
++    if (tid < n) ys[tid] = __ldg(&J->y[tid]);
++    const int row = int(blockIdx.x) * kM40LR + r, N = a.N, K = a.K, nch = K / CH;
++    const float* const X = reinterpret_cast<const float*>(a.X);
++    const char* base = a.ep ? a.ep[we_i] : a.wa + size_t(we_i) * a.sa;
++    const uint8_t* rowp = reinterpret_cast<const uint8_t*>(base) + size_t(row < N ? row : 0) * a.row_bytes;
++    float s[TT];
++#pragma unroll
++    for (int k = 0; k < TT; ++k) s[k] = 0.0f;
++    for (int c0 = 0; c0 < nch; c0 += L) {   // a round: chunks c0 .. c0 + L - 1, lane l's the chunk c0 + l
++        const int nc = min(L, nch - c0), per = nc * (CH / 4);
++        __syncthreads();   // the last round's rows are done with (the first time: the table and ys are in place)
++        for (int i = tid; i < n * per; i += NT) {
++            const int k = i / per, ci = (i % per) / (CH / 4), c = i % (CH / 4);
++            reinterpret_cast<float4*>(xs + k * XS + ci * CS)[c] = __ldg(reinterpret_cast<const float4*>(X + size_t(ys[k]) * K + (c0 + ci) * CH) + c);
++        }
++        __syncthreads();
++        if (row < N && l < nc) {
++            uint32_t W[kGrW<TY>];
++            group_load<TY>(rowp + (c0 + l) * GB, int(a.row_bytes) - (c0 + l) * GB, W);
++            m40_group<TY, TT, XS>(W, tab, xs + l * CS, n, CH, s);
++        }
++    }
++#pragma unroll
++    for (int k = 0; k < TT; ++k) red[(r * L + l) * TT + k] = s[k];
++    __syncthreads();
++    if (l == 0 && row < N) {
++#pragma unroll
++        for (int k = 0; k < TT; ++k) {
++            if (k >= n) continue;
++            float t = red[r * L * TT + k];
++#pragma unroll
++            for (int j = 1; j < L; ++j) t += red[(r * L + j) * TT + k];
++            a.Y[size_t(__ldg(&J->out[k])) * N + row] = t;
++        }
++    }
++}
++
++template <int TY>
++void m40_rows_launch(RowArgs a, int T, int njobs_cap, cudaStream_t s) {
++    constexpr size_t smem = size_t(M40TabU<TY>::n) * 16;
++    if (a.K % 32) throw std::runtime_error("m40 moe rows: columns not whole runs");
++    const int ks = kRunsGr<TY> == 8 ? m40_ks(T, a.K) : 1;
++    a.slice = size_t(njobs_cap) * a.N;
++    if constexpr (kRunsGr<TY> == 8) {
++        const int lpr = ks == 1 ? m40_lpr(T, a.K, 32 * kRunsGr<TY>) : 1;
++        if (lpr > 1) {
++            const dim3 g((a.N + kM40LR - 1) / kM40LR, njobs_cap);
++            if (lpr == 10) {
++                if (T <= 1) k_m40_rows_l<TY, 1, 10><<<g, kM40LR * 10, smem, s>>>(a);
++                else k_m40_rows_l<TY, 2, 10><<<g, kM40LR * 10, smem, s>>>(a);
++            } else if (T <= 1) k_m40_rows_l<TY, 1, 5><<<g, kM40LR * 5, smem, s>>>(a);
++            else if (T == 2) k_m40_rows_l<TY, 2, 5><<<g, kM40LR * 5, smem, s>>>(a);
++            else if (T == 3) k_m40_rows_l<TY, 3, 5><<<g, kM40LR * 5, smem, s>>>(a);
++            else k_m40_rows_l<TY, 4, 5><<<g, kM40LR * 5, smem, s>>>(a);
++            return;
++        }
++    }
++    const dim3 grid((a.N + kM40T - 1) / kM40T, njobs_cap, ks);
++    if (ks == 5) {
++        if (T <= 1) k_m40_rows<TY, 1, 5><<<grid, kM40T, smem, s>>>(a);
++        else if (T == 2) k_m40_rows<TY, 2, 5><<<grid, kM40T, smem, s>>>(a);
++        else if (T == 3) k_m40_rows<TY, 3, 5><<<grid, kM40T, smem, s>>>(a);
++        else if (T == 4) k_m40_rows<TY, 4, 5><<<grid, kM40T, smem, s>>>(a);
++        else k_m40_rows<TY, 6, 5><<<grid, kM40T, smem, s>>>(a);
++        return;
++    }
++    if (T <= 1) k_m40_rows<TY, 1, 1><<<grid, kM40T, smem, s>>>(a);
++    else if (T == 2) k_m40_rows<TY, 2, 1><<<grid, kM40T, smem, s>>>(a);
++    else if (T == 3) k_m40_rows<TY, 3, 1><<<grid, kM40T, smem, s>>>(a);
++    else if (T == 4) k_m40_rows<TY, 4, 1><<<grid, kM40T, smem, s>>>(a);
++    else if (T <= 6) k_m40_rows<TY, 6, 1><<<grid, kM40T, smem, s>>>(a);
++    else if (T <= 8) k_m40_rows<TY, 8, 1><<<grid, kM40T, smem, s>>>(a);
++    else if (T <= 12) k_m40_rows<TY, 12, 1><<<grid, kM40T, smem, s>>>(a);
++    else k_m40_rows<TY, 16, 1><<<grid, kM40T, smem, s>>>(a);
++}
++
++// the decode path's f32 inputs (the M40 build): the FFN input as it is, and silu(gate) * up of each pair (all, or only after a list's
++// copies); gate|up's ks partial slices (m40_ks: P = T TOPK pairs, columns N) added first, in order
++__global__ void __launch_bounds__(256) k_m40_swiglu(const float* __restrict__ gu, int ffs, int P, float* __restrict__ h, const int* __restrict__ list, int ks) {
++    if (list && list[0] == 0) return;
++    const size_t sl = size_t(P) * 2 * ffs;
++    for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < (size_t) P * ffs; e += (size_t) gridDim.x * blockDim.x) {
++        const size_t r = e / ffs, i = e % ffs;
++        float g = gu[r * 2 * ffs + i], u = gu[r * 2 * ffs + ffs + i];
++        for (int k = 1; k < ks; ++k) g += gu[k * sl + r * 2 * ffs + i], u += gu[k * sl + r * 2 * ffs + ffs + i];
++        h[e] = g / (1.0f + __expf(-g)) * u;
++    }
++}
++
++}  // namespace
++}  // namespace fnx
+diff -ruN varne/p100-izvor/model.cpp upstream/src/split/src/model.cpp
+--- varne/p100-izvor/model.cpp	2026-11-06 17:15:48.413020128 +0100
++++ upstream/src/split/src/model.cpp	2026-11-06 18:47:34.231552726 +0100
+@@ -33,6 +33,7 @@
+ #include <malloc.h>
+ #include <map>
+ #include <mutex>
++#include <set>
+ 
+ namespace fnx {
+ 
+@@ -312,28 +313,69 @@
+         c.host_bytes += bytes;
+         return (uint8_t*) hp;
+     }
+-    // routed experts (h from expert_buf: every expert's matrix, stride bytes apart): to VRAM at p, or with an
+-    // ExpertCache each one's address in host_of (the layer's row of the card's host addresses)
+-    void place(DW& w, const uint8_t* h, size_t bytes, size_t stride, const char** host_of) {
++    // n routed experts of stride bytes each, copy(e, dst) writing expert e: to VRAM at w.p, or with an ExpertCache each one's
++    // address in host_of (the layer's row of the card's host addresses). perm (the layer's row of Model::perm, FNX_EXPERT_DYN_GIB):
++    // those go to a VRAM block of their own (perm_at[e], host_of[e] null) and only the others to page-locked host memory
++    template <typename F>
++    void experts(DW& w, size_t stride, int n, const char** host_of, const char* perm, const char** perm_at, F&& copy) {
+         if (!host_of) {
+-            w.p = put<uint8_t>(h, bytes);
++            std::vector<uint8_t> tmp((size_t) n * stride);
++            for (int e = 0; e < n; ++e) copy(e, &tmp[(size_t) e * stride]);
++            w.p = put<uint8_t>(tmp.data(), tmp.size());
+             return;
+         }
+-        void* dp = nullptr;
+-        if (store) dp = (void*) h;   // the shared host memory has one address for the CPU and the cards
+-        else ck(cudaHostGetDevicePointer(&dp, (void*) h, 0), "place: mapped pointer");
+-        for (size_t e = 0; e < bytes / stride; ++e) host_of[e] = (const char*) dp + e * stride;
++        int np = 0;
++        if (perm)
++            for (int e = 0; e < n; ++e) np += perm[e] ? 1 : 0;
++        if (np && store) throw std::runtime_error("experts: the holder keeps every expert's host copy (no FNX_EXPERT_DYN_GIB)");
++        std::vector<uint8_t> unused, pt((size_t) np * stride);
++        uint8_t* h = np < n ? expert_buf((size_t) (n - np) * stride, host_of, unused) : nullptr;
++        for (int e = 0, kh = 0, kp = 0; e < n; ++e) copy(e, np && perm[e] ? &pt[(size_t) kp++ * stride] : h + (size_t) kh++ * stride);
++        char* dp = nullptr;
++        if (h) {
++            if (store) dp = (char*) h;   // the shared host memory has one address for the CPU and the cards
++            else ck(cudaHostGetDevicePointer((void**) &dp, (void*) h, 0), "experts: mapped pointer");
++        }
++        char* vp = nullptr;
++        if (np) {
++            ck(cudaMalloc((void**) &vp, pt.size()), "experts: the permanent ones' block");
++            ck(cudaMemcpy(vp, pt.data(), pt.size(), cudaMemcpyHostToDevice), "experts: the permanent ones' upload");
++            c.perm_mem.push_back(vp);
++            c.perm_bytes += pt.size();
++            c.bytes += pt.size();
++        }
++        for (int e = 0, kh = 0, kp = 0; e < n; ++e)
++            if (np && perm[e]) {
++                host_of[e] = nullptr;
++                perm_at[e] = vp + (size_t) kp++ * stride;
++            } else {
++                host_of[e] = dp + (size_t) kh++ * stride;
++            }
+     }
+     // the card's ExpertCache: a slot for each resident expert (res) in its size's pool, filled from its host copy; the
+     // layers' tables. With arena_score (FNX_ARENA) the largest pool's slots go coldest first and are neither allocated
+-    // nor filled here: the engine puts them in its arena (Engine::arena_fill); until then its experts point at RAM
++    // nor filled here: the engine puts them in its arena (Engine::arena_fill); until then its experts point at RAM.
++    // pool_of / pad (Model's plan_pools): each layer's pool and the pools' padded sizes, else one pool per size. perm
++    // (FNX_EXPERT_DYN_GIB): those experts are in VRAM already (c.perm_gu / perm_dn) and take no pool slot: their slot
++    // numbers follow the pools' (n_dyn and on), so a hit finds them and no CLOCK hand, lend or copy ever reaches them
+     void expert_cache(const std::vector<std::vector<char>>& res, const std::vector<const char*>& hgu, const std::vector<const char*>& hdn,
+-                      const std::vector<double>* arena_score) {
++                      const std::vector<double>* arena_score, const std::vector<std::vector<char>>& perm = {},
++                      const std::vector<int>& plan = {}, const std::vector<std::pair<size_t, size_t>>& pad = {}) {
+         ExpertCache& ec = c.ec;
+         std::vector<std::pair<size_t, size_t>> sizes;   // each pool's (gate|up, down) bytes
+         for (int l = 0; l < NL; ++l) {
+             const LayerW& L = c.L[(size_t) l];
+             if (L.gu_e_stride % 16 || L.down_e_stride % 16) throw std::runtime_error("expert cache: expert strides not in 16-byte units");
++            ec.gu_b[l] = (int) L.gu_e_stride;
++            ec.dn_b[l] = (int) L.down_e_stride;
++            if (!plan.empty()) {
++                const int p = plan[(size_t) l];
++                if (p < 0 || p >= (int) pad.size() || pad.size() > EC_POOLS || L.gu_e_stride > pad[(size_t) p].first ||
++                    L.down_e_stride > pad[(size_t) p].second)
++                    throw std::runtime_error("expert cache: layer " + std::to_string(l) + "'s experts do not fit its planned pool");
++                ec.pool_of[l] = p;
++                continue;
++            }
+             const std::pair<size_t, size_t> s{L.gu_e_stride, L.down_e_stride};
+             auto it = std::find(sizes.begin(), sizes.end(), s);
+             if (it == sizes.end()) {
+@@ -343,6 +385,7 @@
+             }
+             ec.pool_of[l] = (int) (it - sizes.begin());
+         }
++        if (!plan.empty()) sizes = pad;
+         ec.n_pools = (int) sizes.size();
+         if (arena_score) {   // the largest pool by bytes
+             size_t most = 0;
+@@ -353,12 +396,13 @@
+             }
+         }
+         std::vector<int> owner, slot_of((size_t) NL * NEXP, -1);
++        auto permanent = [&](int l, int e) { return !perm.empty() && perm[(size_t) l][(size_t) e]; };
+         for (int p = 0; p < ec.n_pools; ++p) {
+             ec.s0[p] = (int) owner.size();
+             for (int l = 0; l < NL; ++l)
+                 if (ec.pool_of[l] == p)
+                     for (int e = 0; e < NEXP; ++e)
+-                        if (res[(size_t) l][(size_t) e]) owner.push_back(l * NEXP + e);
++                        if (res[(size_t) l][(size_t) e] && !permanent(l, e)) owner.push_back(l * NEXP + e);
+             if (p == ec.arena_pool)
+                 std::stable_sort(owner.begin() + ec.s0[p], owner.end(),
+                                  [&](int a, int b) { return (*arena_score)[(size_t) a] < (*arena_score)[(size_t) b]; });
+@@ -374,10 +418,26 @@
+             if (track) track->push_back(ec.pool[p]);
+             c.bytes += (size_t) ec.n[p] * ec.slot_bytes[p];
+         }
++        ec.n_dyn = (int) owner.size();
++        std::vector<const char*> epg(hgu), epd(hdn);
++        if (!perm.empty()) {   // the permanent experts: slot numbers after the pools', their VRAM blocks' addresses
++            if (c.perm_gu.size() != (size_t) NL * NEXP || c.perm_dn.size() != (size_t) NL * NEXP)
++                throw std::runtime_error("expert cache: the permanent experts were not placed");
++            for (int l = 0; l < NL; ++l)
++                for (int e = 0; e < NEXP; ++e)
++                    if (permanent(l, e)) {
++                        const size_t i = (size_t) l * NEXP + e;
++                        if (!c.perm_gu[i] || !c.perm_dn[i] || hgu[i] || hdn[i])
++                            throw std::runtime_error("expert cache: a permanent expert with a host copy or without its VRAM block");
++                        slot_of[i] = (int) owner.size();
++                        owner.push_back((int) i);
++                        epg[i] = c.perm_gu[i];
++                        epd[i] = c.perm_dn[i];
++                    }
++        }
+         ec.n_slots = (int) owner.size();
+         ec.arena_full = arena_score && ec.n_slots == NL * NEXP;
+-        std::vector<const char*> epg(hgu), epd(hdn);
+-        for (int s = 0; s < ec.n_slots; ++s) {
++        for (int s = 0; s < ec.n_dyn; ++s) {
+             const int i = owner[(size_t) s], p = ec.pool_of[i / NEXP];
+             if (p == ec.arena_pool) continue;
+             const LayerW& L = c.L[(size_t) (i / NEXP)];
+@@ -623,7 +683,8 @@
+         return w;
+     }
+     // per expert: rows [r0, r1) of t1 then of t2 (gate; up), expert-major
+-    DW expert_rows2(const Tensor& t1, const Tensor& t2, int r0, int r1, size_t& stride, const char** host_of = nullptr) {
++    DW expert_rows2(const Tensor& t1, const Tensor& t2, int r0, int r1, size_t& stride, const char** host_of = nullptr,
++                    const char* perm = nullptr, const char** perm_at = nullptr) {
+         if (t1.type != t2.type || t1.ne[0] != t2.ne[0] || t1.ne[2] != t2.ne[2]) throw std::runtime_error(t1.name + " and " + t2.name + " do not stack");
+         row_range(t1, r0, r1);
+         row_range(t2, r0, r1);
+@@ -634,14 +695,10 @@
+         w.row_bytes = t1.row_bytes();
+         stride = (size_t) w.n_out * w.row_bytes;
+         const size_t half = (size_t) (r1 - r0) * w.row_bytes, src_mat = (size_t) t1.ne[1] * w.row_bytes;
+-        std::vector<uint8_t> tmp;
+-        const size_t bytes = (size_t) t1.ne[2] * stride;
+-        uint8_t* h = expert_buf(bytes, host_of, tmp);
+-        for (int64_t e = 0; e < t1.ne[2]; ++e) {
+-            std::memcpy(&h[e * stride], t1.data + e * src_mat + (size_t) r0 * w.row_bytes, half);
+-            std::memcpy(&h[e * stride + half], t2.data + e * src_mat + (size_t) r0 * w.row_bytes, half);
+-        }
+-        place(w, h, bytes, stride, host_of);
++        experts(w, stride, (int) t1.ne[2], host_of, perm, perm_at, [&](int64_t e, uint8_t* dst) {
++            std::memcpy(dst, t1.data + e * src_mat + (size_t) r0 * w.row_bytes, half);
++            std::memcpy(dst + half, t2.data + e * src_mat + (size_t) r0 * w.row_bytes, half);
++        });
+         return w;
+     }
+     // f32 tensors' rows one after another
+@@ -671,9 +728,18 @@
+         }
+         return put<uint16_t>(h.data(), h.size() * 2);
+     }
+-    // per expert: every row, input blocks [b0, b1) (down), expert-major
+-    DW expert_cols(const Tensor& t, int b0, int b1, size_t& stride, const char** host_of = nullptr) {
+-        const TypeInfo ti = block32(t);
++    // per expert: every row, input blocks [b0, b1) (down, counted in 32-value blocks), expert-major. Strata's Q2_0 has 64-value
++    // blocks: a card's slice must then start and end on one (two cards: 5 of them each)
++    DW expert_cols(const Tensor& t, int b0, int b1, size_t& stride, const char** host_of = nullptr, const char* perm = nullptr,
++                   const char** perm_at = nullptr) {
++        const TypeInfo ti = t.type == T_Q2_0 ? type_info(t.type) : block32(t);
++        if (ti.block != 32) {
++            const int k = ti.block / 32;
++            if (ti.block % 32 || b0 % k || b1 % k)
++                throw std::runtime_error(t.name + ": a card's columns [" + std::to_string(32 * b0) + ", " + std::to_string(32 * b1) +
++                                         ") are not whole " + std::to_string(ti.block) + "-value blocks");
++            b0 /= k, b1 /= k;
++        }
+         DW w;
+         w.type = t.type;
+         w.n_in = (b1 - b0) * ti.block;
+@@ -684,13 +750,10 @@
+         if (b0 < 0 || b1 <= b0 || (size_t) b1 * ti.bytes > src_row)
+             throw std::runtime_error(t.name + ": blocks [" + std::to_string(b0) + ", " + std::to_string(b1) + ") asked for, a row has " +
+                                      std::to_string(src_row / ti.bytes));
+-        std::vector<uint8_t> tmp;
+-        const size_t bytes = (size_t) t.ne[2] * stride;
+-        uint8_t* h = expert_buf(bytes, host_of, tmp);
+-        for (int64_t e = 0; e < t.ne[2]; ++e)
++        experts(w, stride, (int) t.ne[2], host_of, perm, perm_at, [&](int64_t e, uint8_t* dst) {
+             for (int r = 0; r < w.n_out; ++r)
+-                std::memcpy(&h[e * stride + (size_t) r * w.row_bytes], t.data + e * src_mat + (size_t) r * src_row + (size_t) b0 * ti.bytes, w.row_bytes);
+-        place(w, h, bytes, stride, host_of);
++                std::memcpy(dst + (size_t) r * w.row_bytes, t.data + e * src_mat + (size_t) r * src_row + (size_t) b0 * ti.bytes, w.row_bytes);
++        });
+         return w;
+     }
+ };
+@@ -701,6 +764,53 @@
+     return v;
+ }
+ 
++// The expert pools: layers whose experts have the same (gate|up, down) bytes on a card share one; with more sizes than max_pools
++// the two groups whose union pads the fewest bytes (each layer's experts padded to the group's largest gate|up and down) merge
++// until max_pools are left. sz: each layer's sizes; pad: each pool's (padded) sizes, in the order of their first layers.
++// Deterministic, so the residency choice and the loader agree
++std::vector<int> plan_pools(const std::vector<std::pair<size_t, size_t>>& sz, int max_pools, std::vector<std::pair<size_t, size_t>>& pad) {
++    struct G {
++        size_t gu, dn;
++        std::vector<int> layers;
++    };
++    std::vector<G> g;
++    for (int l = 0; l < (int) sz.size(); ++l) {
++        auto it = std::find_if(g.begin(), g.end(), [&](const G& x) { return x.gu == sz[(size_t) l].first && x.dn == sz[(size_t) l].second; });
++        if (it == g.end()) g.push_back(G{sz[(size_t) l].first, sz[(size_t) l].second, {}}), it = g.end() - 1;
++        it->layers.push_back(l);
++    }
++    auto waste = [&](size_t gu, size_t dn, const std::vector<int>& ls) {
++        size_t w = 0;
++        for (int l : ls) w += (gu - sz[(size_t) l].first) + (dn - sz[(size_t) l].second);
++        return w;
++    };
++    while ((int) g.size() > max_pools) {
++        size_t best = SIZE_MAX;
++        size_t bi = 0, bj = 1;
++        for (size_t i = 0; i < g.size(); ++i)
++            for (size_t j = i + 1; j < g.size(); ++j) {
++                std::vector<int> ls = g[i].layers;
++                ls.insert(ls.end(), g[j].layers.begin(), g[j].layers.end());
++                const size_t d = waste(std::max(g[i].gu, g[j].gu), std::max(g[i].dn, g[j].dn), ls) - waste(g[i].gu, g[i].dn, g[i].layers) -
++                                 waste(g[j].gu, g[j].dn, g[j].layers);
++                if (d < best) best = d, bi = i, bj = j;
++            }
++        g[bi].gu = std::max(g[bi].gu, g[bj].gu);
++        g[bi].dn = std::max(g[bi].dn, g[bj].dn);
++        g[bi].layers.insert(g[bi].layers.end(), g[bj].layers.begin(), g[bj].layers.end());
++        std::sort(g[bi].layers.begin(), g[bi].layers.end());
++        g.erase(g.begin() + (long) bj);
++    }
++    std::sort(g.begin(), g.end(), [](const G& a, const G& b) { return a.layers[0] < b.layers[0]; });
++    std::vector<int> pool_of(sz.size(), 0);
++    pad.clear();
++    for (size_t k = 0; k < g.size(); ++k) {
++        pad.emplace_back(g[k].gu, g[k].dn);
++        for (int l : g[k].layers) pool_of[(size_t) l] = (int) k;
++    }
++    return pool_of;
++}
++
+ #if FNX_27B
+ // The 27B's layers on a card, from load_card's channel lists: the recurrent layers as Flash-Next's; attention split by
+ // heads (K/V too: each card keeps its own heads' cache, src/s27_attn.cuh), q | gate, K and V stacked in one matrix;
+@@ -791,11 +901,17 @@
+ 
+ // The tensors come from st: group l is layer l's, group NL the output head's (stage_groups); each group is given back
+ // once this card is through with it.
+-// host_experts: every routed expert to a host copy (an ExpertCache, or the lab's holder); store: the holder's shared memory
++// host_experts: every routed expert to a host copy (an ExpertCache, or the lab's holder); store: the holder's shared memory.
++// perm (FNX_EXPERT_DYN_GIB): those experts to VRAM for good as their layer loads, with no host copy; plan / pad: the pools
+ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resident, const std::vector<double>* arena_score,
+-               Store* store, bool host_experts) {
++               Store* store, bool host_experts, const std::vector<std::vector<char>>& perm = {}, const std::vector<int>& plan = {},
++               const std::vector<std::pair<size_t, size_t>>& pad = {}) {
+     ck(cudaSetDevice(c.dev), "cudaSetDevice");
+     Up up{c, store};
++    if (!perm.empty()) {
++        c.perm_gu.assign((size_t) NL * NEXP, nullptr);
++        c.perm_dn.assign((size_t) NL * NEXP, nullptr);
++    }
+     auto L = [&](int l, const char* s) -> const Tensor& { return st.t(l, "blk." + std::to_string(l) + "." + s); };
+     // recurrent channel lists: q, k for this card's key heads; v for its value heads (s * NKH + k)
+     std::vector<int> qch, kch, vch, vblocks;
+@@ -891,8 +1007,11 @@
+             w.idx_qn = up.f32(L(l, "indexer.q_norm.weight"), QSA_KEY);
+             w.idx_kn = up.f32(L(l, "indexer.k_norm.weight"), QSA_KEY);
+         }
+-        w.gu_e = up.expert_rows2(L(l, "ffn_gate_exps.weight"), L(l, "ffn_up_exps.weight"), c.ff0, c.ff1, w.gu_e_stride, hg);
+-        w.down_e = up.expert_cols(L(l, "ffn_down_exps.weight"), c.ff0 / 32, c.ff1 / 32, w.down_e_stride, hd);
++        const char* pr = perm.empty() ? nullptr : perm[(size_t) l].data();
++        w.gu_e = up.expert_rows2(L(l, "ffn_gate_exps.weight"), L(l, "ffn_up_exps.weight"), c.ff0, c.ff1, w.gu_e_stride, hg, pr,
++                                 pr ? c.perm_gu.data() + (size_t) l * NEXP : nullptr);
++        w.down_e = up.expert_cols(L(l, "ffn_down_exps.weight"), c.ff0 / 32, c.ff1 / 32, w.down_e_stride, hd, pr,
++                                  pr ? c.perm_dn.data() + (size_t) l * NEXP : nullptr);
+         w.sh_gu = up.dense(up.rows2(L(l, "ffn_gate_shexp.weight"), range(c.ff0, c.ff1), L(l, "ffn_up_shexp.weight"), range(c.ff0, c.ff1)));
+         w.sh_down = up.dense(up.cols(L(l, "ffn_down_shexp.weight"), range(c.ff0 / 32, c.ff1 / 32)));
+         if (!w.sh_gu.s.q || !w.sh_down.s.q) throw std::runtime_error("fnx: the shared expert is not Q8_0");
+@@ -927,7 +1046,7 @@
+     if (!resident.empty()) {   // tracked, so the engine can place them again with more in RAM (Engine: VRAM short)
+         const size_t before = c.bytes;
+         Up ue{c, store, &c.expert_mem};
+-        ue.expert_cache(resident, hgu, hdn, arena_score);
++        ue.expert_cache(resident, hgu, hdn, arena_score, perm, plan, pad);
+         c.expert_bytes = c.bytes - before;
+     } else if (host_experts) c.ec_host_gu = hgu, c.ec_host_dn = hdn;   // the holder: placed by a worker
+ }
+@@ -1269,7 +1388,13 @@
+ // the cards (the app's rule, strata_control/split_engine.py, refuses it earlier; this is the same check for a start that skipped the rule). The
+ // server then starts the normal layer split. Q2_0 is not listed: the Gguf has already repacked it to Q4_0.
+ static void check_supported(const Gguf& g) {
++#if FNX_ARCH < 53
++    // Maxwell's expert kernels (m40_moe_rows.cuh, p100_moe.cu): the M40's GSQ IQ3_XXS, with its IQ2_XXS / IQ2_XS gate|up and Q2_0 down read
++    // as they are (FNX_Q2_0_NATIVE), and the draft layer's Q4_0
++    const uint32_t ok[] = {T_Q4_0, T_IQ4_NL, T_IQ3_S, T_IQ3_XXS, T_IQ2_S, T_IQ2_XS, T_IQ2_XXS, T_Q2_0};
++#else
+     const uint32_t ok[] = {T_Q4_K, T_Q5_K, T_Q5_1, T_Q8_0, T_Q4_0, T_IQ4_NL, T_IQ4_XS, T_IQ3_S, T_IQ3_XXS, T_IQ2_S};
++#endif
+     for (const auto& kv : g.tensors()) {
+         const std::string& n = kv.first;
+         if (n.find("_exps.weight") == std::string::npos || n.find("shexp") != std::string::npos) continue;
+@@ -1472,7 +1597,7 @@
+         th.emplace_back([&, c] {
+             try {
+                 load_card(st, cards[c], resident, arena ? &score : nullptr, how == Load::HOLD ? store : nullptr,
+-                          how == Load::HOLD || !resident.empty());
++                          how == Load::HOLD || !resident.empty(), perm, pool_of, pool_pad);
+             } catch (const std::exception& e) {
+                 errs[c] = e.what();
+                 st.abort("card " + std::to_string(c) + " failed");   // the other cards wait on groups no one gives back
+@@ -1492,6 +1617,9 @@
+ void Model::choose_residency() {
+     resident.clear();
+     score.clear();
++    perm.clear();
++    pool_of.clear();
++    pool_pad.clear();
+     // prod's settings are the defaults: the arena, the coldest 3 GiB of experts in RAM, ranked by
+     // data/expert-routes.bin (expert use tallied over an agentic code-review panel).
+     // FNX_ARENA=0 and FNX_EXPERT_RAM_GIB=off together: every expert in VRAM, no expert cache
+@@ -1538,26 +1666,74 @@
+         std::vector<int> order((size_t) NL * NEXP);
+         for (int i = 0; i < NL * NEXP; ++i) order[(size_t) i] = i;
+         std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return score[(size_t) a] < score[(size_t) b]; });
++        // the pools: one per expert size on a card, at most EC_POOLS (more sizes share padded pools: the M40's GSQ IQ3_XXS has 10)
++        std::vector<std::pair<size_t, size_t>> card_sz((size_t) NL);
++        for (int l = 0; l < NL; ++l) {
++            const std::string b = "blk." + std::to_string(l) + ".";
++            const Tensor& tg = g.t(b + "ffn_gate_exps.weight");
++            const Tensor& tdn = g.t(b + "ffn_down_exps.weight");
++            const TypeInfo ti = type_info(tdn.type);
++            for (const CardW& cw : cards) {
++                const size_t ffs = (size_t) (cw.ff1 - cw.ff0);
++                card_sz[(size_t) l].first = std::max(card_sz[(size_t) l].first, 2 * ffs * tg.row_bytes());
++                card_sz[(size_t) l].second = std::max(card_sz[(size_t) l].second, (size_t) tdn.ne[1] * (ffs / (size_t) ti.block) * ti.bytes);
++            }
++        }
++        std::vector<std::pair<size_t, size_t>> pad;
++        std::vector<int> plan = plan_pools(card_sz, EC_POOLS, pad);
++        const char* dyn_s = std::getenv("FNX_EXPERT_DYN_GIB");
++        if (dyn_s || pad.size() < std::set<std::pair<size_t, size_t>>(card_sz.begin(), card_sz.end()).size()) pool_of = plan, pool_pad = pad;
++        // each pool keeps this many of its experts in VRAM, and with FNX_EXPERT_DYN_GIB this many dynamic ones (the misses', the
++        // K/V arena's and the prompt path's slots): a window's picks and the next layer's guesses
++        const int keep = (int) std::max<long long>(2 * MAXT * TOPK + 64, env_int("FNX_EXPERT_DYN_MIN", 2 * MAXT * TOPK + 64));
+         resident.assign(NL, std::vector<char>(NEXP, 1));
+         double moved = 0;
+         int n = 0, extra = 0;
+-        std::vector<std::pair<double, int>> left;   // the experts each size still has in VRAM
+-        for (int l = 0; l < NL; ++l) {
+-            auto it = std::find_if(left.begin(), left.end(), [&](const auto& x) { return x.first == bytes[(size_t) l]; });
+-            if (it == left.end()) left.emplace_back(bytes[(size_t) l], NEXP);
+-            else it->second += NEXP;
+-        }
++        std::vector<int> left(pad.size(), 0);   // the experts each pool still has in VRAM
++        for (int l = 0; l < NL; ++l) left[(size_t) plan[(size_t) l]] += NEXP;
+         for (int i : order) {
+             if (moved >= want && extra++ >= ram_extra) break;
+-            auto it = std::find_if(left.begin(), left.end(), [&](const auto& x) { return x.first == bytes[(size_t) (i / NEXP)]; });
+-            if (it->second <= 2 * MAXT * TOPK + 64) continue;   // a pool must keep a window's picks
+-            --it->second;
++            int& lp = left[(size_t) plan[(size_t) (i / NEXP)]];
++            if (lp <= keep) continue;   // a pool must keep a window's picks
++            --lp;
+             resident[(size_t) (i / NEXP)][(size_t) (i % NEXP)] = 0;
+             moved += bytes[(size_t) (i / NEXP)];
+             ++n;
+         }
+         std::fprintf(stderr, "fnx: %d of %d routed experts (%.1f GiB) in RAM, ranked by %s%s\n", n, NL * NEXP, moved / (1ull << 30), prof,
+                      ram_extra ? (" (" + std::to_string(ram_extra) + " of them because VRAM was short)").c_str() : "");
++        if (dyn_s) {
++            // FNX_EXPERT_DYN_GIB=G: of the experts in VRAM the coldest G GiB (at least `keep` a pool) stay dynamic, with a host copy;
++            // the rest are permanent: placed once, no host copy, so RAM holds G plus FNX_EXPERT_RAM_GIB of experts
++            char* end = nullptr;
++            const double dyn_gib = std::strtod(dyn_s, &end);
++            if (end == dyn_s || *end || dyn_gib < 0) throw std::runtime_error(std::string("fnx: FNX_EXPERT_DYN_GIB: GiB (0 or more), not '") + dyn_s + "'");
++            perm.assign(NL, std::vector<char>(NEXP, 0));
++            std::vector<char> dyn((size_t) NL * NEXP, 0);
++            std::vector<int> per(pad.size(), 0);
++            double dyn_bytes = 0;
++            int nd = 0;
++            auto take = [&](int i) {
++                dyn[(size_t) i] = 1;
++                ++per[(size_t) plan[(size_t) (i / NEXP)]];
++                dyn_bytes += bytes[(size_t) (i / NEXP)];
++                ++nd;
++            };
++            for (int i : order)   // each pool's coldest `keep` first
++                if (resident[(size_t) (i / NEXP)][(size_t) (i % NEXP)] && per[(size_t) plan[(size_t) (i / NEXP)]] < keep) take(i);
++            for (int i : order)
++                if (dyn_bytes < dyn_gib * (double) (1ull << 30) && resident[(size_t) (i / NEXP)][(size_t) (i % NEXP)] && !dyn[(size_t) i]) take(i);
++            int np = 0;
++            double pb = 0;
++            for (int l = 0; l < NL; ++l)
++                for (int e = 0; e < NEXP; ++e)
++                    if (resident[(size_t) l][(size_t) e] && !dyn[(size_t) l * NEXP + e]) perm[(size_t) l][(size_t) e] = 1, ++np, pb += bytes[(size_t) l];
++            std::string pools;
++            for (size_t p = 0; p < pad.size(); ++p)
++                pools += (p ? ", " : "") + std::to_string(per[p]) + " x " + std::to_string((pad[p].first + pad[p].second) >> 10) + " KiB";
++            std::fprintf(stderr, "fnx: FNX_EXPERT_DYN_GIB: %d experts (%.1f GiB) permanent in VRAM with no host copy, %d (%.1f GiB) dynamic in %zu pools (%s); RAM holds %.1f GiB of experts\n",
++                         np, pb / (1ull << 30), nd, dyn_bytes / (1ull << 30), pad.size(), pools.c_str(), (dyn_bytes + moved) / (1ull << 30));
++        }
+     }
+ }
+ 
+@@ -1575,13 +1751,28 @@
+         const_cast<Tensor&>(t).data = nullptr;   // a reader past this point stops at once, it does not read zeros
+     }
+     malloc_trim(0);
++    // FNX_PLE_RAM=0 (the M40's 30 GiB): the PLE table (26.8 GiB) stays in the file, read through the page cache like Strata's own engine
++    // does: random access (no read-around of 128 KiB a fault), and its file's cached pages are kept (Strata shares them: the same file)
++    const bool ple_ram = env_int("FNX_PLE_RAM", 1) != 0;
++    const int ple_shard = m.ple_table ? m.ple_table->shard : -1;
+     {   // after everything else: with the converted tensors gone the load's peak stays about 9 GiB lower, and the kernel has no reason to swap
+         const auto t1 = std::chrono::steady_clock::now();
+-        for (const Tensor* t : {m.tok_embd, m.ple_table}) lock_in_ram(m.g, *t);
+-        std::fprintf(stderr, "fnx: %s and %s (%.1f GB) locked in RAM in %.1f s\n", m.tok_embd->name.c_str(), m.ple_table->name.c_str(),
+-                     (m.tok_embd->nbytes + m.ple_table->nbytes) / 1e9, std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count());
++        lock_in_ram(m.g, *m.tok_embd);
++        if (ple_ram) lock_in_ram(m.g, *m.ple_table);
++        std::fprintf(stderr, "fnx: %s%s%s (%.1f GB) locked in RAM in %.1f s\n", m.tok_embd->name.c_str(), ple_ram ? " and " : "",
++                     ple_ram ? m.ple_table->name.c_str() : "", (m.tok_embd->nbytes + (ple_ram ? m.ple_table->nbytes : 0)) / 1e9,
++                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count());
+     }
+     for (int s = 0; s < m.g.shards(); ++s) {
++        if (!ple_ram && s == ple_shard) {
++            // the table's own pages stay mapped and cached; only what the load touched around it is dropped
++            const uintptr_t PG = 4096, base = (uintptr_t) m.g.shard_base(s), end = base + m.g.shard_size(s),
++                            a0 = (uintptr_t) m.ple_table->data / PG * PG, e0 = ((uintptr_t) m.ple_table->data + m.ple_table->nbytes + PG - 1) / PG * PG;
++            if (a0 > base) madvise((void*) base, a0 - base, MADV_DONTNEED);
++            if (end > e0) madvise((void*) e0, end - e0, MADV_DONTNEED);
++            madvise((void*) a0, e0 - a0, MADV_RANDOM);
++            continue;
++        }
+         madvise((void*) m.g.shard_base(s), m.g.shard_size(s), MADV_DONTNEED);
+         const int fd = ::open(m.g.shard_path(s).c_str(), O_RDONLY);
+         if (fd >= 0) {
+@@ -1589,6 +1780,9 @@
+             ::close(fd);
+         }
+     }
++    if (!ple_ram)
++        std::fprintf(stderr, "fnx: FNX_PLE_RAM=0: %s (%.1f GB) read from its file through the page cache\n", m.ple_table->name.c_str(),
++                     m.ple_table->nbytes / 1e9);
+     auto swap_mib = [] {
+         std::ifstream f("/proc/self/status");
+         std::string line;
+@@ -1598,7 +1792,7 @@
+     };
+     const long long sw0 = swap_mib();
+     std::vector<std::thread> th;
+-    for (const Tensor* t : {m.tok_embd, m.ple_table}) {
++    for (const Tensor* t : {m.tok_embd, ple_ram ? m.ple_table : nullptr}) {
+         if (!t || !t->data) continue;
+         for (int i = 0; i < 4; ++i)
+             th.emplace_back([t, i] {
+@@ -1647,6 +1841,9 @@
+ 
+ void Model::place_experts() {
+     choose_residency();
++    if (!perm.empty())
++        throw std::runtime_error("fnx: FNX_EXPERT_DYN_GIB: the permanent experts have no host copy, so they cannot be placed again "
++                                 "(more in RAM: FNX_EXPERT_RAM_GIB higher)");
+     each_card(cards, [&](CardW& c) {
+         if (c.ec_host_gu.size() != (size_t) NL * NEXP) throw std::runtime_error("fnx: placing experts needs their host copies");
+         const size_t before = c.bytes;
+@@ -1714,7 +1911,8 @@
+         f(c.ple_norm_query), f(c.ple_norm_conv), f(c.ple_conv), f(c.bytes), f(c.host_bytes);
+ }
+ #if !FNX_27B   // the 27B has no holder (plain loads only)
+-static_assert(sizeof(CardW) == 920, "CardW changed: put what load_card stores in card_fields, then update this size");
++// 1392: the M40's permanent experts (perm_*, ExpertCache n_dyn / gu_b / dn_b) are not in card_fields: the holder never has them
++static_assert(sizeof(CardW) == 1392, "CardW changed: put what load_card stores in card_fields, then update this size");
+ #endif
+ // every address load_card stores, in a card and in a layer: a worker moves them to where it mapped the holder's memory
+ template <typename F>
+diff -ruN varne/p100-izvor/model.hpp upstream/src/split/src/model.hpp
+--- varne/p100-izvor/model.hpp	2026-11-06 17:15:48.308019417 +0100
++++ upstream/src/split/src/model.hpp	2026-11-06 17:46:11.573179830 +0100
+@@ -90,11 +90,17 @@
+ // window's experts that are not in a slot take one of their pool's (CLOCK: the first slot not used since the pool's
+ // hand last passed), copied in from RAM, and the layer's tables (LayerW gu_e.ep / down_e.ep: rows of ep_gu / ep_dn)
+ // follow. All device memory; the same steps on every card.
++// M40 (FNX_EXPERT_DYN_GIB): only the coldest of the experts in VRAM keep a host copy and take part in the pools (the
++// dynamic ones); the hotter rest sit in VRAM for good outside every pool (slot numbers n_dyn.. n_slots - 1, never a
++// victim, never lent) and have no host copy, so RAM holds only the experts the cards may give up. More expert sizes
++// than EC_POOLS share a pool padded to its largest (plan_pools); gu_b / dn_b keep each layer's own bytes.
+ constexpr int EC_POOLS = 4;
+ struct ExpertCache {
+-    int n_slots = 0;                     // all pools'
++    int n_slots = 0;                     // all pools', then the permanent experts'
++    int n_dyn = 0;                       // the pools' slots: [0, n_dyn); the permanent experts' [n_dyn, n_slots)
+     int n_pools = 0;
+     int pool_of[NL] = {};                // each layer's pool
++    int gu_b[NL] = {}, dn_b[NL] = {};    // each layer's own gate|up and down bytes (a padded pool's slot can be larger)
+     int s0[EC_POOLS] = {}, n[EC_POOLS] = {};   // a pool's slots: [s0, s0 + n) of the slot numbers
+     size_t slot_bytes[EC_POOLS] = {}, dn_off[EC_POOLS] = {};
+     char* pool[EC_POOLS] = {};
+@@ -199,10 +205,15 @@
+     size_t bytes = 0;                  // what the loader allocated
+     size_t host_bytes = 0;             // routed experts' copies in RAM (page-locked, mapped)
+     ExpertCache ec;                    // n_slots 0: every routed expert in VRAM at its DW's p
+-    std::vector<const char*> ec_host_gu, ec_host_dn;   // ec.host_gu / host_dn on the host
++    std::vector<const char*> ec_host_gu, ec_host_dn;   // ec.host_gu / host_dn on the host (null: a permanent expert)
+     std::vector<int> ec_owner0, ec_slot0;   // ec.owner / slot_of as loaded (an arena engine starts from them again)
+     std::vector<void*> expert_mem;     // what Model::place_experts allocated (freed by free_experts)
+     size_t expert_bytes = 0;
++    // FNX_EXPERT_DYN_GIB: where each permanent expert's gate|up and down sit in VRAM ([NL * NEXP], null: not permanent), their blocks
++    // (one gate|up and one down a layer, uploaded as the layer loads) and bytes
++    std::vector<const char*> perm_gu, perm_dn;
++    std::vector<void*> perm_mem;
++    size_t perm_bytes = 0;
+ };
+ 
+ // the draft (MTP) layer on one card: an attention layer (hc [0] before the attention, [1] before the MoE), its input
+@@ -257,6 +268,12 @@
+     // off: no cache) leaves the coldest G GiB of them (whole experts, all cards' slices) out, ranked by
+     // FNX_EXPERT_PROFILE (FNX_ROUTE_COUNT's tallies; default data/expert-routes.bin)
+     std::vector<std::vector<char>> resident;
++    // [NL][NEXP], empty: none. FNX_EXPERT_DYN_GIB=G: of the resident experts all but the coldest G GiB (whole experts, all cards'
++    // slices) are permanent: in VRAM for good, no host copy (each pool keeps FNX_EXPERT_DYN_MIN of its experts out of them)
++    std::vector<std::vector<char>> perm;
++    // each layer's pool and the pools' (padded) gate|up and down bytes on a card (plan_pools), chosen with the residency
++    std::vector<int> pool_of;
++    std::vector<std::pair<size_t, size_t>> pool_pad;
+     int ram_extra = 0;                   // more of the coldest in RAM than FNX_EXPERT_RAM_GIB's (the engine, VRAM short)
+     // the arena (the default; FNX_ARENA=0: none): every expert resident at the start, the largest pool's slots in the
+     // engine's arena and lent to the K/V pool coldest first as it grows (score: the profile's, per byte; higher is hotter)
+diff -ruN varne/p100-izvor/p100_iq_gemm.cuh upstream/src/split/src/p100_iq_gemm.cuh
+--- varne/p100-izvor/p100_iq_gemm.cuh	2026-11-06 17:15:48.320019498 +0100
++++ upstream/src/split/src/p100_iq_gemm.cuh	2026-11-06 17:46:11.722180869 +0100
+@@ -25,6 +25,8 @@
+     uint2* g3xxs;    // 256: 4 half
+     uint2* g3s;      // 512: 4 half
+     uint4* g2s;      // 1024: 8 half
++    uint4* g2xxs;    // 256: 8 half (IQ2_XXS, the M40's GSQ IQ3_XXS)
++    uint4* g2xs;     // 512: 8 half (IQ2_XS)
+     uint4* sign8;    // 256: the sign masks of 8 halves from a sign byte
+     uint4* sign7;    // 128: the same from IQ3_XXS's 7-bit field
+     uint32_t* nib;   // 256: half2(kvalues[low nibble], kvalues[high nibble])
+@@ -83,11 +85,13 @@
+         const uint32_t g = iq3s_grid[i];
+         t.g3s[i] = make_uint2(b2h(g & 255) | (b2h((g >> 8) & 255) << 16), b2h((g >> 16) & 255) | (b2h(g >> 24) << 16));
+     }
+-    if (i < 1024) {
+-        const uint2 g = reinterpret_cast<const uint2*>(iq2s_grid)[i];
+-        t.g2s[i] = make_uint4(b2h(g.x & 255) | (b2h((g.x >> 8) & 255) << 16), b2h((g.x >> 16) & 255) | (b2h(g.x >> 24) << 16),
+-                              b2h(g.y & 255) | (b2h((g.y >> 8) & 255) << 16), b2h((g.y >> 16) & 255) | (b2h(g.y >> 24) << 16));
+-    }
++    auto g8h = [](const uint2 g) {
++        return make_uint4(b2h(g.x & 255) | (b2h((g.x >> 8) & 255) << 16), b2h((g.x >> 16) & 255) | (b2h(g.x >> 24) << 16),
++                          b2h(g.y & 255) | (b2h((g.y >> 8) & 255) << 16), b2h((g.y >> 16) & 255) | (b2h(g.y >> 24) << 16));
++    };
++    if (i < 1024) t.g2s[i] = g8h(reinterpret_cast<const uint2*>(iq2s_grid)[i]);
++    if (i < 256) t.g2xxs[i] = g8h(reinterpret_cast<const uint2*>(iq2xxs_grid)[i]);
++    if (i < 512) t.g2xs[i] = g8h(reinterpret_cast<const uint2*>(iq2xs_grid)[i]);
+     if (i < 16) t.s12[i] = 1.0f + 2.0f * float(i);
+     if (i < 64) t.s6[i] = float(i - 32);
+ }
+@@ -100,6 +104,8 @@
+ template <> struct RunWords<2> { static constexpr int n = 5; };
+ template <> struct RunWords<42> { static constexpr int n = 3; };
+ template <> struct RunWords<22> { static constexpr int n = 3; };
++template <> struct RunWords<16> { static constexpr int n = 3; };   // IQ2_XXS: 4 grid bytes, then 4 x 7 sign bits and the scale; d
++template <> struct RunWords<17> { static constexpr int n = 4; };   // IQ2_XS: 4 x (9-bit grid, 7 sign bits); the scale byte | d << 16
+ 
+ template <int TY>
+ __device__ __forceinline__ void run_load(const uint8_t* __restrict__ row, const int run, uint32_t (&w)[RunWords<TY>::n]) {
+@@ -322,9 +328,10 @@
+ // ---- gemm4: a lane owns a row.  A warp reading 2-byte fields of 32 different rows fetches a cache line for each: 47 times the traffic of the
+ // weights, which on the card's L2 costs as much as the products.  So a lane first reads its row's next IQ block with aligned 16-byte loads into
+ // shared memory (the bytes in flight, one round trip) and decodes from there.
+-template <int TY> inline constexpr int kSU = TY == 23 ? 10 : TY == 18 || TY == 21 ? 8 : TY == 22 ? 7 : TY == 20 || TY == 2 ? 6 : 4;
++template <int TY> inline constexpr int kSU = TY == 23 ? 10 : TY == 18 || TY == 21 ? 8 : TY == 22 ? 7 : TY == 20 || TY == 2 || TY == 16 || TY == 17 ? 6 : 4;
+ template <int TY> inline constexpr int kRunsGr = TY == 20 || TY == 2 || TY == 42 ? 4 : 8;
+-template <int TY> inline constexpr int kGrBytes = TY == 18 ? 98 : TY == 21 ? 110 : TY == 22 ? 82 : TY == 23 ? 136 : TY == 20 || TY == 2 ? 72 : 36;
++template <int TY> inline constexpr int kGrBytes = TY == 18 ? 98 : TY == 21 ? 110 : TY == 22 ? 82 : TY == 23 ? 136 : TY == 20 || TY == 2 ? 72 :
++                                                  TY == 16 ? 66 : TY == 17 ? 74 : 36;
+ 
+ template <int TY>
+ __device__ __forceinline__ void run_load_s(const uint8_t* p, const int run, uint32_t (&w)[RunWords<TY>::n]) {
+@@ -369,6 +376,19 @@
+         w[2] = P100_U16(x->qs, 8) | (P100_U16(x->qs, 10) << 16);
+         w[3] = P100_U16(x->qs, 12) | (P100_U16(x->qs, 14) << 16);
+         w[4] = P100_U16(&x->d, 0);
++    } else if constexpr (TY == 16) {   // IQ2_XXS: d, qs[32] (run ib: 4 grid bytes, then its signs and scale word)
++        const block_iq2_xxs* x = reinterpret_cast<const block_iq2_xxs*>(p);
++        const int ib = run & 7;
++        w[0] = P100_U16(x->qs, 8 * ib) | (P100_U16(x->qs, 8 * ib + 2) << 16);
++        w[1] = P100_U16(x->qs, 8 * ib + 4) | (P100_U16(x->qs, 8 * ib + 6) << 16);
++        w[2] = P100_U16(&x->d, 0);
++    } else if constexpr (TY == 17) {   // IQ2_XS: d, qs[32] (9-bit grid index, 7 sign bits each), scales[8]
++        const block_iq2_xs* x = reinterpret_cast<const block_iq2_xs*>(p);
++        const int ib = run & 7;
++        w[0] = P100_U16(x->qs, 8 * ib) | (P100_U16(x->qs, 8 * ib + 2) << 16);
++        w[1] = P100_U16(x->qs, 8 * ib + 4) | (P100_U16(x->qs, 8 * ib + 6) << 16);
++        w[2] = x->scales[ib];
++        w[3] = P100_U16(&x->d, 0);
+     } else {
+         const block_q2_0* x = reinterpret_cast<const block_q2_0*>(p) + ((run & 3) >> 1);
+         const int part = (run & 1) * 8;
+@@ -384,6 +404,8 @@
+ template <> struct TabU<21> { static constexpr int n = 512; };
+ template <> struct TabU<22> { static constexpr int n = 256; };
+ template <> struct TabU<42> { static constexpr int n = 128; };
++template <> struct TabU<16> { static constexpr int n = 384; };   // IQ2_XXS's grid, then the 7-bit sign masks
++template <> struct TabU<17> { static constexpr int n = 640; };   // IQ2_XS's grid, then the 7-bit sign masks
+ 
+ template <int TY>
+ __device__ __forceinline__ void stage_tabs(const Tabs& t, uint4* tab, const int tid, const int nt) {
+@@ -395,6 +417,12 @@
+         for (int i = tid; i < 256; i += nt) tab[256 + i] = __ldg(t.sign8 + i);
+     } else if constexpr (TY == 22) {
+         for (int i = tid; i < 256; i += nt) tab[i] = __ldg(t.sign8 + i);
++    } else if constexpr (TY == 16) {
++        for (int i = tid; i < 256; i += nt) tab[i] = __ldg(t.g2xxs + i);
++        for (int i = tid; i < 128; i += nt) tab[256 + i] = __ldg(t.sign7 + i);
++    } else if constexpr (TY == 17) {
++        for (int i = tid; i < 512; i += nt) tab[i] = __ldg(t.g2xs + i);
++        for (int i = tid; i < 128; i += nt) tab[512 + i] = __ldg(t.sign7 + i);
+     } else if constexpr (TY == 2) {
+         for (int i = tid; i < 64; i += nt) tab[i] = __ldg(reinterpret_cast<const uint4*>(t.nib4) + i);
+     } else if constexpr (TY == 23 || TY == 20) {
+@@ -458,6 +486,26 @@
+             out[g] = make_uint4(nib_pair_s(nib, a & 0xffff, dd), nib_pair_s(nib, a >> 16, dd), nib_pair_s(nib, b & 0xffff, dd), nib_pair_s(nib, b >> 16, dd));
+             out[g + 2] = make_uint4(nib_pair_s(nib, (a >> 4) & 0x0fff, dd), nib_pair_s(nib, a >> 20, dd), nib_pair_s(nib, (b >> 4) & 0x0fff, dd), nib_pair_s(nib, b >> 20, dd));
+         }
++    } else if constexpr (TY == 16) {   // IQ2_XXS: one scale a run, d (0.5 + s) / 4 (ggml's dequantize_row_iq2_xxs)
++        const uint4* sign = tab + 256;
++        const uint32_t aux = w[1];
++        const half2 dd = dup_f(h2f(uint16_t(w[2])) * (0.5f + float(aux >> 28)) * 0.25f);
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const uint4 g = tab[(w[0] >> (8 * j)) & 255], sg = sign[(aux >> (7 * j)) & 127];
++            out[j] = make_uint4(hmul(g.x ^ sg.x, dd), hmul(g.y ^ sg.y, dd), hmul(g.z ^ sg.z, dd), hmul(g.w ^ sg.w, dd));
++        }
++    } else if constexpr (TY == 17) {   // IQ2_XS: a scale a half run (dequantize_row_iq2_xs)
++        const uint4* sign = tab + 512;
++        const float df = h2f(uint16_t(w[3])) * 0.25f;
++        const half2 d0 = dup_f(df * (0.5f + float(w[2] & 15))), d1 = dup_f(df * (0.5f + float(w[2] >> 4)));
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const uint32_t q = (w[j >> 1] >> (16 * (j & 1))) & 0xffff;
++            const uint4 g = tab[q & 511], sg = sign[q >> 9];
++            const half2 dd = j < 2 ? d0 : d1;
++            out[j] = make_uint4(hmul(g.x ^ sg.x, dd), hmul(g.y ^ sg.y, dd), hmul(g.z ^ sg.z, dd), hmul(g.w ^ sg.w, dd));
++        }
+     } else {
+         const uint2* q20 = reinterpret_cast<const uint2*>(tab);
+         const half2 dd = dup_u16(w[2]);
+@@ -589,6 +637,7 @@
+     Tabs& t = per[dev & 15];
+     if (t.g3xxs == nullptr) {
+         cudaMalloc(&t.g3xxs, 256 * 8); cudaMalloc(&t.g3s, 512 * 8); cudaMalloc(&t.g2s, 1024 * 16); cudaMalloc(&t.sign8, 256 * 16);
++        cudaMalloc(&t.g2xxs, 256 * 16); cudaMalloc(&t.g2xs, 512 * 16);
+         cudaMalloc(&t.sign7, 128 * 16); cudaMalloc(&t.nib, 256 * 4); cudaMalloc(&t.nib4, 256 * 4); cudaMalloc(&t.q20, 256 * 8); cudaMalloc(&t.s12, 16 * 4); cudaMalloc(&t.s6, 64 * 4);
+         tabs_kernel<<<4, 256, 0, st>>>(t);
+     }
+diff -ruN varne/p100-izvor/p100_moe.cu upstream/src/split/src/p100_moe.cu
+--- varne/p100-izvor/p100_moe.cu	2026-11-06 17:15:48.261019098 +0100
++++ upstream/src/split/src/p100_moe.cu	2026-11-06 17:46:11.735180960 +0100
+@@ -66,12 +66,19 @@
+     const int ldx_u = a.ldx_u;
+     const std::size_t row_bytes = a.row_bytes;
+     const Tabs t = a.t;
++#if FNX_ARCH >= 53
+     half2 h[TL][RL];
++#endif
+     float s[TL][RL];
+ #pragma unroll
+     for (int i = 0; i < TL; ++i)
+ #pragma unroll
+-        for (int r = 0; r < RL; ++r) { h[i][r] = as_half2(0u); s[i][r] = 0.0f; }
++        for (int r = 0; r < RL; ++r) {
++#if FNX_ARCH >= 53
++            h[i][r] = as_half2(0u);
++#endif
++            s[i][r] = 0.0f;
++        }
+     stage_tabs<TY>(t, tab, tid, NT);
+     __syncthreads();
+     const BigJob& jb = *reinterpret_cast<const BigJob*>(sj);
+@@ -129,6 +136,20 @@
+ #pragma unroll
+                 for (int i = 0; i < TL; ++i) xr[i] = sx[xb + i * KU + cc];
+                 cc = (cc + 1) & (KU - 1);
++#if FNX_ARCH < 53
++                // Maxwell: no f16 arithmetic. Each pair of halves to f32 once (a weight's for every token, a token's for every row),
++                // f32 FMAs into the f32 sums
++#define M40_MACJ(F) \
++                { \
++                    float2 xf[TL], wf[RL]; \
++                    _Pragma("unroll") for (int i = 0; i < TL; ++i) xf[i] = __half22float2(as_half2(xr[i].F)); \
++                    _Pragma("unroll") for (int r = 0; r < RL; ++r) wf[r] = __half22float2(as_half2(wr[r].F)); \
++                    _Pragma("unroll") for (int i = 0; i < TL; ++i) \
++                        _Pragma("unroll") for (int r = 0; r < RL; ++r) s[i][r] = fmaf(wf[r].y, xf[i].y, fmaf(wf[r].x, xf[i].x, s[i][r])); \
++                }
++                M40_MACJ(x) M40_MACJ(y) M40_MACJ(z) M40_MACJ(w)
++#undef M40_MACJ
++#else
+ #define P100_MACJ(F) \
+                 _Pragma("unroll") \
+                 for (int i = 0; i < TL; ++i) \
+@@ -136,11 +157,14 @@
+                     for (int r = 0; r < RL; ++r) h[i][r] = __hfma2(as_half2(wr[r].F), as_half2(xr[i].F), h[i][r]);
+                 P100_MACJ(x) P100_MACJ(y) P100_MACJ(z) P100_MACJ(w)
+ #undef P100_MACJ
++#endif
+             }
++#if FNX_ARCH >= 53
+ #pragma unroll
+             for (int i = 0; i < TL; ++i)
+ #pragma unroll
+                 for (int r = 0; r < RL; ++r) fold_one(h[i][r], s[i][r]);
++#endif
+         }
+         __syncthreads();
+     }
+@@ -188,6 +212,9 @@
+         case T_IQ4_XS: job_launch<23>(a, njobs_cap, s); break;
+         case T_IQ4_NL: job_launch<20>(a, njobs_cap, s); break;
+         case T_Q4_0: job_launch<2>(a, njobs_cap, s); break;
++        case T_IQ2_XXS: job_launch<16>(a, njobs_cap, s); break;   // the M40's GSQ IQ3_XXS: 9 layers' gate|up
++        case T_IQ2_XS: job_launch<17>(a, njobs_cap, s); break;    // 10 layers' gate|up
++        case T_Q2_0: job_launch<42>(a, njobs_cap, s); break;      // 30 layers' down, read as they are (FNX_Q2_0_NATIVE)
+         default: throw std::runtime_error("p100 moe: expert type " + std::to_string(A.type) + " not handled");
+     }
+     const cudaError_t e = cudaGetLastError();
+diff -ruN varne/p100-izvor/p100_moe_rows.cuh upstream/src/split/src/p100_moe_rows.cuh
+--- varne/p100-izvor/p100_moe_rows.cuh	2026-11-06 17:15:48.244018983 +0100
++++ upstream/src/split/src/p100_moe_rows.cuh	2026-11-06 18:52:55.892781109 +0100
+@@ -94,6 +94,7 @@
+     float* Y;
+     int ldx_u, N, K;
+     int phase;   // 0 every job; 1 the jobs not marked (w >= 0); 2 the marked ones (w = ~expert)
++    size_t slice = 0;   // Maxwell (m40_moe_rows.cuh): floats between the partial sums of a row split by columns
+ };
+ 
+ // one run of the row: its 32 weights, then each token's sum. On the IQ gate|up types the products stay on the grid's small integers and the
+@@ -272,6 +273,11 @@
+ }
+ 
+ }  // namespace
++}  // namespace fnx
++#if FNX_ARCH < 53
++#include "m40_moe_rows.cuh"
++#endif
++namespace fnx {
+ 
+ bool p100_rows_on() {
+     static const bool on = [] {
+@@ -288,7 +294,22 @@
+ }
+ }  // namespace
+ void p100_f32_f16(const float* x, size_t n, uint16_t* out, void* st) {
++#if FNX_ARCH < 53
++    // Maxwell's rows kernel reads the f32 rows as they are (the buffer holds n floats there)
++    const cudaError_t e = cudaMemcpyAsync(out, x, n * sizeof(float), cudaMemcpyDeviceToDevice, (cudaStream_t) st);
++    if (e != cudaSuccess) throw std::runtime_error(std::string("p100_f32_f16: ") + cudaGetErrorString(e));
++#else
+     k_f32_f16_rows<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) st>>>(x, n, reinterpret_cast<__half*>(out));
++#endif
++}
++void p100_swiglu_rows(const float* gu, int ffs, int P, uint16_t* h16, void* st) {
++#if FNX_ARCH < 53
++    k_m40_swiglu<<<(unsigned) std::min<size_t>(4096, ((size_t) P * ffs + 255) / 256), 256, 0, (cudaStream_t) st>>>(gu, ffs, P, reinterpret_cast<float*>(h16), nullptr, m40_ks(P / TOPK, N));
++    const cudaError_t e = cudaGetLastError();
++    if (e != cudaSuccess) throw std::runtime_error(std::string("p100_swiglu_rows: ") + cudaGetErrorString(e));
++#else
++    swiglu_h16(gu, ffs, P, h16, st);
++#endif
+ }
+ 
+ // Y[job.out[k] * n_out + row] = sum over the row of W[job.w][row][c] * x[job.y[k] * n_in + c]; x: FP16 rows, Y: floats
+@@ -309,6 +330,20 @@
+     a.N = A.n_out;
+     a.K = A.n_in;
+     a.phase = phase;
++#if FNX_ARCH < 53
++    // Maxwell: f32 rows and tables (m40_moe_rows.cuh), the M40 model's types
++    switch (A.type) {
++        case T_IQ2_XXS: m40_rows_launch<16>(a, T, njobs_cap, s); break;
++        case T_IQ2_XS: m40_rows_launch<17>(a, T, njobs_cap, s); break;
++        case T_IQ2_S: m40_rows_launch<22>(a, T, njobs_cap, s); break;
++        case T_IQ3_XXS: m40_rows_launch<18>(a, T, njobs_cap, s); break;
++        case T_IQ3_S: m40_rows_launch<21>(a, T, njobs_cap, s); break;
++        case T_IQ4_NL: m40_rows_launch<20>(a, T, njobs_cap, s); break;
++        case T_Q4_0: m40_rows_launch<2>(a, T, njobs_cap, s); break;
++        case T_Q2_0: m40_rows_launch<42>(a, T, njobs_cap, s); break;
++        default: throw std::runtime_error("m40 moe rows: expert type " + std::to_string(A.type) + " not handled");
++    }
++#else
+     switch (A.type) {
+         case T_IQ3_XXS: rows_launch<18>(a, T, njobs_cap, s); break;
+         case T_IQ3_S: rows_launch<21>(a, T, njobs_cap, s); break;
+@@ -318,6 +353,7 @@
+         case T_Q4_0: rows_launch<2>(a, T, njobs_cap, s); break;
+         default: throw std::runtime_error("p100 moe rows: expert type " + std::to_string(A.type) + " not handled");
+     }
++#endif
+     const cudaError_t e = cudaGetLastError();
+     if (e != cudaSuccess) throw std::runtime_error(std::string("p100 moe rows: ") + cudaGetErrorString(e));
+ }
+@@ -460,8 +496,8 @@
+ }
+ void p100_cache_copy(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, const int* list, void* st) {
+     const int p = ec.pool_of[layer];
+-    if (gu_stride != ec.dn_off[p] || ec.dn_off[p] + dn_stride != ec.slot_bytes[p])
+-        throw std::runtime_error("p100_cache_copy: the layer's experts are not its pool's size");
++    if (gu_stride > ec.dn_off[p] || dn_stride > ec.slot_bytes[p] - ec.dn_off[p])
++        throw std::runtime_error("p100_cache_copy: the layer's experts do not fit its pool's slots");
+     static const int blocks = [] { const char* e = std::getenv("FNX_COPY_BLOCKS"); return e ? std::atoi(e) : 40; }();
+     static const int threads = [] { const char* e = std::getenv("FNX_COPY_THREADS"); return e ? std::atoi(e) : 256; }();
+     k_cache_copy_side<<<blocks, threads, 0, (cudaStream_t) st>>>(ec, p, list, gu_stride, dn_stride);
+@@ -469,7 +505,11 @@
+     if (e != cudaSuccess) throw std::runtime_error(std::string("p100_cache_copy: ") + cudaGetErrorString(e));
+ }
+ void p100_swiglu_after(const float* gu, int ffs, int P, uint16_t* h16, const int* list, void* st) {
++#if FNX_ARCH < 53
++    k_m40_swiglu<<<(unsigned) std::min<size_t>(4096, ((size_t) P * ffs + 255) / 256), 256, 0, (cudaStream_t) st>>>(gu, ffs, P, reinterpret_cast<float*>(h16), list, m40_ks(P / TOPK, N));
++#else
+     k_swiglu_after<<<(unsigned) std::min<size_t>(4096, ((size_t) P * ffs + 255) / 256), 256, 0, (cudaStream_t) st>>>(gu, ffs, P, reinterpret_cast<__half*>(h16), list);
++#endif
+     const cudaError_t e = cudaGetLastError();
+     if (e != cudaSuccess) throw std::runtime_error(std::string("p100_swiglu_after: ") + cudaGetErrorString(e));
+ }
+diff -ruN varne/p100-izvor/prefill.cu upstream/src/split/src/prefill.cu
+--- varne/p100-izvor/prefill.cu	2026-11-06 17:15:48.221018828 +0100
++++ upstream/src/split/src/prefill.cu	2026-11-06 17:46:11.638180284 +0100
+@@ -1203,7 +1203,9 @@
+                 for (int e = 0; e < NEXP; ++e) {
+                     const size_t i = (size_t) l * NEXP + e;
+                     const int s = p.slot_h[i];
+-                    if (s >= 0) {
++                    if (s >= ec.n_dyn && s < ec.n_slots) {   // FNX_EXPERT_DYN_GIB: a permanent expert, in its own VRAM block
++                        p.ep_hgu[i] = w.perm_gu[i], p.ep_hdn[i] = w.perm_dn[i];
++                    } else if (s >= 0) {
+                         const int q = ec.pool_of[l];
+                         const char* at = ec.pool[q] + (size_t) (s - ec.s0[q]) * ec.slot_bytes[q];
+                         p.ep_hgu[i] = at, p.ep_hdn[i] = at + ec.dn_off[q];
+diff -ruN varne/p100-izvor/tensor_convert.hpp upstream/src/split/src/tensor_convert.hpp
+--- varne/p100-izvor/tensor_convert.hpp	2026-11-06 17:15:48.171018489 +0100
++++ upstream/src/split/src/tensor_convert.hpp	2026-11-06 18:44:52.108423208 +0100
+@@ -59,6 +59,9 @@
+     static const int8_t k[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+     return k;
+ }
++// ggml's iq3s_grid (512 entries of 4 bytes), from ggml-common.h in gguf.cpp: the M40's GSQ IQ3_XXS keeps some dense matrices and its
++// token embedding in IQ3_S
++const uint32_t* iq3s_grid_host();
+ // the K-quants' 6-bit scale and min of sub-block j (ggml get_scale_min_k4)
+ inline void scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
+     if (j < 4) {
+@@ -110,6 +113,30 @@
+             for (int j = 0; j < 64; ++j) y[b * 64 + j] = d * (float) ((int) ((p[2 + j / 4] >> (2 * (j % 4))) & 3) - 1);
+         }
+         return;
++    case T_IQ3_S: {   // dequantize_row_iq3_s: d, qs[64], qh[8], signs[32], scales[4]
++        const uint32_t* grid = iq3s_grid_host();
++        for (size_t b = 0; b < n / 256; ++b) {
++            const uint8_t* p = src + b * 110;
++            uint16_t dh;
++            std::memcpy(&dh, p, 2);
++            const float d = h2f(dh);
++            const uint8_t *qs = p + 2, *qh = p + 66, *signs = p + 74, *sc = p + 106;
++            float* o = y + b * 256;
++            for (int ib = 0; ib < 8; ++ib) {
++                const float db = d * (float) (1 + 2 * ((sc[ib / 2] >> (4 * (ib & 1))) & 15));
++                for (int l = 0; l < 4; ++l) {
++                    const uint32_t g1 = grid[qs[8 * ib + 2 * l] | ((qh[ib] << (8 - 2 * l)) & 256)];
++                    const uint32_t g2 = grid[qs[8 * ib + 2 * l + 1] | ((qh[ib] << (7 - 2 * l)) & 256)];
++                    const uint8_t s = signs[4 * ib + l];
++                    for (int j = 0; j < 4; ++j) {
++                        o[32 * ib + 8 * l + j] = db * (float) ((g1 >> (8 * j)) & 255) * ((s >> j) & 1 ? -1.f : 1.f);
++                        o[32 * ib + 8 * l + 4 + j] = db * (float) ((g2 >> (8 * j)) & 255) * ((s >> (j + 4)) & 1 ? -1.f : 1.f);
++                    }
++                }
++            }
++        }
++        return;
++    }
+     case T_IQ4_NL:
+         for (size_t b = 0; b < n / 32; ++b) {
+             const uint8_t* p = src + b * 18;

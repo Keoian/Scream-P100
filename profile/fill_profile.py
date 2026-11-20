@@ -10,8 +10,9 @@
 --model      iq3_s (default): ISTA-DASLab's IQ3_S, flash-next-iq3s-512k.template.json; q4_k_xl: Unsloth's UD-Q4_K_XL,
              flash-next-q4_k_xl-512k.template.json (README, "Unsloth's UD-Q4_K_XL"; its 256k one with
              --template profile/flash-next-q4_k_xl-256k.template.json); edge0: Edge0's Edge0-145B-NVFP4,
-             flash-next-edge0-512k.template.json (README, "Edge0-145B")
---mtp        the MTP draft layer's runtime folder (dense.bin, dense.txt, experts.bin; README, "The MTP draft layer")
+             flash-next-edge0-512k.template.json (README, "Edge0-145B"); iq3_xxs: ISTA-DASLab's IQ3_XXS for the TEST BUILD on two
+             Tesla M40 24 GB, flash-next-iq3xxs-m40-256k.template.json and build-m40/ (docs/M40.md)
+--mtp       the MTP draft layer's runtime folder (dense.bin, dense.txt, experts.bin; README, "The MTP draft layer")
 --tokenizer  the tokenizer folder (vocab.json, merges.txt, chat_template.jinja ...; README, "The tokenizer folder")
 --vision-exe Strata's strata-vision; leave it out to run without pictures (the "vision" block and --vision go)
 --route-prior FNX_ROUTE_PRIOR: 0 (default) is exact; 0.15 is our production setting, faster and lossy (README)
@@ -55,6 +56,9 @@ MODELS = {
     # IQ3_S's second shard (FNX_LATENT_PLE, checked below)
     "edge0": ("flash-next-edge0-512k.template.json",
               ["model-skeleton.gguf", "experts.bin", "latent_dense_q8.bin", "labels.bin"]),
+    # the 2 x Tesla M40 24 GB TEST BUILD (docs/M40.md): ISTA-DASLab's IQ3_XXS on engine-m40/ (build.sh --m40), 256k, 32 GB of RAM
+    "iq3_xxs": ("flash-next-iq3xxs-m40-256k.template.json",
+                [f"Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-0000{i}-of-00002.gguf" for i in (1, 2)]),
 }
 
 
@@ -101,6 +105,8 @@ def main():
         sys.exit("--ssd-ram-gib: GiB a card, 1 to 64")
     if a.coder and a.model == "edge0":
         sys.exit("--coder: not with --model edge0 (the Coder's list names Flash-Next's experts, not Edge0's latent ones)")
+    if a.model == "iq3_xxs" and (a.ram != "96" or a.coder or a.fast):
+        sys.exit("--model iq3_xxs (the 2 x M40 test build): its template is the only profile (32 GB of RAM); no --ram, --coder or --fast")
     if a.fast and a.model != "q4_k_xl":
         sys.exit("--fast: only with --model q4_k_xl (the settings were measured on UD-Q4_K_XL only)")
     if a.fast and a.route_prior != "0":
@@ -109,8 +115,8 @@ def main():
     if len(cards) != 2 or not all(c.strip().isdigit() for c in cards) or cards[0].strip() == cards[1].strip():
         sys.exit("--gpu: two different card numbers, e.g. 0,1")
     template, files = MODELS[a.model]
-    if not a.exe:   # the low-RAM modes have an engine of their own (build.sh --32g)
-        a.exe = str(RELEASE / ("build-32g" if low else "build") / "split" / "strata-split-2")
+    if not a.exe:   # the low-RAM modes have an engine of their own (build.sh --32g), and so has the M40 test build (--m40)
+        a.exe = str(RELEASE / ("build-m40" if a.model == "iq3_xxs" else "build-32g" if low else "build") / "split" / "strata-split-2")
     values = {"{{RELEASE}}": str(RELEASE), "{{EXE}}": str(Path(a.exe).resolve()),
               "{{MODELS}}": str(Path(a.models).resolve()), "{{MTP}}": str(Path(a.mtp).resolve()),
               "{{TOKENIZER}}": str(Path(a.tokenizer).resolve()), "{{LOGS}}": str(Path(a.logs).resolve()),
@@ -188,7 +194,8 @@ def main():
         sys.exit("missing, nothing written:\n  " + "\n  ".join(missing))
     Path(a.out).write_text(json.dumps(cfg, indent=1) + "\n", encoding="utf-8")
     print(f"wrote {a.out} ({a.model}, FNX_ROUTE_PRIOR={cfg['env']['FNX_ROUTE_PRIOR']}, pictures {'on' if 'vision' in cfg else 'off'}, "
-          f"{a.ram} GB of RAM{f' (a RAM tier of at most {a.ssd_ram_gib:g} GiB a card)' if low else ''}"
+          f"{'32 GB of RAM, 2 x M40 TEST BUILD' if a.model == 'iq3_xxs' else f'{a.ram} GB of RAM'}"
+          f"{f' (a RAM tier of at most {a.ssd_ram_gib:g} GiB a card)' if low else ''}"
           f"{', the Coder experts' if a.coder and not a.fast else ''}"
           f"{', FAST (lossy: Coder mask, λ 1.0, FNX_ONEHOP=2)' if a.fast else ''})")
 

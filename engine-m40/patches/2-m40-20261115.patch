@@ -1,0 +1,1675 @@
+diff -ruN varne-20261115/src/kernels.cu upstream/src/split/src/kernels.cu
+--- varne-20261115/src/kernels.cu	2026-11-06 17:46:11.659180430 +0100
++++ upstream/src/split/src/kernels.cu	2026-11-15 17:04:23.234412075 +0100
+@@ -1351,6 +1351,60 @@
+     ck_launch("qsa_index");
+ }
+ 
++// FNX_QSA_DUMP=<dir> (a diagnostic; it waits for the stream, so not for measuring): every FNX_QSA_DUMP_EVERY-th (113) selection of
++// a prompt group on card 0 (64 rows or more) writes the group's scores to <dir>/g<n>.bin, FNX_QSA_DUMP_MAX (26) files at most:
++// four ints (the rows, the blocks a row, the first row's position, max_pools), then the rows' scores.
++static void qsa_dump_scores(const float* scores, int max_pools, const int* pos0, int T, int card, cudaStream_t s) {
++    static const char* const dir = std::getenv("FNX_QSA_DUMP");
++    if (!dir || !*dir || card != 0 || T < 64) return;
++    static const int every = std::max(1, (int) env_int("FNX_QSA_DUMP_EVERY", 113)), most = (int) env_int("FNX_QSA_DUMP_MAX", 26);
++    static int calls = 0, files = 0;
++    if (calls++ % every != 0 || files >= most) return;
++    int p0 = 0;
++    if (cudaStreamSynchronize(s) != cudaSuccess || cudaMemcpy(&p0, pos0, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) return;
++    const int W = std::min(max_pools, (p0 + T) / QSA_POOL);
++    if (W <= 0) return;
++    std::vector<float> h((size_t) T * W);
++    if (cudaMemcpy2D(h.data(), (size_t) W * sizeof(float), scores, (size_t) max_pools * sizeof(float), (size_t) W * sizeof(float),
++                     (size_t) T, cudaMemcpyDeviceToHost) != cudaSuccess)
++        return;
++    char path[600];
++    std::snprintf(path, sizeof path, "%s/g%03d.bin", dir, files);
++    FILE* f = std::fopen(path, "wb");
++    if (!f) return;
++    const int head[4] = {T, W, p0, max_pools};
++    std::fwrite(head, sizeof(int), 4, f);
++    std::fwrite(h.data(), sizeof(float), h.size(), f);
++    std::fclose(f);
++    ++files;
++}
++
++// FNX_QSA_SEL=1 (the P100 port): k_idx_select_c for a window's or a prompt group's rows instead of k_idx_select (qsa.cuh: a bound,
++// the candidates no less than it, k_idx_select's steps on those alone; the same cells and counts). The same grid, a block a row.
++static void qsa_select_rows(const float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T, int card, cudaStream_t s) {
++    qsa_dump_scores(scores, max_pools, pos0, T, card, s);
++    static const bool on = env_int("FNX_QSA_SEL", 0) != 0;
++    if (on) k_idx_select_c<2048><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card);
++    else k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
++}
++
++// FNX_QSA_TILE=1 (the P100 port): k_idx_score_a for a window's or a prompt group's rows instead of k_idx_score (qsa.cuh: a thread
++// scores a tile of rows by 2 pools; the same scores bit for bit). The grid is a count of blocks from T and the context only (a
++// decode window's launches are captured per T; the kernel picks the tile from the position itself): a power of two, a block a
++// row at least, 256 unless the old grid had fewer (more blocks only cost their launch: mikro/khc/qsa_adapt_test.cu).
++static bool qsa_score_tiles(const float* q, const __half* pl, const KvPages& g, float* scores, int max_pools, const int* pos0, int T,
++                            cudaStream_t s) {
++    static const bool on = env_int("FNX_QSA_TILE", 0) != 0;
++    if (!on) return false;
++    int nb = 1;
++    while (nb < T) nb <<= 1;
++    while (nb < 256 && nb < T * ((max_pools + 255) / 256)) nb <<= 1;
++    if (T <= 2) k_idx_score_a<1><<<nb, 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, T);
++    else if (T <= 4) k_idx_score_a<4><<<nb, 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, T);
++    else k_idx_score_a<8><<<nb, 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, T);
++    return true;
++}
++
+ void qsa_select(const float* q, const uint16_t* pooled, const KvPages& g, float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T,
+                 int card, void* st) {
+     cudaStream_t s = (cudaStream_t) st;
+@@ -1359,9 +1413,10 @@
+     k_idx_score_tc<<<dim3((max_pools + QSC_KEYS - 1) / QSC_KEYS, (T + QSC_ROWS - 1) / QSC_ROWS), 256, 0, s>>>(q, pl, g, scores, max_pools,
+                                                                                                          pos0, T);
+ #else
+-    k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
++    if (!qsa_score_tiles(q, pl, g, scores, max_pools, pos0, T, s))
++        k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
+ #endif
+-    k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
++    qsa_select_rows(scores, cells, n_cells, max_pools, pos0, T, card, s);
+     ck_launch("qsa_select");
+ }
+ 
+@@ -1425,8 +1480,9 @@
+         ck_launch("qsa");
+         return;
+     }
+-    k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
+-    k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
++    if (!qsa_score_tiles(q, pl, g, scores, max_pools, pos0, T, s))
++        k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
++    qsa_select_rows(scores, cells, n_cells, max_pools, pos0, T, card, s);
+     ck_launch("qsa");
+ }
+ 
+diff -ruN varne-20261115/src/m40_pf_gemm.cuh upstream/src/split/src/m40_pf_gemm.cuh
+--- varne-20261115/src/m40_pf_gemm.cuh	1970-01-01 01:00:00.000000000 +0100
++++ upstream/src/split/src/m40_pf_gemm.cuh	2026-11-15 18:05:31.005967544 +0100
+@@ -0,0 +1,351 @@
++// m40_pf_gemm.cuh (2026-11-15): the prompt path's routed experts on Maxwell (sm_52, ai-streznik-m40), FNX_M40_PF=1. k_gemm4_job (p100_moe.cu)
++// is Strata's P100 kernel with f16 tiles; on Maxwell each pair of halves goes to f32 before its FMAs, and a conversion runs at a quarter
++// of the FMA rate: 112 FMA-cycles of conversions to 96 of FMAs a step, about 28 % of the cards' f32 peak in the engine (profile of
++// 2026-11-06: gate|up and down 42 % of a long read). An f32-tile variant (m40_gemm.cuh, 6 Nov) dropped the conversions but read twice the
++// shared bytes a FMA with the same 6 x 8 thread tile and 8 warps an SM, and was no faster. Here:
++//   - a block is 128 rows of the expert by BN tokens of a job (96 or 48), a thread 8 rows by BN / 8 tokens (96 or 48 sums): 5 (or 3.5)
++//     shared loads of 16 bytes for 96 (48) FMAs, so the FMAs, not shared memory, set the pace;
++//   - a step is one run of 32 values: each thread decodes its row's run straight to f32 weights (ggml's dequantize_row_* values: the
++//     scale times the grid value is exact in f32) into As[k][row], and the job's tokens' f16 values to f32 into Bs[k][token];
++//   - the next step's token values, and every RG steps the row's next group, are loaded into registers while this step computes.
++// Sums in f32, in the order of k: the same result from run to run; not the bits of k_gemm4_job (its weights are f16, rounded).
++// Types: the M40 model's gate|up IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, down IQ4_NL, Q2_0, and Q4_0; any other stays on k_gemm4_job.
++#pragma once
++#define FNX_M40_PF_GEMM 1
++
++#include "env.hpp"
++
++namespace fnx {
++namespace {
++
++constexpr int kPfT = 128, kPfM = 128, kPfK = 32;
++
++// run IB of the group W as 32 f32 weights (value 8 j + i of the run in w[8 j + i])
++template <int TY, int IB>
++__device__ __forceinline__ void m40_dq(const uint32_t (&W)[kGrW<TY>], const uint4* tab, float (&w)[32]) {
++    float v[8];
++    auto put = [&](const int j, const float sc) {
++#pragma unroll
++        for (int i = 0; i < 8; ++i) w[8 * j + i] = v[i] * sc;
++    };
++    if constexpr (TY == 16) {   // IQ2_XXS
++        const uint2* grid = reinterpret_cast<const uint2*>(tab);
++        const uint32_t gi = g16<2 + 8 * IB>(W) | (g16<4 + 8 * IB>(W) << 16), aux = g16<6 + 8 * IB>(W) | (g16<8 + 8 * IB>(W) << 16);
++        const float sc = h2f(uint16_t(g16<0>(W))) * (0.5f + float(aux >> 28)) * 0.25f;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            m40_g8(grid[(gi >> (8 * j)) & 255], m40_s7((aux >> (7 * j)) & 127), v);
++            put(j, sc);
++        }
++    } else if constexpr (TY == 17) {   // IQ2_XS
++        const uint2* grid = reinterpret_cast<const uint2*>(tab);
++        const uint32_t q01 = g16<2 + 8 * IB>(W) | (g16<4 + 8 * IB>(W) << 16), q23 = g16<6 + 8 * IB>(W) | (g16<8 + 8 * IB>(W) << 16);
++        const uint32_t sc = g8<66 + IB>(W);
++        const float d = h2f(uint16_t(g16<0>(W))) * 0.25f, s0 = d * (0.5f + float(sc & 15)), s1 = d * (0.5f + float(sc >> 4));
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const uint32_t q = ((j < 2 ? q01 : q23) >> (16 * (j & 1))) & 0xffff;
++            m40_g8(grid[q & 511], m40_s7(q >> 9), v);
++            put(j, j < 2 ? s0 : s1);
++        }
++    } else if constexpr (TY == 22) {   // IQ2_S
++        const uint2* grid = reinterpret_cast<const uint2*>(tab);
++        const uint32_t lo = g16<2 + 4 * IB>(W) | (g16<4 + 4 * IB>(W) << 16), sb = g16<34 + 4 * IB>(W) | (g16<36 + 4 * IB>(W) << 16);
++        const uint32_t qh = g8<66 + IB>(W), sc = g8<74 + IB>(W);
++        const float d = h2f(uint16_t(g16<0>(W))) * 0.25f, s0 = d * (0.5f + float(sc & 15)), s1 = d * (0.5f + float(sc >> 4));
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            m40_g8(grid[((lo >> (8 * j)) & 255) | ((qh << (8 - 2 * j)) & 0x300u)], (sb >> (8 * j)) & 255, v);
++            put(j, j < 2 ? s0 : s1);
++        }
++    } else if constexpr (TY == 18) {   // IQ3_XXS
++        const uint32_t* grid = reinterpret_cast<const uint32_t*>(tab);
++        const uint32_t w0 = g16<2 + 8 * IB>(W), w1 = g16<4 + 8 * IB>(W), w2 = g16<6 + 8 * IB>(W), w3 = g16<8 + 8 * IB>(W);
++        const uint32_t aux = g16<66 + 4 * IB>(W) | (g16<68 + 4 * IB>(W) << 16);
++        const float sc = h2f(uint16_t(g16<0>(W))) * (0.5f + float(aux >> 28)) * 0.5f;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const uint32_t wj = j == 0 ? w0 : j == 1 ? w1 : j == 2 ? w2 : w3;
++            m40_g8(make_uint2(grid[wj & 255], grid[wj >> 8]), m40_s7((aux >> (7 * j)) & 127), v);
++            put(j, sc);
++        }
++    } else if constexpr (TY == 21) {   // IQ3_S
++        const uint32_t* grid = reinterpret_cast<const uint32_t*>(tab);
++        const uint32_t w0 = g16<2 + 8 * IB>(W), w1 = g16<4 + 8 * IB>(W), w2 = g16<6 + 8 * IB>(W), w3 = g16<8 + 8 * IB>(W);
++        const uint32_t sb = g16<74 + 4 * IB>(W) | (g16<76 + 4 * IB>(W) << 16), qh = g8<66 + IB>(W);
++        const uint32_t s4 = (g8<106 + IB / 2>(W) >> (4 * (IB & 1))) & 15;
++        const float sc = h2f(uint16_t(g16<0>(W))) * float(1 + 2 * s4);
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const uint32_t wj = j == 0 ? w0 : j == 1 ? w1 : j == 2 ? w2 : w3;
++            const uint32_t i1 = (wj & 255) | ((qh << (8 - 2 * j)) & 256), i2 = (wj >> 8) | ((qh << (7 - 2 * j)) & 256);
++            m40_g8(make_uint2(grid[i1], grid[i2]), (sb >> (8 * j)) & 255, v);
++            put(j, sc);
++        }
++    } else if constexpr (TY == 20 || TY == 2) {   // IQ4_NL, Q4_0: block IB of 32
++        constexpr int B = 18 * IB;
++        const uint32_t q0 = g16<B + 2>(W) | (g16<B + 4>(W) << 16), q1 = g16<B + 6>(W) | (g16<B + 8>(W) << 16);
++        const uint32_t q2 = g16<B + 10>(W) | (g16<B + 12>(W) << 16), q3 = g16<B + 14>(W) | (g16<B + 16>(W) << 16);
++        const float* kv = reinterpret_cast<const float*>(tab);
++        const float sc = h2f(uint16_t(g16<B>(W)));
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const uint32_t a = j & 1 ? q2 : q0, b = j & 1 ? q3 : q1, sh = j < 2 ? 0 : 4;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                const uint32_t na = (a >> (8 * i + sh)) & 15, nb = (b >> (8 * i + sh)) & 15;
++                if constexpr (TY == 20) v[i] = kv[na], v[4 + i] = kv[nb];
++                else v[i] = m40_i(na) - 8.0f, v[4 + i] = m40_i(nb) - 8.0f;
++            }
++            put(j, sc);
++        }
++    } else {   // Q2_0: half IB & 1 of block IB >> 1 (64 values)
++        constexpr int B = 18 * (IB >> 1), H = 8 * (IB & 1);
++        const uint32_t ql = g16<B + 2 + H>(W) | (g16<B + 4 + H>(W) << 16), qh = g16<B + 6 + H>(W) | (g16<B + 8 + H>(W) << 16);
++        const float sc = h2f(uint16_t(g16<B>(W)));
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            const uint32_t c = ((j < 2 ? ql : qh) >> (16 * (j & 1))) & 0xffff;
++#pragma unroll
++            for (int i = 0; i < 8; ++i) v[i] = m40_i((c >> (2 * i)) & 3) - 1.0f;
++            put(j, sc);
++        }
++    }
++}
++
++template <int TY>
++__device__ __forceinline__ void m40_dq_run(const int ib, const uint32_t (&W)[kGrW<TY>], const uint4* tab, float (&w)[32]) {
++    switch (ib) {
++        case 0: m40_dq<TY, 0>(W, tab, w); break;
++        case 1: m40_dq<TY, 1>(W, tab, w); break;
++        case 2: m40_dq<TY, 2>(W, tab, w); break;
++        case 3: m40_dq<TY, 3>(W, tab, w); break;
++        default:
++            if constexpr (kRunsGr<TY> == 8) {
++                switch (ib) {
++                    case 4: m40_dq<TY, 4>(W, tab, w); break;
++                    case 5: m40_dq<TY, 5>(W, tab, w); break;
++                    case 6: m40_dq<TY, 6>(W, tab, w); break;
++                    default: m40_dq<TY, 7>(W, tab, w); break;
++                }
++            }
++    }
++}
++
++// the raw 16-byte loads of a group (group_load's first half), and their shift into words from the group's first byte (its second)
++template <int TY>
++__device__ __forceinline__ void m40_gr_issue(const uint8_t* p, const int avail, uint4 (&V)[kSU<TY>], int& off) {
++    const uintptr_t ad = reinterpret_cast<uintptr_t>(p);
++    const uint4* al = reinterpret_cast<const uint4*>(ad & ~uintptr_t(15));
++    off = int(ad & 15);
++    const int bytes = off + min(kGrBytes<TY>, avail);
++#pragma unroll
++    for (int q = 0; q < kSU<TY>; ++q) V[q] = q * 16 < bytes ? __ldg(al + q) : make_uint4(0u, 0u, 0u, 0u);
++}
++template <int TY>
++__device__ __forceinline__ void m40_gr_words(const uint4 (&V4)[kSU<TY>], const int off, uint32_t (&W)[kGrW<TY>]) {
++    constexpr int NV = kSU<TY> * 4;
++    uint32_t V[NV];
++#pragma unroll
++    for (int q = 0; q < kSU<TY>; ++q) V[4 * q] = V4[q].x, V[4 * q + 1] = V4[q].y, V[4 * q + 2] = V4[q].z, V[4 * q + 3] = V4[q].w;
++    const bool s8 = (off & 8) != 0, s4 = (off & 4) != 0, s2 = (off & 2) != 0;
++#pragma unroll
++    for (int i = 0; i < NV - 2; ++i) V[i] = s8 ? V[i + 2] : V[i];
++#pragma unroll
++    for (int i = 0; i < NV - 1; ++i) V[i] = s4 ? V[i + 1] : V[i];
++#pragma unroll
++    for (int i = 0; i < kGrW<TY>; ++i) W[i] = s2 ? (V[i] >> 16) | (V[i + 1] << 16) : V[i];
++}
++
++struct PfArgs {
++    const char* wa;
++    size_t sa, row_bytes;
++    const char* const* ep;
++    const BigJob* jobs;
++    const int* njobs;
++    const __half* X;
++    float* Y;
++    int N, K, lo, hi;   // jobs of lo < n <= hi tokens
++};
++
++// a block: rows [128 blockIdx.x, + 128) of job blockIdx.y's expert, the job's first BN tokens (a job holds PF_JOB <= 96)
++template <int TY, int BN>
++__global__ void __launch_bounds__(kPfT, 2) k_m40_pf(PfArgs a) {
++    constexpr int TN = BN / 8, RG = kRunsGr<TY>, NXQ = (BN * kPfK / 8 + kPfT - 1) / kPfT;   // tokens a thread; steps a group; X loads
++    static_assert(BN == 96 || BN == 48 || BN == 16, "k_m40_pf: 96, 48 or 16 tokens a block");
++    __shared__ __align__(16) float As[kPfK][kPfM];
++    __shared__ __align__(16) float Bs[kPfK][BN];
++    __shared__ __align__(16) uint4 tab[M40TabU<TY>::n > 0 ? M40TabU<TY>::n : 1];
++    __shared__ int sy[BN], so[BN];
++    __shared__ int sw, sn;
++    const int tid = int(threadIdx.x), ji = int(blockIdx.y);
++    if (ji >= *a.njobs) return;
++    const BigJob* jp = a.jobs + ji;
++    const int n = jp->n;
++    if (n <= a.lo || n > a.hi) return;
++    if (tid == 0) sw = jp->w, sn = n;
++    for (int t = tid; t < BN; t += kPfT) {
++        sy[t] = t < n ? jp->y[t] : -1;
++        so[t] = t < n ? jp->out[t] : -1;
++    }
++    m40_stage<TY, kPfT>(tab, tid);
++    __syncthreads();
++    const int N = a.N, K = a.K, row0 = int(blockIdx.x) * kPfM, my_row = row0 + tid;
++    const int rx = tid & 15, ty = tid >> 4;   // rows 4 rx + {0..3} and 64 + 4 rx + {0..3}; tokens by ty (below)
++    const uint8_t* const we = reinterpret_cast<const uint8_t*>(a.ep ? a.ep[sw] : a.wa + (size_t) sw * a.sa);
++    const uint8_t* const wrow = we + (size_t) min(my_row, N - 1) * a.row_bytes;
++    const int nsteps = K / kPfK;
++    // the step's tokens' values: load q of a thread is uint4 i = tid + kPfT q of the [BN tokens][4 uint4] tile, token i % BN, part i / BN
++    uint4 xr[NXQ];
++    auto x_issue = [&](const int s) {
++#pragma unroll
++        for (int q = 0; q < NXQ; ++q) {
++            const int i = tid + kPfT * q, t = i % BN, c = i / BN;
++            xr[q] = make_uint4(0u, 0u, 0u, 0u);
++            if (i < BN * 4 && sy[t] >= 0) xr[q] = __ldg(reinterpret_cast<const uint4*>(a.X + (size_t) sy[t] * K + (size_t) s * kPfK) + c);
++        }
++    };
++    auto x_store = [&] {
++#pragma unroll
++        for (int q = 0; q < NXQ; ++q) {
++            const int i = tid + kPfT * q, t = i % BN, c = i / BN;
++            if (i >= BN * 4) continue;
++            const uint32_t u[4] = {xr[q].x, xr[q].y, xr[q].z, xr[q].w};
++#pragma unroll
++            for (int h = 0; h < 4; ++h) {
++                const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&u[h]));
++                Bs[8 * c + 2 * h][t] = f.x;
++                Bs[8 * c + 2 * h + 1][t] = f.y;
++            }
++        }
++    };
++    uint4 gv[kSU<TY>];
++    int goff = 0;
++    uint32_t W[kGrW<TY>];
++    auto g_issue = [&](const int s) {   // the group of step s
++        const int g = s / RG;
++        m40_gr_issue<TY>(wrow + (size_t) g * kGrBytes<TY>, int(a.row_bytes) - g * kGrBytes<TY>, gv, goff);
++    };
++    float acc[8][TN];
++#pragma unroll
++    for (int r = 0; r < 8; ++r)
++#pragma unroll
++        for (int t = 0; t < TN; ++t) acc[r][t] = 0.0f;
++    x_issue(0);
++    g_issue(0);
++    for (int s = 0; s < nsteps; ++s) {
++        const int ib = s % RG;
++        // this step's tiles: the tokens' values, and the row's run as weights
++        x_store();
++        if (ib == 0) m40_gr_words<TY>(gv, goff, W);
++        {
++            float w[32];
++            m40_dq_run<TY>(ib, W, tab, w);
++#pragma unroll
++            for (int k = 0; k < kPfK; ++k) As[k][tid] = w[k];
++        }
++        __syncthreads();
++        // the next step's loads while this one computes
++        if (s + 1 < nsteps) {
++            x_issue(s + 1);
++            if ((s + 1) % RG == 0) g_issue(s + 1);
++        }
++        // not unrolled whole: 32 x 101 instructions are more than the instruction cache holds
++#ifndef M40_PF_UNR
++#define M40_PF_UNR 2   // m40_pf_test 15 Nov, IQ3_S full jobs: 2 3.90, 4 3.83, 8 3.75, all 32 1.2 TFLOP/s
++#endif
++#define M40_PF_PRAGMA(x) _Pragma(#x)
++#define M40_PF_UNROLL(n) M40_PF_PRAGMA(unroll n)
++        M40_PF_UNROLL(M40_PF_UNR)
++        for (int k = 0; k < kPfK; ++k) {
++            const float4 a0 = *reinterpret_cast<const float4*>(&As[k][4 * rx]), a1 = *reinterpret_cast<const float4*>(&As[k][64 + 4 * rx]);
++            const float ar[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
++            float br[TN];
++            if constexpr (BN == 96) {   // tokens 4 ty + {0..3}, 32 + 4 ty + {0..3}, 64 + 4 ty + {0..3}
++#pragma unroll
++                for (int q = 0; q < 3; ++q) {
++                    const float4 b = *reinterpret_cast<const float4*>(&Bs[k][32 * q + 4 * ty]);
++                    br[4 * q] = b.x, br[4 * q + 1] = b.y, br[4 * q + 2] = b.z, br[4 * q + 3] = b.w;
++                }
++            } else if constexpr (BN == 48) {   // tokens 6 ty + {0..5}
++#pragma unroll
++                for (int q = 0; q < 3; ++q) {
++                    const float2 b = *reinterpret_cast<const float2*>(&Bs[k][6 * ty + 2 * q]);
++                    br[2 * q] = b.x, br[2 * q + 1] = b.y;
++                }
++            } else {   // tokens 2 ty + {0, 1}
++                const float2 b = *reinterpret_cast<const float2*>(&Bs[k][2 * ty]);
++                br[0] = b.x, br[1] = b.y;
++            }
++#pragma unroll
++            for (int r = 0; r < 8; ++r)
++#pragma unroll
++                for (int t = 0; t < TN; ++t) acc[r][t] = fmaf(ar[r], br[t], acc[r][t]);
++        }
++        __syncthreads();
++    }
++    // out: token t's rows 4 rx + {0..3} and 64 + 4 rx + {0..3}
++#pragma unroll
++    for (int t = 0; t < TN; ++t) {
++        const int tk = BN == 96 ? 32 * (t / 4) + 4 * ty + (t & 3) : TN * ty + t;
++        if (tk >= sn) continue;
++        float* yr = a.Y + (size_t) so[tk] * N + row0;
++        if (row0 + 4 * rx + 3 < N) *reinterpret_cast<float4*>(yr + 4 * rx) = make_float4(acc[0][t], acc[1][t], acc[2][t], acc[3][t]);
++        if (row0 + 64 + 4 * rx + 3 < N) *reinterpret_cast<float4*>(yr + 64 + 4 * rx) = make_float4(acc[4][t], acc[5][t], acc[6][t], acc[7][t]);
++    }
++}
++
++template <int TY>
++void m40_pf_launch(const PfArgs& a0, int njobs_cap, cudaStream_t s) {
++    const dim3 grid((a0.N + kPfM - 1) / kPfM, njobs_cap);
++    PfArgs a = a0;
++    a.lo = 48, a.hi = 96;
++    k_m40_pf<TY, 96><<<grid, kPfT, 0, s>>>(a);
++    // jobs of up to this many tokens on the 16-token block (0: none; 16 at most)
++    static const int small = std::max(0, std::min(16, (int) env_int("FNX_M40_PF16", 16)));
++    a.lo = small, a.hi = 48;
++    k_m40_pf<TY, 48><<<grid, kPfT, 0, s>>>(a);
++    if (small > 0) {
++        a.lo = 0, a.hi = small;
++        k_m40_pf<TY, 16><<<grid, kPfT, 0, s>>>(a);
++    }
++}
++
++}  // namespace
++
++// the prompt path's routed experts of the M40's types on k_m40_pf; false: not handled (k_gemm4_job runs)
++bool m40_pf_run(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int njobs_cap, const uint16_t* x, float* out, cudaStream_t s) {
++    if (A.n_in % kPfK || A.n_out % 4) return false;
++    PfArgs a{};
++    a.wa = (const char*) A.p;
++    a.sa = sa;
++    a.row_bytes = A.row_bytes;
++    a.ep = A.ep;
++    a.jobs = jobs;
++    a.njobs = njobs;
++    a.X = reinterpret_cast<const __half*>(x);
++    a.Y = out;
++    a.N = A.n_out;
++    a.K = A.n_in;
++    switch (A.type) {
++        case T_IQ2_XXS: m40_pf_launch<16>(a, njobs_cap, s); break;
++        case T_IQ2_XS: m40_pf_launch<17>(a, njobs_cap, s); break;
++        case T_IQ2_S: m40_pf_launch<22>(a, njobs_cap, s); break;
++        case T_IQ3_XXS: m40_pf_launch<18>(a, njobs_cap, s); break;
++        case T_IQ3_S: m40_pf_launch<21>(a, njobs_cap, s); break;
++        case T_IQ4_NL: m40_pf_launch<20>(a, njobs_cap, s); break;
++        case T_Q4_0: m40_pf_launch<2>(a, njobs_cap, s); break;
++        case T_Q2_0: m40_pf_launch<42>(a, njobs_cap, s); break;
++        default: return false;
++    }
++    const cudaError_t e = cudaGetLastError();
++    if (e != cudaSuccess) throw std::runtime_error(std::string("m40 pf: ") + cudaGetErrorString(e));
++    return true;
++}
++// FNX_M40_PF=1: p100_moe's jobs on k_m40_pf (unset or 0: k_gemm4_job, as before)
++bool m40_pf_moe(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int njobs_cap, const uint16_t* x, float* out, cudaStream_t s) {
++    static const bool on = env_int("FNX_M40_PF", 0) != 0;
++    return on && m40_pf_run(A, sa, jobs, njobs, njobs_cap, x, out, s);
++}
++
++}  // namespace fnx
+diff -ruN varne-20261115/src/p100_moe.cu upstream/src/split/src/p100_moe.cu
+--- varne-20261115/src/p100_moe.cu	2026-11-06 17:46:11.735180960 +0100
++++ upstream/src/split/src/p100_moe.cu	2026-11-15 17:39:56.340249960 +0100
+@@ -189,8 +189,14 @@
+ 
+ }  // namespace
+ 
++#if FNX_ARCH < 53
++bool m40_pf_moe(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int njobs_cap, const uint16_t* x, float* out, cudaStream_t s);   // m40_pf_gemm.cuh
++#endif
+ void p100_moe(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int njobs_cap, const uint16_t* x, float* out, void* st) {
+     cudaStream_t s = (cudaStream_t) st;
++#if FNX_ARCH < 53
++    if (m40_pf_moe(A, sa, jobs, njobs, njobs_cap, x, out, s)) return;   // FNX_M40_PF=1
++#endif
+     if (A.n_in % 64) throw std::runtime_error("p100 moe: columns not in units of 64");
+     JobArgs a{};
+     a.t = tabs(s);
+@@ -226,3 +232,6 @@
+ #include "p100_moe_rows.cuh"
+ #include "p100_attn.cuh"
+ #include "p100_dma.cuh"
++#if FNX_ARCH < 53
++#include "m40_pf_gemm.cuh"
++#endif
+diff -ruN varne-20261115/src/pf_common.cuh upstream/src/split/src/pf_common.cuh
+--- varne-20261115/src/pf_common.cuh	2026-11-06 17:15:48.101018014 +0100
++++ upstream/src/split/src/pf_common.cuh	2026-11-15 17:04:23.407135659 +0100
+@@ -184,9 +184,15 @@
+ // copy into the next card is followed by a flag there; the step after waits on this card's flag (stream memory
+ // operations: no SM time, no host). Both files' ring shapes run it: Flash-Next's PfRing and the 27B's Pf, which holds
+ // the same buffers and takes its sequence number and copy-engine stream from itself rather than from the caller.
++// rs_only (FNX_PF_SP, sp_patch.py): the reduce-scatter alone: this card's finished part back into x (the other parts of x keep
++// what they held), no finished part sent on; the step flags still go, so a card's next sum into a set waits until the other
++// card has read its slot. The ring plan only (not the direct gather)
+ template <typename Ring>
+-inline void pf_ring_run(const Ring& r, int dev, int g, float* x, int C, unsigned seq, unsigned* err, cudaStream_t s) {
++inline void pf_ring_run(const Ring& r, int dev, int g, float* x, int C, unsigned seq, unsigned* err, cudaStream_t s, bool rs_only = false) {
+     if (r.plan.empty() || r.plan.front().part != g) throw std::runtime_error("prefill: the ring's plan is not card " + std::to_string(g) + "'s");
++    if (rs_only)
++        for (const PfRingOp& o : r.plan)
++            if (o.k == PfRingOp::GADD) throw std::runtime_error("prefill: the reduce-scatter alone takes the ring plan, not the direct gather");
+     const int set = (int) (seq & 1u), fin_part = (g + 1) % NCARD;   // the part this card finishes (pf_ring_plan)
+     __half* const own_ag = r.dma ? r.dag[set] : r.ag[set];             // where this card's gathered rows are (device with DMA, host without)
+     auto r0 = [&](int k) { return k * C / NCARD; };
+@@ -243,6 +249,7 @@
+                 break;
+             case PfRingOp::SEND: copy(r.nin[o.hop][set], r.send, rows(o.part)); break;
+             case PfRingOp::PASS:
++                if (rs_only) break;
+                 if (rows(o.part) > 0) {
+                     const size_t off = (size_t) r0(o.part) * N;
+                     if (o.part == fin_part && r.dma)   // the part finished here: device -> the next card's host gather buffer, by DMA
+@@ -287,6 +294,12 @@
+             case PfRingOp::SIGNAL: signal(o.step); break;
+             case PfRingOp::WAIT: wait(o.step); break;
+             case PfRingOp::OUT:
++                if (rs_only) {
++                    if (rows(fin_part) > 0)
++                        k_pfr_out<<<grid_for((size_t) rows(fin_part) * N / 2), 256, 0, s>>>((const __half2*) (own_ag + (size_t) r0(fin_part) * N),
++                                                                                        (float2*) (x + (size_t) r0(fin_part) * N), rows(fin_part) * N / 2);
++                    break;
++                }
+                 // the parts that arrived (everything but the one finished here) go to device memory by DMA, then one kernel reads it all
+                 if (r.dma)
+                     for (int p = 0; p < NCARD; ++p)
+diff -ruN varne-20261115/src/prefill.cu upstream/src/split/src/prefill.cu
+--- varne-20261115/src/prefill.cu	2026-11-06 17:46:11.638180284 +0100
++++ upstream/src/split/src/prefill.cu	2026-11-15 19:26:00.815337172 +0100
+@@ -86,6 +86,24 @@
+     for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < (size_t) rows * cols; e += (size_t) gridDim.x * blockDim.x)
+         y[(e / cols) * ldy + e % cols] = __half2float(x[e]);
+ }
++// the same without a 64-bit division per value (FNX_PF_CONV bit 1): flat when the rows lie back to back, else the row and the
++// column carried from one of the thread's values to its next
++__global__ void k_f16_f32_v(const __half* __restrict__ x, int rows, int cols, float* __restrict__ y, int ldy) {
++    const size_t n = (size_t) rows * cols, step = (size_t) gridDim.x * blockDim.x;
++    size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x;
++    if (ldy == cols) {
++        for (; e < n; e += step) y[e] = __half2float(x[e]);
++        return;
++    }
++    if (e >= n) return;
++    const unsigned c = (unsigned) cols, sr = (unsigned) (step / c), sc = (unsigned) (step % c);
++    unsigned r = (unsigned) (e / c), k = (unsigned) (e % c);
++    for (; e < n; e += step) {
++        y[(size_t) r * ldy + k] = __half2float(x[e]);
++        r += sr, k += sc;
++        if (k >= c) k -= c, ++r;
++    }
++}
+ __global__ void k_bf16_f32(const uint16_t* __restrict__ x, size_t n, float* __restrict__ y) {
+     for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < n; e += (size_t) gridDim.x * blockDim.x)
+         y[e] = __uint_as_float((unsigned) x[e] << 16);
+@@ -146,6 +164,61 @@
+         inject_out[t * HC + i0] = s;
+     }
+ }
++// FNX_PF_PREP=1 (prep_patch.py): k_hcb_prep with the row's four streams loaded (and written back) before the first block sum
++__global__ void __launch_bounds__(HCB_THREADS) k_hcb_prep4(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
++                                                           const float* __restrict__ wn, float* __restrict__ rs, __half* __restrict__ xh,
++                                                           float eps, const uint16_t* __restrict__ w_inj, float* __restrict__ inject_out) {
++    const int t = blockIdx.x, i0 = threadIdx.x;
++    __shared__ float sh[32];
++    __shared__ float shi[HC][HCB_THREADS / 32];
++    float acc[HC] = {};
++    float v[HC][HCB_PER];
++    float ss[HC];
++#pragma unroll
++    for (int c = 0; c < HC; ++c) {
++        ss[c] = 0.f;
++        const float g = bo ? 2.0f * pf_sigm(inj[t * HC + c] / (float) HC) : 0.f;
++#pragma unroll
++        for (int k = 0; k < HCB_PER; ++k) {
++            const int i = i0 + k * HCB_THREADS;
++            float r = R[(size_t) t * D + c * N + i];
++            if (bo) {
++                r = fmaf(bo[(size_t) t * N + i], g, r);
++                R[(size_t) t * D + c * N + i] = r;
++            }
++            v[c][k] = r;
++            ss[c] += r * r;
++        }
++    }
++#pragma unroll
++    for (int c = 0; c < HC; ++c) {
++        const float r_s = rsqrtf(pf_block_sum(ss[c], sh) / (float) N + eps);
++        if (i0 == 0) rs[t * HC + c] = r_s;
++#pragma unroll
++        for (int k = 0; k < HCB_PER; ++k) {
++            const int i = i0 + k * HCB_THREADS;
++            const float xn = v[c][k] * wn[c * N + i] * r_s;
++            xh[(size_t) t * D + c * N + i] = __float2half(xn);
++            if (w_inj)
++#pragma unroll
++                for (int r = 0; r < HC; ++r) acc[r] = fmaf(__uint_as_float((unsigned) w_inj[(size_t) r * D + c * N + i] << 16), xn, acc[r]);
++        }
++    }
++    if (!w_inj) return;
++    const int lane = i0 & 31, warp = i0 >> 5;
++#pragma unroll
++    for (int r = 0; r < HC; ++r) {
++        const float s = pf_wsum(acc[r]);
++        if (lane == 0) shi[r][warp] = s;
++    }
++    __syncthreads();
++    if (i0 < HC) {
++        float s = 0.f;
++#pragma unroll
++        for (int w = 0; w < HCB_THREADS / 32; ++w) s += shi[i0][w];
++        inject_out[t * HC + i0] = s;
++    }
++}
+ // lo = silu(down / HC) as f16
+ __global__ void k_hcb_lo(const float* __restrict__ down, int n, __half* __restrict__ lo) {
+     for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n; e += gridDim.x * blockDim.x) lo[e] = __float2half(pf_silu(down[e] / (float) HC));
+@@ -189,6 +262,25 @@
+         inj[t * HC + tid] = s;
+     }
+ }
++// k_hcb_mixinj's mix from the up product as cuBLAS left it, f16 (FNX_PF_CONV bit 2): __half2float of it is the float k_f16_f32
++// stores, so the same values without 4 D floats a row written and read back
++__global__ void __launch_bounds__(HCM_THREADS) k_hcb_mix_h(const float* __restrict__ R, const float* __restrict__ wn,
++                                                           const float* __restrict__ rs, const __half* __restrict__ up,
++                                                           float* __restrict__ mixed, __half* __restrict__ mixh) {
++    const int t = blockIdx.x, tid = threadIdx.x;
++    const float* Rt = R + (size_t) t * D;
++    float r_s[HC];
++#pragma unroll
++    for (int c = 0; c < HC; ++c) r_s[c] = rs[t * HC + c];
++    for (int i = tid; i < N; i += HCM_THREADS) {
++        float g[HC];
++#pragma unroll
++        for (int c = 0; c < HC; ++c) g[c] = pf_sigm(__half2float(up[(size_t) t * D + c * N + i])) * (Rt[c * N + i] * wn[c * N + i] * r_s[c]);
++        const float m = (g[0] + g[1] + g[2] + g[3]) / (float) HC;
++        mixed[(size_t) t * N + i] = m;
++        mixh[(size_t) t * N + i] = __float2half(m);
++    }
++}
+ 
+ // ---------------------------------------------------------------- routing
+ // row t (a warp): top 10 of the NEXP logits (the lower index on a tie), weights the selected softmax renormalized
+@@ -391,6 +483,16 @@
+     bool overlap = false;
+     cudaStream_t ring_st = nullptr;
+     cudaEvent_t ev_go[Engine::PF_PASS], ev_ra[Engine::PF_PASS], ev_rf[Engine::PF_PASS];
++    // FNX_PF_SP=1 (idea 58, sp_patch.py): see the pass's note. mixk: two chunks' mixed; ghb: host rows the other card's gather lands in
++    // (rows of D, for the draft source's R too), gnhb: the other card's; gflags [2 sets][rows in, rows read], gnflags: the other card's;
++    // ag_st: the gathers' stream; ev_hcd / ev_agd: a chunk's hc read / its gather done
++    bool sp = false;
++    float* mixk[2] = {};
++    float *ghb[2] = {}, *gnhb[2] = {};
++    unsigned *gflags = nullptr, *gnflags = nullptr;
++    unsigned gseq = 0;
++    cudaStream_t ag_st = nullptr;
++    cudaEvent_t ev_hcd[Engine::PF_PASS], ev_agd[Engine::PF_PASS];
+     // with an ExpertCache: a pass's expert tables (device, [NL][NEXP]; pinned copies to build them in) and the copies
+     // into stage[l & 1] (on cs) of layer l's experts not in a slot, as many as fit; the rest are read in place
+     char* stage[2] = {};
+@@ -411,23 +513,70 @@
+ };
+ 
+ namespace {
++// FNX_PF_CONV (the P100 port; bits, unset or 0: as before; the values and their places are the same either way):
++// 1: an f16 product to f32 without a division per value (k_f16_f32_v); 2: the hc read's up product stays f16 (k_hcb_mix_h)
++int pf_conv() {
++    static const int v = (int) env_int("FNX_PF_CONV", 0);
++    return v;
++}
++// FNX_M40_DENSE_ALGO=1 (m40_dense_algo_patch.py): the fastest algorithm by shape and chunk size, measured on the M40 (gemm_m40_dense.log,
++// 15 Nov): rows x cols, then one algorithm a size of kDaC (-1: the default was fastest)
++struct DenseAlgo {
++    int rows, cols;
++    signed char a[14];
++};
++constexpr int kDaC[14] = {16, 32, 64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096};
++constexpr DenseAlgo kDa[] = {
++    {6528, 2560, {9, 9, 3, 11, 5, 11, 11, 6, 11, 11, 6, 6, 6, 6}},
++    {3712, 2560, {9, 9, 10, 11, 5, 11, 11, 11, 6, 6, 11, 6, 6, 6}},
++    {5760, 2560, {4, 9, 3, 6, 3, 11, 6, 11, 6, 6, 6, 6, 6, 6}},
++    {1664, 2560, {9, 9, 10, 10, 10, 8, 10, 8, 8, 10, 10, 10, 10, 10}},
++    {2560, 3072, {9, 9, 10, 8, 8, 11, 10, 10, 10, 10, 6, 6, 6, 6}},
++    {2560, 2560, {-1, 9, 10, 10, 5, 6, 10, 10, 10, 10, 6, 10, 6, 10}},
++    {640, 2560, {-1, -1, -1, -1, -1, 10, 10, 10, 8, 10, 10, 8, 10, 10}},
++    {2560, 320, {4, 4, 4, 6, 5, 6, 5, 5, 5, 5, 5, 5, 5, 5}},
++    {512, 2560, {-1, -1, -1, -1, -1, -1, -1, 10, 6, 5, 5, 10, 5, 10}},
++};
++bool dense_algo_on() {
++    static const bool on = env_flag("FNX_M40_DENSE_ALGO");
++    return on;
++}
++cublasGemmAlgo_t dense_algo(int rows, int cols, int C) {
++    int b = 0;
++    while (b + 1 < 14 && C >= kDaC[b + 1]) ++b;
++    for (const DenseAlgo& d : kDa)
++        if (d.rows == rows && d.cols == cols) return d.a[b] < 0 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : (cublasGemmAlgo_t) d.a[b];
++    return CUBLAS_GEMM_DEFAULT_TENSOR_OP;
++}
+ // out[t * ldo + r] = W[r] . X[t] for t < C: W f16 [rows][cols], X f16 [C][cols]
+-void pf_gemm(Engine::Pf& p, const __half* W, int rows, int cols, const __half* X, int C, float* out, int ldo, cudaStream_t s) {
++// algo: CUBLAS_GEMM_DEFAULT_TENSOR_OP, or sp_algo's for an hc read on a part of a chunk (FNX_PF_SP)
++void pf_gemm(Engine::Pf& p, const __half* W, int rows, int cols, const __half* X, int C, float* out, int ldo, cudaStream_t s,
++             cublasGemmAlgo_t algo = CUBLAS_GEMM_DEFAULT_TENSOR_OP) {
+     if (std::getenv("FNX_PF_GEMM_LOG")) {   // each shape once (for tools/gemm_bench.cu)
+         static std::set<std::tuple<int, int, int, int>> seen;
+         if (seen.insert({rows, cols, C, ldo}).second) std::fprintf(stderr, "pf_gemm: rows %d cols %d C %d ldo %d\n", rows, cols, C, ldo);
+     }
++    bool from_table = false;   // FNX_M40_DENSE_ALGO: the table's algorithm, which cuBLAS may not offer for every size and ldo
++    if (algo == CUBLAS_GEMM_DEFAULT_TENSOR_OP && dense_algo_on()) {
++        algo = dense_algo(rows, cols, C);
++        from_table = algo != CUBLAS_GEMM_DEFAULT_TENSOR_OP;
++    }
+     if (p.f16acc) {
+         // f16 accumulation and output (llama.cpp's COMPUTE_16F on a V100), then to f32
+         const __half one = __float2half(1.0f), zero = __float2half(0.0f);
+         __half* tmp = reinterpret_cast<__half*>(p.up32);   // up32 is free outside the hc read
+         ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, C, cols, &one, W, CUDA_R_16F, cols, X, CUDA_R_16F, cols, &zero, tmp,
+-                         CUDA_R_16F, rows, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), "gemm f16");
+-        k_f16_f32<<<grid_for((size_t) rows * C), 256, 0, s>>>(tmp, C, rows, out, ldo);
++                         CUDA_R_16F, rows, CUBLAS_COMPUTE_16F, algo), "gemm f16");
++        if (pf_conv() & 1) k_f16_f32_v<<<grid_for((size_t) rows * C), 256, 0, s>>>(tmp, C, rows, out, ldo);
++        else k_f16_f32<<<grid_for((size_t) rows * C), 256, 0, s>>>(tmp, C, rows, out, ldo);
+     } else {
+         const float one = 1.0f, zero = 0.0f;
+-        ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, C, cols, &one, W, CUDA_R_16F, cols, X, CUDA_R_16F, cols, &zero, out,
+-                         CUDA_R_32F, ldo, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), "gemm");
++        cublasStatus_t st = cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, C, cols, &one, W, CUDA_R_16F, cols, X, CUDA_R_16F, cols, &zero,
++                                         out, CUDA_R_32F, ldo, CUBLAS_COMPUTE_32F, algo);
++        if (st == CUBLAS_STATUS_NOT_SUPPORTED && from_table)   // not offered at this size or ldo: the default (decided by the shape alone)
++            st = cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, C, cols, &one, W, CUDA_R_16F, cols, X, CUDA_R_16F, cols, &zero, out,
++                              CUDA_R_32F, ldo, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
++        ckb(st, "gemm");
+     }
+ }
+ // out = W . xh for a split-layout Q8_0 matrix (dequantized to f16), xh: C rows of cols as f16 already in p.xh
+@@ -452,26 +601,78 @@
+     const float one = 1.0f, zero = 0.0f;
+     ckb(cublasSgemm(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, C, cols, &one, W, cols, x, cols, &zero, out, ldo), "sgemm");
+ }
+-// the hyper-connection read for C rows (see hc.cuh for what it computes)
++// FNX_PF_SP: for a part of a chunk of C rows, the algorithm of the hc read's down (or up) product whose bits for those rows are the whole
++// chunk's default's: cuBLAS's default picks another kernel for half the rows at C 17..33 and 3073..4096 (down), 17..33 (up), and
++// these were equal at every C (mikro/k58/gemm_pol2, gemm_pol3 with production's math mode: 0 differences from 2 to 4096 rows)
++cublasGemmAlgo_t sp_algo(bool down, int C) {
++#if FNX_ARCH < 53
++    // the M40 (f16 in, f32 sums and out; m40_sp_patch.py, mikro/p100/gemm_m40.cu)
++    if (down && C >= 2433) return CUBLAS_GEMM_ALGO2;
++    if (!down && C >= 52 && C <= 103) return CUBLAS_GEMM_ALGO2;
++    if (!down && C <= 3) return CUBLAS_GEMM_ALGO7;
++    return CUBLAS_GEMM_DEFAULT_TENSOR_OP;
++#else
++    if (C >= 17 && C <= 33) return down ? CUBLAS_GEMM_ALGO4 : CUBLAS_GEMM_ALGO1;
++    if (down && C >= 3073) return CUBLAS_GEMM_ALGO1;
++    return CUBLAS_GEMM_DEFAULT_TENSOR_OP;
++#endif
++}
++// FNX_M40_HC_ALGO=1 (m40_hc_algo_patch.py): the hc read's products on explicit algorithms by the chunk's rows (see the patch's note)
++bool hc_algo_on() {
++    static const bool on = env_flag("FNX_M40_HC_ALGO");
++    return on;
++}
++int hc_down_min() {
++    static const int v = (int) env_int("FNX_M40_HC_DOWN_MIN", 192);
++    return v;
++}
++cublasGemmAlgo_t hc_algo(bool down, int C) {
++    if (!down) return C < 64 ? CUBLAS_GEMM_ALGO4 : CUBLAS_GEMM_ALGO5;   // m40_dense_algo_patch.py: ALGO4 below 64 rows
++    return C >= hc_down_min() ? CUBLAS_GEMM_ALGO8 : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
++}
++// m40_sp_patch.py: a chunk size whose parts take the whole chunk's bits with sp_algo (on the M40 no algorithm gives the down product's at
++// 2..3 and 33..1537 rows; such a pass reads hc whole on both cards as before). With FNX_M40_HC_ALGO the default is left only below
++// FNX_M40_HC_DOWN_MIN rows of the down product, where 4..32 are exact
++bool sp_exact(int C) {
++#if FNX_ARCH < 53
++    if (hc_algo_on()) return (C >= 4 && C <= 32) || C >= hc_down_min();
++    return (C >= 4 && C <= 32) || C >= 1538;
++#else
++    return C >= 2;
++#endif
++}
++// the hyper-connection read for C rows (see hc.cuh for what it computes); sp_c: these rows are a part of a chunk of sp_c rows (FNX_PF_SP)
+ void pf_hc_read(Engine::Pf& p, float* R, const float* bo, const float* inj_prev, const float* w_norm, const Q8S& w_down, const Q8S& w_up,
+-                const uint16_t* w_inj, float eps, float* mixed, float* inject, int C, cudaStream_t s) {
+-    k_hcb_prep<<<C, HCB_THREADS, 0, s>>>(R, bo, inj_prev, w_norm, p.rs, p.xh, eps, w_inj, inject);   // the inject rows here
++                const uint16_t* w_inj, float eps, float* mixed, float* inject, int C, cudaStream_t s, int sp_c = 0) {
++    const int whole = sp_c ? sp_c : C;   // FNX_M40_HC_ALGO: by the chunk's rows, so a part takes the whole chunk's algorithm
++    const cublasGemmAlgo_t a_down = hc_algo_on() ? hc_algo(true, whole) : sp_c ? sp_algo(true, sp_c) : CUBLAS_GEMM_DEFAULT_TENSOR_OP,
++                           a_up = hc_algo_on() ? hc_algo(false, whole) : sp_c ? sp_algo(false, sp_c) : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
++    static const bool prep4 = env_flag("FNX_PF_PREP");   // prep_patch.py
++    if (prep4) k_hcb_prep4<<<C, HCB_THREADS, 0, s>>>(R, bo, inj_prev, w_norm, p.rs, p.xh, eps, w_inj, inject);
++    else k_hcb_prep<<<C, HCB_THREADS, 0, s>>>(R, bo, inj_prev, w_norm, p.rs, p.xh, eps, w_inj, inject);   // the inject rows here
+     k_q8s_f16<<<grid_for((size_t) LR * D), 256, 0, s>>>(w_down.q, w_down.d, (size_t) LR * D, p.wh);
+-    pf_gemm(p, p.wh, LR, D, p.xh, C, p.lo32, LR, s);
++    pf_gemm(p, p.wh, LR, D, p.xh, C, p.lo32, LR, s, a_down);
+     k_hcb_lo<<<grid_for((size_t) C * LR), 256, 0, s>>>(p.lo32, C * LR, p.lo16);
+     k_q8s_f16<<<grid_for((size_t) D * LR), 256, 0, s>>>(w_up.q, w_up.d, (size_t) D * LR, p.wh);
+-    if (p.f16acc) {
++    const bool up_h = p.f16acc && (pf_conv() & 2);   // the up product stays f16, in up32's memory (xh is the mix's output)
++    if (up_h) {
++        const __half one = __float2half(1.0f), zero = __float2half(0.0f);
++        ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, D, C, LR, &one, p.wh, CUDA_R_16F, LR, p.lo16, CUDA_R_16F, LR, &zero,
++                         reinterpret_cast<__half*>(p.up32), CUDA_R_16F, D, CUBLAS_COMPUTE_16F, a_up), "gemm f16 (hc up)");
++    } else if (p.f16acc) {
+         // pf_gemm's f16 path stages through up32: here up32 is the result, so stage through xh (free once lo is made)
+         const __half one = __float2half(1.0f), zero = __float2half(0.0f);
+         ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, D, C, LR, &one, p.wh, CUDA_R_16F, LR, p.lo16, CUDA_R_16F, LR, &zero, p.xh,
+-                         CUDA_R_16F, D, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), "gemm f16 (hc up)");
+-        k_f16_f32<<<grid_for((size_t) D * C), 256, 0, s>>>(p.xh, C, D, p.up32, D);
++                         CUDA_R_16F, D, CUBLAS_COMPUTE_16F, a_up), "gemm f16 (hc up)");
++        if (pf_conv() & 1) k_f16_f32_v<<<grid_for((size_t) D * C), 256, 0, s>>>(p.xh, C, D, p.up32, D);
++        else k_f16_f32<<<grid_for((size_t) D * C), 256, 0, s>>>(p.xh, C, D, p.up32, D);
+     } else {
+         const float one = 1.0f, zero = 0.0f;
+         ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, D, C, LR, &one, p.wh, CUDA_R_16F, LR, p.lo16, CUDA_R_16F, LR, &zero, p.up32,
+-                         CUDA_R_32F, D, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), "gemm (hc up)");
++                         CUDA_R_32F, D, CUBLAS_COMPUTE_32F, a_up), "gemm (hc up)");
+     }
+-    k_hcb_mixinj<<<C, HCM_THREADS, 0, s>>>(R, w_norm, p.rs, p.up32, mixed, p.xh, nullptr, nullptr);   // prep made the inject rows
++    if (up_h) k_hcb_mix_h<<<C, HCM_THREADS, 0, s>>>(R, w_norm, p.rs, reinterpret_cast<const __half*>(p.up32), mixed, p.xh);
++    else k_hcb_mixinj<<<C, HCM_THREADS, 0, s>>>(R, w_norm, p.rs, p.up32, mixed, p.xh, nullptr, nullptr);   // prep made the inject rows
+     // FNX_PF_HC_CHECK=1 (debugging): the inject rows the way k_hcb_mixinj made them, against prep's
+     static const bool check = std::getenv("FNX_PF_HC_CHECK") != nullptr;
+     if (check && w_inj) {
+@@ -514,7 +715,7 @@
+ 
+ // the sum of x (C rows of N) over the cards on card g, one way round (each card's link is busy both ways already: it
+ // sends to g + 1 while it takes from g - 1; measured, the other direction at once halves both)
+-void pf_ring(Engine::Pf& p, int g, float* x, int C, const RingMoe* m, unsigned* err, cudaStream_t s) {
++void pf_ring(Engine::Pf& p, int g, float* x, int C, const RingMoe* m, unsigned* err, cudaStream_t s, bool rs_only = false) {
+     const unsigned seq = ++p.seq;
+     if (m) k_pfr_addend<<<grid_for((size_t) C * N), 256, 0, s>>>(x, m->part, m->topw, m->logits, C);
+ #if FNX_HIP
+@@ -535,10 +736,33 @@
+         return;
+     }
+ #endif
+-    pf_ring_run(p.ring_ce, p.dev, g, x, C, seq, err, s);
++    pf_ring_run(p.ring_ce, p.dev, g, x, C, seq, err, s, rs_only);
+     ckc(cudaGetLastError(), "ring");
+ }
+ 
++// FNX_PF_SP (sp_patch.py): rows of base (row_floats floats a row) for a chunk of C rows on stream s: this card's part (the ring part it
++// finishes, pf_ring_plan) goes to the other card's host rows by the copy engine, the other card's part comes from this card's host rows
++// into base. Flags [set][0]: the rows are in; [set][1]: the receiver has them (the sender's next use of the set waits for that). Every
++// card makes the same calls in the same order (seq)
++void pf_gather(Engine::Pf& p, int g, float* base, int row_floats, int C, cudaStream_t s) {
++    static_assert(NCARD == 2, "pf_gather: two cards");
++    const unsigned seq = ++p.gseq;
++    const int set = (int) (seq & 1u), own = (g + 1) % NCARD, oth = g;
++    auto r0 = [&](int k) { return k * C / NCARD; };
++    auto rows = [&](int k) { return r0(k + 1) - r0(k); };
++    CUstream cs = (CUstream) s;
++    if (seq > 2) cud(cuStreamWaitValue32(cs, (CUdeviceptr) (p.gflags + set * 2 + 1), seq - 2, CU_STREAM_WAIT_VALUE_GEQ), "gather consumed");
++    if (rows(own) > 0)
++        ckc(cudaMemcpyAsync(p.gnhb[set], base + (size_t) r0(own) * row_floats, (size_t) rows(own) * row_floats * sizeof(float), cudaMemcpyDefault, s),
++            "gather send");
++    cud(cuStreamWriteValue32(cs, (CUdeviceptr) (p.gnflags + set * 2), seq, 0), "gather flag");
++    cud(cuStreamWaitValue32(cs, (CUdeviceptr) (p.gflags + set * 2), seq, CU_STREAM_WAIT_VALUE_GEQ), "gather wait");
++    if (rows(oth) > 0)
++        ckc(cudaMemcpyAsync(base + (size_t) r0(oth) * row_floats, p.ghb[set], (size_t) rows(oth) * row_floats * sizeof(float), cudaMemcpyDefault, s),
++            "gather in");
++    cud(cuStreamWriteValue32(cs, (CUdeviceptr) (p.gnflags + set * 2 + 1), seq, 0), "gather read");
++}
++
+ // the attention partials to their heads' cards: block k of apart to card k (into its slot for this card), then wait
+ // for the other cards' blocks of this card's heads. One receive set: a card's next exchange comes after a chunk sum that
+ // needs every card past its merge
+@@ -661,6 +885,10 @@
+         ckc(cudaMemset(p.ring_ce.flags, 0, 2 * PF_RING_STEPS * sizeof(unsigned)), "prompt ring flags");
+         for (unsigned* f : p.aflags) ckc(cudaMemset(f, 0, ATT_FLAG_ROWS * ATT_PIECES_MAX * sizeof(unsigned)), "attention exchange flags");
+         p.seq = p.att_seq[0] = p.att_seq[1] = start;
++        if (p.sp) {   // FNX_PF_SP: the gathers count from 0 again
++            ckc(cudaMemset(p.gflags, 0, 4 * sizeof(unsigned)), "gather flags");
++            p.gseq = 0;
++        }
+     }
+     for (CardBuf* b : cb_) { ckc(cudaSetDevice(b->dev), "set"); ckc(cudaDeviceSynchronize(), "prompt sequence reset sync"); }
+ }
+@@ -875,6 +1103,22 @@
+                     }
+             }
+         }
++        // FNX_PF_SP (idea 58, sp_patch.py): a second mixed, the gathers' host rows (half a chunk of rows of D, two sets), flags, stream
++        if (env_int("FNX_PF_SP", 0) != 0 && NCARD == 2 && p->overlap && !p->ring_sm) {
++            p->sp = true;
++            p->mixk[0] = p->mixed;
++            p->mixk[1] = palloc<float>((size_t) pf_c_ * N);
++            for (int k = 0; k < 2; ++k) p->ghb[k] = hpalloc<float>((size_t) (pf_c_ + 1) / 2 * D);
++            p->gflags = hpalloc<unsigned>(4);
++            ckc(cudaStreamCreateWithFlags(&p->ag_st, cudaStreamNonBlocking), "gather stream");
++            own_stream(p->ag_st);
++            for (int k = 0; k < PF_PASS; ++k)
++                for (cudaEvent_t* e : {&p->ev_hcd[k], &p->ev_agd[k]}) {
++                    ckc(cudaEventCreateWithFlags(e, cudaEventDisableTiming), "event");
++                    own_event(*e);
++                }
++            std::fprintf(stderr, "fnx: FNX_PF_SP: card %d reads hc on its ring part of a chunk's rows (passes of 2 chunks and more)\n", c);
++        }
+         if (w.ec.n_slots) {   // the stages themselves: prefill_stages, once the experts' places are final
+             const long long stage_rows = env_int("FNX_PF_STAGE_ROWS", 2048);
+             if (stage_rows < 0 || stage_rows > INT32_MAX)
+@@ -910,6 +1154,14 @@
+             }
+             pf_[c]->pdev[k] = pf_[k]->dev;
+         }
++    for (int c = 0; c < NCARD; ++c) {   // FNX_PF_SP: each card's gathers land in the other card's host rows
++        Pf& p = *pf_[c];
++        const Pf& n = *pf_[(c + 1) % NCARD];
++        if (p.sp != n.sp) throw std::runtime_error("FNX_PF_SP: on every card or on none");
++        if (!p.sp) continue;
++        for (int k = 0; k < 2; ++k) p.gnhb[k] = n.ghb[k];
++        p.gnflags = n.gflags;
++    }
+     for (int c = 0; c < NCARD; ++c) {
+         Pf& p = *pf_[c];
+         const Pf& n = *pf_[(c + 1) % NCARD];
+@@ -962,10 +1214,13 @@
+     const CardW& w = m_.cards[c];
+     if (!w.ec.n_slots) return 0;
+     // a stage holds the largest layer's experts not in a slot at the start, FNX_PF_STAGE_MIB at most
++    // FNX_PF_STAGE_ALL=1 (stage_patch.py): every expert counted, as the lent slots' are missing too while reading
++    static const bool all = env_flag("FNX_PF_STAGE_ALL");
+     size_t most = 0;
+     for (int l = 0; l < NL; ++l) {
+         size_t n = 0;
+-        for (int e = 0; e < NEXP; ++e) n += m_.resident[(size_t) l][(size_t) e] ? 0 : 1;
++        if (all && l == NL - 1) continue;   // the last layer runs no experts while reading
++        for (int e = 0; e < NEXP; ++e) n += !all && m_.resident[(size_t) l][(size_t) e] ? 0 : 1;
+         most = std::max(most, n * (w.L[(size_t) l].gu_e_stride + w.L[(size_t) l].down_e_stride));
+     }
+     const long long stage_mib = env_int("FNX_PF_STAGE_MIB", 384);
+@@ -1247,11 +1502,12 @@
+     // made here: the next chunk's experts reuse their buffers), while the pass's next chunk computes; `done` marks it
+     // finished, and the chunk's next half waits for that alone. A layer runs every chunk's attention half, then every
+     // chunk's FFN half, so there is a next chunk to compute meanwhile
++    bool ring_rs = false;   // FNX_PF_SP: the split layers' sums stop after their reduce-scatter
+     auto ring_async = [&](int c, CardBuf& b, Pf& p, float* x, const RingMoe* m, int j, cudaEvent_t done, int rows) {
+         if (m) k_pfr_addend<<<grid_for((size_t) rows * N), 256, 0, b.st>>>(x, m->part, m->topw, m->logits, rows);
+         ckc(cudaEventRecord(p.ev_go[j], b.st), "ring go");
+         ckc(cudaStreamWaitEvent(p.ring_st, p.ev_go[j], 0), "ring go");
+-        pf_ring(p, c, x, rows, nullptr, b.ring.err, p.ring_st);
++        pf_ring(p, c, x, rows, nullptr, b.ring.err, p.ring_st, ring_rs);
+         if (p.rccl) p.post.push_back([&p, done] { ckc(cudaEventRecord(done, p.ring_st), "ring done"); });   // after the sum's conversion, once the group is closed
+         else ckc(cudaEventRecord(done, p.ring_st), "ring done");
+     };
+@@ -1265,6 +1521,222 @@
+         pf_dense(p, w.L[l].wo.s, N, w.nq * HD, p.att, rows, p.boak[j], N, b.st);
+         if (l < NL - 1 || mtp_) ring_async(c, b, p, p.boak[j], nullptr, j, p.ev_ra[j], rows);   // the last layer's sum: unused
+     };
++    // FNX_PF_SP=1 (idea 58, sp_patch.py; NACRT-ideja58-hc-po-vrsticah.md): a pass of two chunks and more reads hc, from layer PLE_LAYER
++    // on, on each card for the rows of the ring part it finishes only; the cards trade those mixed rows on ag_st (pf_gather) and the
++    // layer's sums stop after their reduce-scatter (ring_rs). A half's next chunk's hc read and gather go first, so the gather crosses
++    // the link while this chunk's half computes; mixed alternates between mixk[0] and mixk[1] by the chunk, and each half makes xh again
++    // from its chunk's mixed. Layer 0 and PLE_LAYER's write run on every row as before; the draft layer's source R is gathered whole.
++    bool sp_pass = false;
++    {
++        static const bool draft8_sp = env_flag("FNX_PF_DRAFT8");
++        const Pf& p0 = *pf_[0];
++        static const int sp_min = (int) env_int("FNX_PF_SP_MIN", 3584);   // sp2_patch.py: a short second chunk hides no gather
++        bool sp_sizes = true;   // m40_sp_patch.py: on the M40 every chunk of the pass a size whose hc parts give the whole chunk's bits
++        for (int j = 0; j < nk; ++j) sp_sizes = sp_sizes && sp_exact((int) chunks[(size_t) j].tokens.size());
++        sp_pass = p0.sp && nk >= 2 && (int) chunks[1].tokens.size() >= sp_min && (p0.f16acc || FNX_ARCH < 53) && sp_sizes && !draft8_sp &&
++                  !p0.ring_ce.direct && !p0.rccl;
++    }
++    if (sp_pass) {
++        for (int l = 0; l < NL; ++l) {
++            if (staging && l + 1 < NL - 1) stage_in(l + 1);   // the last layer runs no experts
++            const bool spl = l >= PLE_LAYER;   // this layer's hc reads on the card's own rows, its sums a reduce-scatter
++            ring_rs = spl;
++            // ---- attention half: a chunk's hc read on its own rows, its mixed gathered (issued a chunk ahead of the half)
++            auto att_pre = [&](int j) {
++                use(j);
++                each([&](int c, CardBuf& b, const CardW& w, Pf& p) {
++                    const LayerW& L = w.L[l];
++                    cudaStream_t s = b.st;
++                    const bool pending = l > 0;
++                    if (pending) ckc(cudaStreamWaitEvent(s, p.ev_rf[j], 0), "ffn sum");
++                    pf_prof_mark(b, PF_HC);
++                    bool apply = pending;
++                    const int own = (c + 1) % NCARD, r0 = own * C / NCARD, nr = (own + 1) * C / NCARD - r0;
++                    if (l == PLE_LAYER) {   // every row: the sum before it was whole
++                        ckc(cudaMemcpyAsync(p.ple_emb, pf_ple_[set], (size_t) C * N * 4, cudaMemcpyHostToDevice, s), "ple");
++                        hc_write(p.R, p.bo_f, p.inj_f, C, s);
++                        apply = false;
++                        pf_dense(p, w.ple_key.s, w.ple_key.n_out, w.ple_key.n_in, p.ple_emb, C, p.ple_key, w.ple_key.n_out, s);
++                        pf_dense(p, w.ple_value.s, w.ple_value.n_out, w.ple_value.n_in, p.ple_emb, C, p.ple_val, w.ple_value.n_out, s);
++                        for (int g = 0; g < ng; ++g) {
++                            const int q0 = g * MAXT, Tg = std::min(MAXT, C - q0);
++                            ple_post(p.R + (size_t) q0 * D, p.ple_key + (size_t) q0 * D, p.ple_val + (size_t) q0 * N, w.ple_norm_key,
++                                     w.ple_norm_query, w.ple_norm_conv, w.ple_conv, b.ple_hist, b.ple_hsnap, Tg, eps, s, p.ple_tmp);
++                        }
++                    }
++                    float* const mx = p.mixk[j & 1];
++                    if (spl) {
++                        if (nr > 0)
++                            pf_hc_read(p, p.R + (size_t) r0 * D, apply ? p.bo_f + (size_t) r0 * N : nullptr, p.inj_f + (size_t) r0 * HC,
++                                       L.hc_norm[0], L.hc_down[0], L.hc_up[0], L.hc_inj[0], eps, mx + (size_t) r0 * N, p.inj_a + (size_t) r0 * HC,
++                                       nr, s, C);
++                        ckc(cudaEventRecord(p.ev_hcd[j], s), "hc read done");
++                        ckc(cudaStreamWaitEvent(p.ag_st, p.ev_hcd[j], 0), "gather after the hc read");
++                        pf_gather(p, c, mx, N, C, p.ag_st);
++                        ckc(cudaEventRecord(p.ev_agd[j], p.ag_st), "gather done");
++                    } else {
++                        pf_hc_read(p, p.R, apply ? p.bo_f : nullptr, p.inj_f, L.hc_norm[0], L.hc_down[0], L.hc_up[0], L.hc_inj[0], eps, mx,
++                                   p.inj_a, C, s);
++                    }
++                });
++            };
++            auto att_post = [&](int j) {
++                use(j);
++                each([&](int c, CardBuf& b, const CardW& w, Pf& p) {
++                    const LayerW& L = w.L[l];
++                    cudaStream_t s = b.st;
++                    if (spl) ckc(cudaStreamWaitEvent(s, p.ev_agd[j], 0), "mixed gathered");
++                    p.mixed = p.mixk[j & 1];
++                    k_f32_f16<<<grid_for((size_t) C * N), 256, 0, s>>>(p.mixed, (size_t) C * N, p.xh);   // the f16 of mixed (the next chunk's hc read used xh)
++                    if (!is_attn(l)) {
++                        const int nv = w.nv(), ch = w.conv_ch(), rs_qkvz = ch + nv * HS;
++                        pf_prof_mark(b, PF_QKVZ);
++                        pf_dense_xh(p, L.qkvz.s, rs_qkvz, N, C, p.qkvz, rs_qkvz, s);
++                        pf_prof_mark(b, PF_AB);
++                        pf_sgemm(p, L.ab, 2 * nv, N, p.mixed, C, p.ab, 2 * nv);
++                        pf_prof_mark(b, PF_GDN);
++                        gdn_prompt(p.qkvz, p.ab, b.chist[l], L.conv, L.dt_bias, L.ssm_a, L.ssm_norm, b.S[l], p.ctl, ng, w.nk, nv, w.vmap, C, eps,
++                                   p.gdn_xc, p.gdn_sq, p.y32, p.gdn_ch, s);
++                        pf_prof_mark(b, PF_OUT);
++                        pf_dense(p, L.ssm_out.s, N, nv * HS, p.y32, C, p.bo_a, N, s);
++                    } else {
++                        pf_prof_mark(b, PF_WO);
++                        finish_att(c, b, w, p, l);   // the previous chunk's, before qg is this chunk's
++                        pf_prof_mark(b, PF_QKV);
++                        pf_dense(p, L.wq.s, NQH * 2 * HD, N, p.mixed, C, p.qg, NQH * 2 * HD, s);
++                        pf_dense_xh(p, L.wk.s, NKVH * HD, N, C, p.k, NKVH * HD, s);
++                        pf_dense_xh(p, L.wv.s, NKVH * HD, N, C, p.v, NKVH * HD, s);
++                        attn_prep(p.qg, p.k, L.q_norm, L.k_norm, NQH, NKVH, p.ctl, C, eps, rope_of(b.mrope), s);
++                        kv_append(p.k, p.v, b.kc[l], b.vc[l], b.pg, b.att_ring.card, C, p.ctl, s);
++                        pf_prof_mark(b, PF_IDX);
++                        k_bf16_f32<<<grid_for((size_t) 512 * N), 256, 0, s>>>(L.idx_wq, (size_t) 512 * N, p.widx);
++                        k_bf16_f32<<<grid_for((size_t) 128 * N), 256, 0, s>>>(L.idx_wk, (size_t) 128 * N, p.widx + (size_t) 512 * N);
++                        pf_sgemm(p, p.widx, qsa_rows(), N, p.mixed, C, p.yidx, qsa_rows());
++                        qsa_index(p.yidx, L.idx_qn, L.idx_kn, b.qsa_ring[l], b.qsa_pooled[l], b.pg, p.qidx, p.ctl, C, eps, rope_of(b.mrope), s);
++                        pf_prof_mark(b, PF_SEL);
++                        const int AR = p.attn_dec ? attn_rows() : p.qsa_pf_rows;
++                        for (int g = 0; g * AR < C; ++g) {
++                            const int q0 = g * AR, Tg = std::min(AR, C - q0);
++                            const int* gctl = p.ctl + 2 + 2 * (q0 / MAXT);
++                            qsa_select(p.qidx + (size_t) q0 * 512, b.qsa_pooled[l], b.pg, p.scores, p.cells + (size_t) q0 * qsa_maxsel(),
++                                       p.ncells + q0, max_ctx_ / 4, gctl, Tg, b.att_ring.card, s);
++                            if (!p.attn_dec) continue;
++                            attn(p.qg + (size_t) q0 * NQH * 2 * HD, b.kc[l], b.vc[l], b.pg, p.att + (size_t) q0 * w.nq * HD, b.att_ring,
++                                 (const unsigned*) (gctl + 1), 128 + l, gctl, Tg, b.att_part, s, p.cells + (size_t) q0 * qsa_maxsel(),
++                                 p.ncells + q0);
++                        }
++                        pf_prof_mark(b, PF_ATT);
++                        if (!p.attn_dec) {
++                            pf_attn_start(p, b, b.kc[l], b.vc[l], c, C, j & 1, s);   // merged by finish_att
++                            p.att_pend = j, p.att_pend_rows = C;
++                        } else {
++                            pf_prof_mark(b, PF_WO);
++                            pf_dense(p, L.wo.s, N, w.nq * HD, p.att, C, p.bo_a, N, s);
++                        }
++                    }
++                });
++                if (l == NL - 1 && !mtp_) return;   // the last layer's FFN half changes no state
++                each([&](int c, CardBuf& b, const CardW&, Pf& p) {
++                    pf_prof_mark(b, PF_SUM);
++                    if (!is_attn(l) || p.attn_dec) ring_async(c, b, p, p.bo_a, nullptr, j, p.ev_ra[j], C);   // else finish_att's
++                });
++            };
++            att_pre(0);
++            for (int j = 0; j < nk; ++j) {
++                if (j + 1 < nk) att_pre(j + 1);
++                att_post(j);
++            }
++            if (is_attn(l)) each([&](int c, CardBuf& b, const CardW& w, Pf& p) { finish_att(c, b, w, p, l); });   // the last chunk
++            if (l == NL - 1 && !mtp_) continue;
++            // ---- FFN half
++            auto ffn_pre = [&](int j) {
++                use(j);
++                each([&](int c, CardBuf& b, const CardW& w, Pf& p) {
++                    const LayerW& L = w.L[l];
++                    cudaStream_t s = b.st;
++                    ckc(cudaStreamWaitEvent(s, p.ev_ra[j], 0), "attention sum");
++                    pf_prof_mark(b, PF_HC);
++                    const int own = (c + 1) % NCARD, r0 = own * C / NCARD, nr = (own + 1) * C / NCARD - r0;
++                    float* const mx = p.mixk[j & 1];
++                    if (!spl) {
++                        pf_hc_read(p, p.R, p.bo_a, p.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], eps, mx, p.inj_f, C, s);
++                        return;
++                    }
++                    if (nr > 0)
++                        pf_hc_read(p, p.R + (size_t) r0 * D, p.bo_a + (size_t) r0 * N, p.inj_a + (size_t) r0 * HC, L.hc_norm[1], L.hc_down[1],
++                                   L.hc_up[1], L.hc_inj[1], eps, mx + (size_t) r0 * N, p.inj_f + (size_t) r0 * HC, nr, s, C);
++                    if (l == NL - 1) {   // the draft layer's source: R with the last attention write folded in, whole on both cards
++                        pf_gather(p, c, p.R, D, C, s);
++                        return;
++                    }
++                    ckc(cudaEventRecord(p.ev_hcd[j], s), "hc read done");
++                    ckc(cudaStreamWaitEvent(p.ag_st, p.ev_hcd[j], 0), "gather after the hc read");
++                    pf_gather(p, c, mx, N, C, p.ag_st);
++                    ckc(cudaEventRecord(p.ev_agd[j], p.ag_st), "gather done");
++                });
++            };
++            auto ffn_post = [&](int j) {
++                use(j);
++                each([&](int, CardBuf& b, const CardW& w, Pf& p) {
++                    const LayerW& L = w.L[l];
++                    cudaStream_t s = b.st;
++                    const int P = C * TOPK, ffs = w.ff1 - w.ff0;
++                    DW gu_e = L.gu_e, down_e = L.down_e;
++                    if (staging) {
++                        gu_e.ep = p.ep_gu + (size_t) l * NEXP, down_e.ep = p.ep_dn + (size_t) l * NEXP;
++                        if (j == 0) ckc(cudaStreamWaitEvent(s, p.ev_ready[l & 1], 0), "stage in");
++                    }
++                    if (spl) ckc(cudaStreamWaitEvent(s, p.ev_agd[j], 0), "mixed gathered");
++                    p.mixed = p.mixk[j & 1];
++                    k_f32_f16<<<grid_for((size_t) C * N), 256, 0, s>>>(p.mixed, (size_t) C * N, p.xh);   // the f16 of mixed
++                    if (p.moe_q8) quantize_q8_1(p.mixed, p.xq, N, C, s);
++                    pf_prof_mark(b, PF_ROUTER);
++                    k_bf16_f32<<<grid_for((size_t) (NEXP + 1) * N), 256, 0, s>>>(L.router, (size_t) (NEXP + 1) * N, p.router32);
++                    pf_sgemm(p, p.router32, NEXP + 1, N, p.mixed, C, p.logits, NEXP + 1);
++                    k_pf_top10<<<(C + 7) / 8, 256, 0, s>>>(p.logits, C, p.topi, p.topw);
++                    ckc(cudaMemsetAsync(p.cnt, 0, NEXP * 4, s), "cnt");
++                    k_pf_count<<<(P + 255) / 256, 256, 0, s>>>(p.topi, P, p.cnt);
++                    if (b.route_cnt) route_count(p.topi, P, b.route_cnt + (size_t) (NL + l) * NEXP, s);
++                    k_pf_jobbase<<<1, NEXP, 0, s>>>(p.cnt, p.jbase, p.njobs);
++                    k_pf_fill<<<NEXP, PF_FILL_THREADS, 0, s>>>(p.topi, P, p.cnt, p.jbase, p.jobs_gu, p.jobs_dn);
++                    pf_prof_mark(b, PF_GU);
++                    if (p.moe_q8) {
++                        moe_gate_up_big(gu_e, L.gu_e_stride, p.jobs_gu, p.njobs, pf_jobs_, p.xq, p.gu, s);
++                        moe_down_big(down_e, L.down_e_stride, p.jobs_dn, p.njobs, pf_jobs_, p.gu, p.part, s);
++                    } else {
++                        moe_gate_up_mma(gu_e, L.gu_e_stride, p.jobs_gu, p.njobs, pf_jobs_, reinterpret_cast<const uint16_t*>(p.xh), p.gu, s);
++                        swiglu_h16(p.gu, ffs, P, p.h16, s);
++                        pf_prof_mark(b, PF_DOWN);
++                        moe_down_mma(down_e, L.down_e_stride, p.jobs_dn, p.njobs, pf_jobs_, p.h16, p.part, s);
++                    }
++                    if (staging && j == nk - 1) ckc(cudaEventRecord(p.ev_done[l & 1], s), "stage done");
++                    pf_prof_mark(b, PF_SHARED);
++                    pf_dense_xh(p, L.sh_gu.s, 2 * ffs, N, C, p.shg, 2 * ffs, s);   // xh: still the f16 of mixed
++                    k_pf_swiglu<<<grid_for((size_t) C * ffs), 256, 0, s>>>(p.shg, ffs, C, p.shh);
++                    k_q8s_f16<<<grid_for((size_t) N * ffs), 256, 0, s>>>(L.sh_down.s.q, L.sh_down.s.d, (size_t) N * ffs, p.wh);
++                    pf_gemm(p, p.wh, N, ffs, p.shh, C, p.part + (size_t) P * N, N, s);
++                    ckc(cudaGetLastError(), "ffn");
++                });
++                each([&](int c, CardBuf& b, const CardW&, Pf& p) {
++                    RingMoe m;
++                    m.part = p.part;
++                    m.topw = p.topw;
++                    m.logits = p.logits;
++                    ring_async(c, b, p, p.bo_f, &m, j, p.ev_rf[j], C);
++                });
++            };
++            if (l == NL - 1) {
++                for (int j = 0; j < nk; ++j) ffn_pre(j);
++                continue;
++            }
++            ffn_pre(0);
++            for (int j = 0; j < nk; ++j) {
++                if (j + 1 < nk) ffn_pre(j + 1);
++                ffn_post(j);
++            }
++        }
++        each([&](int, CardBuf&, const CardW&, Pf& p) { p.mixed = p.mixk[0]; });
++    } else
+     for (int l = 0; l < NL; ++l) {
+         if (staging && l + 1 < NL - 1) stage_in(l + 1);   // the last layer runs no experts
+         for (int j = 0; j < nk; ++j) {
+diff -ruN varne-20261115/src/qsa.cuh upstream/src/split/src/qsa.cuh
+--- varne-20261115/src/qsa.cuh	2026-11-06 17:15:48.232018902 +0100
++++ upstream/src/split/src/qsa.cuh	2026-11-15 17:04:23.233295529 +0100
+@@ -155,6 +155,125 @@
+     scores[(size_t) t * max_pools + j] = s;
+ }
+ 
++// k_idx_score in tiles (FNX_QSA_TILE=1, the P100 port). k_idx_score reads a key again for every row and a query value from shared
++// memory for every multiply (~0.5 T MAC/s: at a 130k position a quarter and at 400k over a half of the prompt path's time, and a
++// tenth and more of a decode window's). Here a thread scores R rows by P pools at once: a key is read once for R rows and a row's
++// query values once for P pools. A (row, pool, head)'s sum runs over the dims in k_idx_score's order with its fmaf pairs and the
++// heads' relus are summed as there, so the same scores bit for bit (mikro/khc/qsa_adapt_test.cu compares them).
++// The best tile depends on the rows and the position, and a decode window's launches are captured in a graph per T, so the
++// kernel picks the tile itself, from T and the window's position: every block of a launch picks the same one. The grid is a
++// count of blocks from T and the context only; a tile of rows gets an equal share of them and its threads stride over the pools
++// the tile's last row sees. One position for all rows (*pos0p + t): not for lanes (k_idx_score there).
++// The rows a thread are as measured with the rows forced (qsa_adapt_test.cu's f columns; mikro/khc/pravilo.py scores a rule on
++// them). A prompt's group (T > 16): 4 everywhere (8 are no faster even with the keys far past the L2). A decode window: 8 only
++// where the keys are far past the L2 and 8 rows leave half the tiles of 4; else 4 from QSA_TILE_FAR pools; nearer whichever of
++// 1, 2, 4 takes the least time by the waves of threads it needs (a wave: the threads the card runs at once; about 9, 19 and
++// 35 us for 1, 2 and 4 rows a thread), the more rows on a tie.
++constexpr int QSA_TILE_WAVE = 13824;   // threads
++constexpr int QSA_TILE_FAR = 16384;    // pools
++__host__ __device__ __forceinline__ int qsa_tile_rows(int T, int nv) {
++    if (T <= 2) return 1;
++    if (T <= 4) return T * nv <= 45000 ? 1 : 4;
++    if (T > 16) return 4;
++    if (nv >= ((((T - 1) >> 2) & 1) ? 24576 : 81920)) return 8;   // T 5..8 and 13..16: two tiles of 4 become one of 8
++    if (nv >= QSA_TILE_FAR) return 4;
++    const int h = (nv + 1) / 2;   // threads a tile of 2 pools a thread keeps busy
++    const int c1 = ((T * nv + QSA_TILE_WAVE - 1) / QSA_TILE_WAVE) * 9;
++    const int c2 = ((((T + 1) / 2) * h + QSA_TILE_WAVE - 1) / QSA_TILE_WAVE) * 19;
++    const int c4 = ((((T + 3) / 4) * h + QSA_TILE_WAVE - 1) / QSA_TILE_WAVE) * 35;
++    return c4 <= c2 && c4 <= c1 ? 4 : c2 <= c1 ? 2 : 1;
++}
++
++// the tile's R rows (from t0; `rows` of them real, the rest zeros in qs) against the pools j0, j0 + step, ... below nvm, P at a time
++template <int R, int P>
++__device__ __forceinline__ void idx_score_tile(const float* qs, const __half* __restrict__ pooled, const KvPages& g, float* __restrict__ scores,
++                                               int max_pools, int t0, int rows, int p0, int nvm, int j_first, int step) {
++    const float w = rsqrtf((float) QSA_DIM);
++    for (int j0 = j_first; j0 < nvm; j0 += step) {
++        const uint4* kr[P];
++#pragma unroll
++        for (int a = 0; a < P; ++a) kr[a] = reinterpret_cast<const uint4*>(pooled + kvp_block(g, min(j0 + a, nvm - 1)));
++        float d[R][P][QSA_HEADS];
++#pragma unroll
++        for (int r = 0; r < R; ++r)
++#pragma unroll
++            for (int a = 0; a < P; ++a)
++#pragma unroll
++                for (int h = 0; h < QSA_HEADS; ++h) d[r][a][h] = 0.f;
++#pragma unroll 2
++        for (int c = 0; c < QSA_DIM / 8; ++c) {
++            float2 kv[P][4];
++#pragma unroll
++            for (int a = 0; a < P; ++a) {
++                const uint4 u = kr[a][c];
++                const __half2* h2 = reinterpret_cast<const __half2*>(&u);
++#pragma unroll
++                for (int k = 0; k < 4; ++k) kv[a][k] = __half22float2(h2[k]);
++            }
++#pragma unroll
++            for (int k = 0; k < 4; ++k) {
++                const int dim = c * 8 + 2 * k;
++#pragma unroll
++                for (int r = 0; r < R; ++r)
++#pragma unroll
++                    for (int h = 0; h < QSA_HEADS; ++h) {
++                        const float qx = qs[(r * QSA_HEADS + h) * QSA_DIM + dim], qy = qs[(r * QSA_HEADS + h) * QSA_DIM + dim + 1];
++#pragma unroll
++                        for (int a = 0; a < P; ++a) d[r][a][h] = fmaf(qx, kv[a][k].x, fmaf(qy, kv[a][k].y, d[r][a][h]));
++                    }
++            }
++        }
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            const int nv = (p0 + r + 1) / QSA_POOL;   // the row's own pools, as k_idx_score's
++            if (r >= rows || nv <= QSA_TOP) continue;
++#pragma unroll
++            for (int a = 0; a < P; ++a) {
++                float s = 0.f;
++#pragma unroll
++                for (int h = 0; h < QSA_HEADS; ++h) s += fmaxf(d[r][a][h], 0.f) * w;
++                if (j0 + a < nv) scores[(size_t) (t0 + r) * max_pools + j0 + a] = s;
++            }
++        }
++    }
++}
++
++// RMAX: the most rows a thread (a power of two, 8 at most; no less than qsa_tile_rows gives for the launch's T: 1 for T <= 2,
++// 4 for T <= 4, else 8; the instance sizes the shared queries and what the compiler has to keep in registers). The grid: no
++// fewer blocks than the next power of two from T, so every tile has one (a tile's share is a power of two: shifts, no division,
++// since a block with nothing to score should leave as fast as it can).
++template <int RMAX>
++__global__ void __launch_bounds__(256) k_idx_score_a(const float* __restrict__ q, const __half* __restrict__ pooled, KvPages g,
++                                                     float* __restrict__ scores, int max_pools, const int* pos0p, int T) {
++    const int pos0 = *pos0p;
++    int R = qsa_tile_rows(T, (pos0 + T) / QSA_POOL);
++    if (R > RMAX) R = RMAX;
++    const int lr = 31 - __clz(R), P = R > 1 ? 2 : 1, tiles = (T + R - 1) >> lr;
++    const int lb = (31 - __clz((int) gridDim.x)) - (32 - __clz(tiles - 1));   // a tile's share of the blocks: 1 << lb
++    const int ti = blockIdx.x >> lb, bi = blockIdx.x & ((1 << lb) - 1);
++    if (ti >= tiles) return;
++    const int t0 = ti * R, rows = min(R, T - t0), p0 = pos0 + t0;
++    const int nvm = (p0 + rows) / QSA_POOL;   // the tile's last row sees the most pools
++    if (nvm <= QSA_TOP || bi * (int) blockDim.x * P >= nvm) return;   // the whole block: no pool of the tile's to score
++    __shared__ float qs[RMAX * QSA_HEADS * QSA_DIM];
++    for (int k = threadIdx.x; k < R * QSA_HEADS * QSA_DIM; k += blockDim.x)
++        qs[k] = k < rows * QSA_HEADS * QSA_DIM ? q[(size_t) t0 * QSA_HEADS * QSA_DIM + k] : 0.f;
++    __syncthreads();
++    const int j0 = (bi * (int) blockDim.x + (int) threadIdx.x) * P, step = ((int) blockDim.x << lb) * P;
++    switch (R) {
++        case 1: idx_score_tile<1, 1>(qs, pooled, g, scores, max_pools, t0, rows, p0, nvm, j0, step); break;
++        case 2:
++            if (RMAX >= 2) idx_score_tile<2, 2>(qs, pooled, g, scores, max_pools, t0, rows, p0, nvm, j0, step);
++            break;
++        case 4:
++            if (RMAX >= 4) idx_score_tile<4, 2>(qs, pooled, g, scores, max_pools, t0, rows, p0, nvm, j0, step);
++            break;
++        default:
++            if (RMAX >= 8) idx_score_tile<8, 2>(qs, pooled, g, scores, max_pools, t0, rows, p0, nvm, j0, step);
++            break;
++    }
++}
++
+ #if FNX_ARCH >= 70
+ // the same for a prompt's rows on the tensor cores: a block takes 16 rows (their 4 heads: 64 rows of q, in f16 high and
+ // low halves) against 64 blocks' keys (f16 already), f32 accumulation; each key is read once per 16 rows instead of once
+@@ -352,4 +471,322 @@
+     }
+ }
+ 
++// k_idx_select with a bound and candidates (FNX_QSA_SEL=1, the P100 port). k_idx_select passes over a row's scores seven times:
++// four with an atomic a key into 256 counters and three in a chunk a thread (a line a lane, so a warp's step touches 32 lines);
++// at a 130k position that is 5.6 us a row and at 390k 22 us (a tenth and more of the prompt path's time there), with over 70
++// barriers a row. Here three light passes, a line a warp's step each: (1) a thread's largest score over its strided share; the
++// bound L is the least over the warps of a warp's 16th largest such maximum, so 32 x 16 = 512 scores at least are no less than L
++// and every block k_idx_select would take is among the scores no less than L (about 1,100 of them whatever the row's length:
++// mikro/khc/sim_meja.py); (2) the count of those a warp, a warp's scores being a contiguous range; (3) their keys and indices
++// into shared memory in index order. Then k_idx_select's own radix steps, ties and output on the candidates alone, with the
++// prefix sums a warp by shuffles (two barriers a sum). The 512th largest of the candidates is the 512th largest of the row and
++// the ties at it keep their index order, so the same cells and count as k_idx_select's (mikro/khc/qsa_sel_test.cu compares
++// them). A row with more candidates than QSA_SELC_CAP (scores nearly all equal) goes through k_idx_select's passes as they were.
++// ALL: a row of no more scores than that skips (1) and (2), every score a candidate. One position for all rows (*pos0p + t):
++// not for lanes (k_idx_select there).
++constexpr int QSA_SELC_CAP = 3072;                                                       // candidates a row at most
++constexpr int QSA_SELC_PER = (QSA_SELC_CAP + QSA_SEL_THREADS - 1) / QSA_SEL_THREADS;   // candidates a thread at most
++
++// the block's exclusive prefix sum of v in thread order, and the sum (32 warps; s: 32 shared ints, free again at return)
++__device__ __forceinline__ int selc_scan(int v, int* s, int& total) {
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    int inc = v;
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++        const int u = __shfl_up_sync(0xffffffffu, inc, o);
++        if (lane >= o) inc += u;
++    }
++    if (lane == 31) s[warp] = inc;
++    __syncthreads();
++    const int w = s[lane];   // the warps' sums, one a lane
++    int winc = w;
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++        const int u = __shfl_up_sync(0xffffffffu, winc, o);
++        if (lane >= o) winc += u;
++    }
++    const int before = __shfl_sync(0xffffffffu, winc - w, warp);
++    total = __shfl_sync(0xffffffffu, winc, 31);
++    __syncthreads();
++    return before + inc - v;
++}
++
++// k_idx_select's passes over all the row's scores (its text; hist: 256, ps: 2, s_gt and s_eq: QSA_SEL_THREADS shared words)
++static __device__ __noinline__ void selc_all(const unsigned* __restrict__ key, int* __restrict__ row, int* __restrict__ n_cells, int t, int p,
++                                      int card, unsigned* hist, unsigned* ps, int* s_gt, int* s_eq) {
++    const int tid = threadIdx.x, nv = (p + 1) / QSA_POOL, n_tail = (p + 1) % QSA_POOL;
++    unsigned prefix = 0, mask = 0, want = QSA_TOP;
++    for (int shift = 24; shift >= 0; shift -= 8) {
++        for (int b = tid; b < 256; b += QSA_SEL_THREADS) hist[b] = 0;
++        __syncthreads();
++        for (int j0 = 0; j0 < nv; j0 += QSA_SEL_THREADS) {
++            const int j = j0 + tid;
++            const unsigned k = j < nv ? key[j] : 0u;
++            if (j < nv && (k & mask) == prefix) atomicAdd(&hist[(k >> shift) & 255u], 1u);
++        }
++        __syncthreads();
++        if (tid < 32) {
++            const int lane = tid, hi = 255 - 8 * lane;
++            unsigned own = 0;
++#pragma unroll
++            for (int i = 0; i < 8; ++i) own += hist[hi - i];
++            unsigned before = own;
++#pragma unroll
++            for (int o = 1; o < 32; o <<= 1) {
++                const unsigned v = __shfl_up_sync(0xffffffffu, before, o);
++                if (lane >= o) before += v;
++            }
++            before -= own;
++            const unsigned hit = __ballot_sync(0xffffffffu, before + own >= want);
++            const int first = hit ? __ffs(hit) - 1 : 31;
++            if (lane == first) {
++                unsigned acc = before;
++                int b = hi - 7;
++                for (int i = 0; i < 8; ++i) {
++                    const int bb = hi - i;
++                    if (bb == 0 || acc + hist[bb] >= want) {
++                        b = bb;
++                        break;
++                    }
++                    acc += hist[bb];
++                }
++                ps[0] = prefix | ((unsigned) b << shift);
++                ps[1] = want - acc;
++            }
++        }
++        __syncthreads();
++        prefix = ps[0];
++        want = ps[1];
++        mask |= 255u << shift;
++        __syncthreads();
++    }
++    const unsigned thr = prefix;
++    const int chunk = (nv + QSA_SEL_THREADS - 1) / QSA_SEL_THREADS, j0 = min(nv, tid * chunk), j1 = min(nv, j0 + chunk);
++    int n_eq = 0;
++    for (int j = j0; j < j1; ++j) n_eq += key[j] == thr;
++    s_eq[tid] = n_eq;
++    __syncthreads();
++    for (int o = 1; o < QSA_SEL_THREADS; o <<= 1) {
++        const int e = tid >= o ? s_eq[tid - o] : 0;
++        __syncthreads();
++        s_eq[tid] += e;
++        __syncthreads();
++    }
++    const int eq_start = s_eq[tid] - n_eq;
++    int own = 0;
++    {
++        int eq_before = eq_start;
++        for (int j = j0; j < j1; ++j) {
++            const unsigned k = key[j];
++            bool take = k > thr;
++            if (k == thr) take = eq_before++ < (int) want;
++            own += take && kv_card(j) == card;
++        }
++    }
++    s_gt[tid] = own;
++    __syncthreads();
++    for (int o = 1; o < QSA_SEL_THREADS; o <<= 1) {
++        const int a = tid >= o ? s_gt[tid - o] : 0;
++        __syncthreads();
++        s_gt[tid] += a;
++        __syncthreads();
++    }
++    int out = s_gt[tid] - own;
++    {
++        int eq_before = eq_start;
++        for (int j = j0; j < j1; ++j) {
++            const unsigned k = key[j];
++            bool take = k > thr;
++            if (k == thr) take = eq_before++ < (int) want;
++            if (take && kv_card(j) == card) {
++#pragma unroll
++                for (int m = 0; m < QSA_POOL; ++m) row[out * QSA_POOL + m] = kv_local_block(j) * QSA_POOL + m;
++                ++out;
++            }
++        }
++    }
++    if (tid == QSA_SEL_THREADS - 1) {
++        int n = out * QSA_POOL;
++        const int jt = p / QSA_POOL;
++        if (kv_card(jt) == card)
++            for (int m = 0; m < n_tail; ++m) row[n++] = kv_local_block(jt) * QSA_POOL + (p - n_tail + 1 + m) % QSA_POOL;
++        n_cells[t] = n;
++    }
++}
++
++template <int ALL>
++__global__ void __launch_bounds__(QSA_SEL_THREADS, 2) k_idx_select_c(const float* __restrict__ scores, int* __restrict__ cells,
++                                                                     int* __restrict__ n_cells, int max_pools, const int* pos0p, int card) {
++    const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int p = *pos0p + t, nv = (p + 1) / QSA_POOL, n_tail = (p + 1) % QSA_POOL;
++    if (nv <= QSA_TOP) {
++        if (tid == 0) n_cells[t] = -1;
++        return;
++    }
++    const unsigned* key = reinterpret_cast<const unsigned*>(scores + (size_t) t * max_pools);
++    int* row = cells + (size_t) t * QSA_MAXSEL;
++    __shared__ unsigned ck[QSA_SELC_CAP];   // the candidates' keys and indices, in index order
++    __shared__ int cj[QSA_SELC_CAP];
++    __shared__ unsigned hist[256];
++    __shared__ unsigned sw[32], ps[2];
++    __shared__ int sc[32];
++    const unsigned FULL = 0xffffffffu;
++    // a warp's scores in passes 2 and 3: wc of them from warp * wc, 32 a step
++    const int wc = (((nv + 31) >> 5) + 31) & ~31, w0 = min(nv, warp * wc), w1 = min(nv, w0 + wc);
++    unsigned L = 0;
++    int woff = w0, nc = nv;
++    if (nv > ALL) {
++        unsigned m = 0;   // 1: the largest of the thread's scores (tid, tid + 1024, ...); none: 0, which bounds nothing wrongly
++        for (int j = tid; j < nv; j += QSA_SEL_THREADS) m = max(m, key[j]);
++        int rank = 0;   // the lanes with a larger maximum (ties: the lower lane first)
++#pragma unroll
++        for (int r = 1; r < 32; ++r) {
++            const int o = (lane + r) & 31;
++            const unsigned v = __shfl_sync(FULL, m, o);
++            rank += v > m || (v == m && o < lane);
++        }
++        const unsigned hit = __ballot_sync(FULL, rank == 15);
++        const unsigned wm = __shfl_sync(FULL, m, __ffs(hit) - 1);   // the warp's 16th largest
++        if (lane == 0) sw[warp] = wm;
++        __syncthreads();
++        L = sw[lane];
++#pragma unroll
++        for (int o = 16; o > 0; o >>= 1) L = min(L, __shfl_xor_sync(FULL, L, o));
++        int cnt = 0;   // 2: the warp's candidates
++        for (int j0 = w0; j0 < w1; j0 += 32) {
++            const int j = j0 + lane;
++            const unsigned k = j < w1 ? key[j] : 0u;
++            cnt += __popc(__ballot_sync(FULL, j < w1 && k >= L));
++        }
++        if (lane == 0) sc[warp] = cnt;
++        __syncthreads();
++        const int w = sc[lane];
++        int winc = w;
++#pragma unroll
++        for (int o = 1; o < 32; o <<= 1) {
++            const int u = __shfl_up_sync(FULL, winc, o);
++            if (lane >= o) winc += u;
++        }
++        woff = __shfl_sync(FULL, winc - w, warp);
++        nc = __shfl_sync(FULL, winc, 31);
++        __syncthreads();   // sc is free again
++        if (nc > QSA_SELC_CAP) {
++            selc_all(key, row, n_cells, t, p, card, hist, ps, cj, cj + QSA_SEL_THREADS);
++            return;
++        }
++    }
++    for (int j0 = w0; j0 < w1; j0 += 32) {   // 3: the candidates in index order
++        const int j = j0 + lane;
++        const unsigned k = j < w1 ? key[j] : 0u;
++        const bool c = j < w1 && k >= L;
++        const unsigned mk = __ballot_sync(FULL, c);
++        if (c) {
++            const int i = woff + __popc(mk & ((1u << lane) - 1u));
++            ck[i] = k;
++            cj[i] = j;
++        }
++        woff += __popc(mk);
++    }
++    __syncthreads();
++    // a thread's candidates: per of them from tid * per, in registers from here on
++    const int per = (nc + QSA_SEL_THREADS - 1) / QSA_SEL_THREADS, i0 = min(nc, tid * per), n = min(nc, i0 + per) - i0;
++    unsigned k[QSA_SELC_PER];
++    int jj[QSA_SELC_PER];
++#pragma unroll
++    for (int s = 0; s < QSA_SELC_PER; ++s) {
++        k[s] = s < n ? ck[i0 + s] : 0u;
++        jj[s] = s < n ? cj[i0 + s] : 0;
++    }
++    unsigned prefix = 0, mask = 0, want = QSA_TOP;   // k_idx_select's radix steps: the want-th largest among the keys matching prefix on mask
++    for (int shift = 24; shift >= 0; shift -= 8) {
++        if (tid < 256) hist[tid] = 0;
++        __syncthreads();
++#pragma unroll
++        for (int s = 0; s < QSA_SELC_PER; ++s) {
++            const bool in = s < n && (k[s] & mask) == prefix;
++            const unsigned bin = (k[s] >> shift) & 255u;
++            if (shift == 24) {   // the candidates share their high bits: a warp's keys of one bin counted with one atomic
++                unsigned todo = __ballot_sync(FULL, in);
++                while (todo) {
++                    const int lead = __ffs(todo) - 1;
++                    const unsigned b = __shfl_sync(FULL, bin, lead);
++                    const unsigned same = __ballot_sync(FULL, in && bin == b);
++                    if (lane == lead) atomicAdd(&hist[b], (unsigned) __popc(same));
++                    todo &= ~same;
++                }
++            } else if (in) {
++                atomicAdd(&hist[bin], 1u);
++            }
++        }
++        __syncthreads();
++        if (tid < 32) {   // the highest bin b > 0 where the count from 255 down reaches want, else 0; acc: the count above b
++            const int hi = 255 - 8 * lane;   // lane l: bins hi .. hi - 7
++            unsigned own = 0;
++#pragma unroll
++            for (int i = 0; i < 8; ++i) own += hist[hi - i];
++            unsigned before = own;   // inclusive scan over the lanes (higher bins first), then exclusive
++#pragma unroll
++            for (int o = 1; o < 32; o <<= 1) {
++                const unsigned v = __shfl_up_sync(FULL, before, o);
++                if (lane >= o) before += v;
++            }
++            before -= own;
++            const unsigned hit = __ballot_sync(FULL, before + own >= want);
++            const int first = hit ? __ffs(hit) - 1 : 31;
++            if (lane == first) {
++                unsigned acc = before;
++                int b = hi - 7;
++                for (int i = 0; i < 8; ++i) {
++                    const int bb = hi - i;
++                    if (bb == 0 || acc + hist[bb] >= want) {
++                        b = bb;
++                        break;
++                    }
++                    acc += hist[bb];
++                }
++                ps[0] = prefix | ((unsigned) b << shift);
++                ps[1] = want - acc;
++            }
++        }
++        __syncthreads();
++        prefix = ps[0];
++        want = ps[1];
++        mask |= 255u << shift;
++    }
++    // prefix: the threshold key; `want` ties at it are kept (the first by index)
++    const unsigned thr = prefix;
++    int n_eq = 0;
++#pragma unroll
++    for (int s = 0; s < QSA_SELC_PER; ++s) n_eq += s < n && k[s] == thr;
++    int total;
++    int eq_before = selc_scan(n_eq, sc, total);
++    int own = 0;
++    unsigned mine = 0;   // the thread's candidates taken and on this card
++#pragma unroll
++    for (int s = 0; s < QSA_SELC_PER; ++s)
++        if (s < n) {
++            bool take = k[s] > thr;
++            if (k[s] == thr) take = eq_before++ < (int) want;
++            if (take && kv_card(jj[s]) == card) {
++                mine |= 1u << s;
++                ++own;
++            }
++        }
++    int out = selc_scan(own, sc, total);   // owned selected blocks before this thread's; total: the card's selected-block count
++#pragma unroll
++    for (int s = 0; s < QSA_SELC_PER; ++s)
++        if ((mine >> s) & 1u) {
++#pragma unroll
++            for (int m = 0; m < QSA_POOL; ++m) row[out * QSA_POOL + m] = kv_local_block(jj[s]) * QSA_POOL + m;
++            ++out;
++        }
++    if (tid == 0) {
++        int nn = total * QSA_POOL;
++        const int jt = p / QSA_POOL;   // the tail's block (incomplete)
++        if (kv_card(jt) == card)
++            for (int m = 0; m < n_tail; ++m) row[nn++] = kv_local_block(jt) * QSA_POOL + (p - n_tail + 1 + m) % QSA_POOL;
++        n_cells[t] = nn;
++    }
++}
++
+ }  // namespace
+diff -ruN varne-20261115/src/session.cpp upstream/src/split/src/session.cpp
+--- varne-20261115/src/session.cpp	2026-11-06 17:15:48.382019918 +0100
++++ upstream/src/split/src/session.cpp	2026-11-15 17:04:23.263305697 +0100
+@@ -215,14 +215,18 @@
+             ck_parked = ck;
+         }
+     }
+-    // the live sequence goes to host memory when the prompt leaves most of it (another conversation)
+-    auto park_live = [&] {
+-        if (caching) park_live_();
++    // the live sequence goes to host memory when the prompt leaves most of it (another conversation); held: the bytes of
++    // a conversation taken out of the cache, which the room made for it still counts
++    auto park_live = [&](size_t held) {
++        if (caching) park_live_(held);
+     };
+     if (from_parked > from_live) {
+-        park_live();
++        // out of the cache before the live sequence is parked: making room evicts by index, and could evict this one
+         Conv c = std::move(cache_->parked[(size_t) best_parked]);
+         cache_->parked.erase(cache_->parked.begin() + best_parked);
++        size_t held = c.kv->total();
++        for (const State& s : c.ckpts) held += s->total();
++        park_live(held);
+         const auto t_load = std::chrono::steady_clock::now();
+         try {
+             e_.load_state(*c.kv);
+@@ -236,9 +240,11 @@
+         std::fprintf(stderr, "conversation cache: restored %zu tokens in %.0f ms, parked=%zu bytes=%zu\n", from_parked, ms_since(t_load),
+                      cache_->parked.size(), bytes_held());
+     } else if (from_live < hist.size()) {
+-        if (from_live * 2 < hist.size() || hist.size() - from_live >= DROP_PARK_MIN) park_live();
+-        if (ck_live >= 0) {
+-            e_.load_state(*live_.ckpts[(size_t) ck_live]);
++        // the checkpoint held by its State: making room for the live sequence drops live checkpoints from the front
++        const State ck = ck_live >= 0 ? live_.ckpts[(size_t) ck_live] : nullptr;
++        if (from_live * 2 < hist.size() || hist.size() - from_live >= DROP_PARK_MIN) park_live(0);
++        if (ck) {
++            e_.load_state(*ck);
+         } else {
+             e_.reset();
+             live_ = Conv{};
+@@ -338,7 +344,7 @@
+ }
+ 
+ // the live sequence to host memory, if it is long enough to be worth the copy
+-void Session::park_live_() {
++void Session::park_live_(size_t held) {
+     const std::vector<int>& hist = e_.history();
+     if (cache_->budget == 0 || hist.size() < PARK_MIN) return;
+     for (const Conv& p : cache_->parked)   // already parked as it is (a conversation brought back and left unchanged)
+@@ -350,7 +356,7 @@
+         std::fprintf(stderr, "conversation cache: %zu tokens (%zu MiB) are more than the budget (%zu MiB): not parked\n", hist.size(), need >> 20, cache_->budget >> 20);
+         return;
+     }
+-    evict(need);
++    evict(need + held);
+     if ((long) (need >> 20) > e_.host_free_mib() - reserve) {
+         std::fprintf(stderr, "conversation cache: %zu tokens (%zu MiB) with %ld MiB of RAM free: not parked\n", hist.size(), need >> 20, e_.host_free_mib());
+         return;
+diff -ruN varne-20261115/src/session.hpp upstream/src/split/src/session.hpp
+--- varne-20261115/src/session.hpp	2026-11-06 17:15:48.182018563 +0100
++++ upstream/src/split/src/session.hpp	2026-11-15 17:04:23.262136712 +0100
+@@ -140,7 +140,7 @@
+     Conv live_;
+     size_t bytes_held() const;
+     void evict(size_t need);
+-    void park_live_();
++    void park_live_(size_t held = 0);
+     void checkpoint(Conv& c);
+     std::vector<int> prompt_;   // the prompt being answered (its last token not yet in the engine)
+     GenStats* timing_ = nullptr;   // generate()'s stats while it runs

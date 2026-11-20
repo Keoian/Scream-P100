@@ -11,6 +11,7 @@
 | `engine/p100_compat.h`, `engine/src/p100_*`, the changes to the other files | ours | MIT (ours) |
 | `CMakeLists.txt`, `build.sh`, `setup.sh`, `run.sh`, `scripts/`, `profile/`, `bench/`, `docs/`, `history/` | ours; `bench/bench.py` reads its texts from a Strata checkout at run time | MIT (ours) |
 | `engine-32g/` | ours: the low-RAM engine's four patches and `ssd.hpp` (the 32 GB and 64 GB modes), which `build.sh --32g` applies to a copy of `engine/` | MIT (ours) |
+| `engine-m40/` (this branch only; a test build for two Tesla M40 24 GB, measured on one machine) | Strata v0.2.10's `src/split/` (as `engine/`, from sFNX) with our P100 port as of 6 Nov 2026 and our Maxwell changes (`src/m40_*`, `p100_compat.h`'s `__hfma2`, the changes in `patches/`); `CMakeLists.txt` and `tools/` are Strata's, unchanged | MIT: Strata's notice and ours |
 
 [docs/PROVENANCE.md](docs/PROVENANCE.md) says for every file in `engine/` whether it is Strata's unchanged, Strata's
 modified, or new, with its SHA-256. [docs/upstream-v0.2.10.diff](docs/upstream-v0.2.10.diff) is every change against

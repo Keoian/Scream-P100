@@ -1,5 +1,8 @@
 /build/
 /build-32g/
+/build-m40/
+/engine-m40/tests/m40_rows_test
+/engine-m40/tests/m40_pf_test
 /third_party/llama.cpp/
 __pycache__/
 /my-profile*.json

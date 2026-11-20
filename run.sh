@@ -33,9 +33,9 @@ EXE=$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["exe"])' "$
 missing=$(ldd "$EXE" | grep "not found" || true)
 [ -z "$missing" ] || die "the engine cannot find: $missing; set LD_LIBRARY_PATH to the CUDA 12 libraries it was built with"
 avail=$(awk '/^MemAvailable:/ {print int($2 / 1048576)}' /proc/meminfo 2>/dev/null || true)
-kind=$("$PY" -c 'import json, sys; c = json.load(open(sys.argv[1])); m = c.get("model_name", ""); print("q4" if "q4_k_xl" in m else "edge0" if "edge0" in m else c["env"].get("FNX_PLE_RAM", "1"))' "$CFG")
-# what the engine holds once loaded: UD-Q4_K_XL, Edge0, the 64 GB mode (fill_profile.py --ram 64) or the default
-case $kind in q4) holds=70 ;; edge0) holds=80 ;; 0) holds=46 ;; *) holds=85 ;; esac
+kind=$("$PY" -c 'import json, sys; c = json.load(open(sys.argv[1])); m = c.get("model_name", ""); print("m40" if "m40" in m else "q4" if "q4_k_xl" in m else "edge0" if "edge0" in m else c["env"].get("FNX_PLE_RAM", "1"))' "$CFG")
+# what the engine holds once loaded: the 2 x M40 test build, UD-Q4_K_XL, Edge0, the 64 GB mode (fill_profile.py --ram 64) or the default
+case $kind in m40) holds=20 ;; q4) holds=70 ;; edge0) holds=80 ;; 0) holds=46 ;; *) holds=85 ;; esac
 if [ -n "$avail" ] && [ "$avail" -lt $((holds - 5)) ]; then
   say "WARNING: $avail GiB of RAM available; the engine holds about $holds GiB once loaded"
 fi
