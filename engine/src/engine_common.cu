@@ -940,6 +940,7 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
     if (T < 1 || T > MAXT) throw std::runtime_error("window: 1..MAXT tokens");
     if (pos_ + T > max_ctx_) throw std::runtime_error("window: context full");
     arena_churn();
+    vram_churn();
     ensure_pages(pos_ + T);
     const auto t0 = std::chrono::steady_clock::now();
     if (!h_.R0) {
@@ -1065,6 +1066,7 @@ std::vector<int> Engine::step(const std::vector<int>& lanes, const std::vector<i
             if (lanes[q] == lanes[r]) throw std::runtime_error("step: a lane twice in one window");
     }
     arena_churn();
+    vram_churn();
     const auto t0 = std::chrono::steady_clock::now();
     // the current lane's scalars to its slot, so every lane reads from lanes_
     LaneHost& cur = lanes_[(size_t) cur_];
@@ -1252,6 +1254,7 @@ std::vector<int> Engine::verify_rows(const std::vector<int>& lanes, const std::v
             if (lanes[q] == lanes[i]) throw std::runtime_error("verify_rows: a lane twice in one window");
     }
     arena_churn();
+    vram_churn();
     const auto t0 = std::chrono::steady_clock::now();
     // the current lane's scalars to its slot, so every lane reads from lanes_
     LaneHost& cur = lanes_[(size_t) cur_];

@@ -467,6 +467,8 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     // comes later: the window graphs captured at first use (with batched drafts a verify graph per row total), cuBLAS's
     // workspaces and the lanes' page tables. Default 512: they took ~270 MiB a card on three cards and ~340 on two,
     // through one to six lanes, batched drafts and a 114k prompt
+    if (vram_elastic() && !m.arena)
+        throw std::runtime_error("--vram-elastic (FNX_VRAM_ELASTIC=1) lends the arena's slots: it needs FNX_ARENA=1 (the default)");
     if (m.arena) {
         const long long reserve_mib = env_int("FNX_ARENA_RESERVE_MIB", 512);
         if (reserve_mib < 0) throw std::runtime_error("FNX_ARENA_RESERVE_MIB: want MiB >= 0, got " + std::to_string(reserve_mib));
@@ -582,7 +584,17 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             ExpertCache& ec = m.cards[c].ec;
             const int p = ec.arena_pool;
             b->n_pages = arena_cap_;
-            char* region = (char*) dalloc<uint8_t>(arena_slot_off(c) + (size_t) ec.n[p] * ec.slot_bytes[p]);
+            const size_t region_bytes = arena_slot_off(c) + (size_t) ec.n[p] * ec.slot_bytes[p];
+            char* region = nullptr;
+            if (vram_elastic()) {   // --vram-elastic: the same bytes in chunks that can go back to the driver (elastic.hpp)
+                if (el_.empty()) el_.resize(NCARD);
+                el_[c] = std::make_shared<ElasticRegion>();
+                region = (char*) el_[c]->alloc(b->dev, region_bytes);
+                own([r = el_[c]] { r->release(); });
+                dalloc_note(__FILE__, __LINE__, region_bytes);
+            } else {
+                region = (char*) dalloc<uint8_t>(region_bytes);
+            }
             b->pool = (uint16_t*) region;
             ec.pool[p] = region + arena_slot_off(c);
             m.cards[c].bytes += (size_t) ec.n[p] * ec.slot_bytes[p];
@@ -1036,6 +1048,9 @@ void Engine::arena_refill(int c, int from, int to) {
 void Engine::arena_set(int w) {
     if (w == arena_w_) return;
     if (w < arena_base_ || w > arena_cap_) throw std::runtime_error("arena: top " + std::to_string(w) + " outside its range");
+    if (hold_hi_ > hold_lo_ && w < hold_hi_)
+        throw std::runtime_error("arena: top " + std::to_string(w) + " below the pages held for --vram-elastic (" + std::to_string(hold_lo_) + ".." +
+                                 std::to_string(hold_hi_ - 1) + ")");
     const auto t0 = std::chrono::steady_clock::now();
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];
@@ -1083,6 +1098,7 @@ void Engine::arena_reclaim(double hold_s) {
     int top = arena_base_;
     for (const LaneHost& L : lanes_)
         for (int pg : L.pages) top = std::max(top, pg + 1);
+    if (hold_hi_ > hold_lo_) top = std::max(top, hold_hi_);   // the held pages come back with VRAM 0 only
     if (top < arena_w_) arena_set(top);
 }
 
@@ -1094,8 +1110,98 @@ void Engine::arena_churn() {
     int top = arena_base_;
     for (const LaneHost& L : lanes_)
         for (int pg : L.pages) top = std::max(top, pg + 1);
+    if (hold_hi_ > hold_lo_) top = std::max(top, hold_hi_);
     arena_set(std::min(arena_cap_, std::max(arena_w_, top) + ARENA_STEP));
     arena_set(top);
+}
+
+// --vram-elastic: what is held now mapped again (zeroed: the draft layer reads K/V it never wrote, see arena_set), the
+// pages back in the pool, then the pool's top down to the highest page in use, so the slots come back and are filled
+// again at once (arena_set, arena_refill)
+void Engine::vram_take_back() {
+    if (hold_hi_ <= hold_lo_) return;
+    for (int c = 0; c < NCARD; ++c) {
+        ck(cudaSetDevice(cb_[c]->dev), "set");
+        el_[(size_t) c]->take();
+    }
+    for (int pg = hold_lo_; pg < hold_hi_; ++pg) free_pages_.push_back(pg);
+    std::sort(free_pages_.begin(), free_pages_.end(), std::greater<int>());
+    hold_lo_ = hold_hi_ = 0;
+    int top = arena_base_;
+    for (const LaneHost& L : lanes_) {
+        for (int pg : L.pages) top = std::max(top, pg + 1);
+        if (L.block_n) top = std::max(top, L.block0 + L.block_n);   // a lane's block stays lent for good (add_lane)
+    }
+    if (top < arena_w_) arena_set(top);
+}
+
+std::string Engine::vram(long mib) {
+    if (el_.empty()) throw Refused("VRAM: this engine was started without --vram-elastic");
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<long> fr = free_vram_mib();
+    const long least = *std::min_element(fr.begin(), fr.end());
+    if (mib <= 0 || least < mib) vram_take_back();   // a new amount starts from everything given back
+    if (mib > 0 && least < mib) {
+        fr = free_vram_mib();
+        // the pages to lend: each card's shortfall, a chunk at each end that stays mapped beside the slots, and a chunk more
+        int want = 0;
+        for (int c = 0; c < NCARD; ++c) {
+            const long short_mib = mib - fr[(size_t) c];
+            if (short_mib <= 0) continue;
+            const size_t page = kvp_page(c) * sizeof(uint16_t), bytes = ((size_t) short_mib << 20) + 3 * el_[(size_t) c]->chunk;
+            want = std::max(want, (int) ((bytes + page - 1) / page));
+        }
+        if (want > 0) {
+            if (arena_w_ + want > arena_cap_) {
+                const long can = (long) (((size_t) (arena_cap_ - arena_w_) * kvp_page(0) * sizeof(uint16_t)) >> 20);
+                throw Refused("VRAM: " + std::to_string(mib) + " MiB free needs " + std::to_string(want) + " pages of the experts' slots; " +
+                              std::to_string(arena_cap_ - arena_w_) + " (" + std::to_string(can) + " MiB a card) can be lent now");
+            }
+            const int lo = arena_w_;
+            arena_set(lo + want);   // the slots' experts to RAM, as for K/V; the cards idle
+            free_pages_.erase(std::remove_if(free_pages_.begin(), free_pages_.end(), [&](int pg) { return pg >= lo && pg < lo + want; }),
+                              free_pages_.end());
+            hold_lo_ = lo;
+            hold_hi_ = lo + want;
+            for (int c = 0; c < NCARD; ++c) {
+                ck(cudaSetDevice(cb_[c]->dev), "set");
+                ck(cudaDeviceSynchronize(), "VRAM: card idle");
+                const size_t page = kvp_page(c) * sizeof(uint16_t);
+                el_[(size_t) c]->give((size_t) hold_lo_ * page, (size_t) hold_hi_ * page);
+            }
+        }
+    }
+    fr = free_vram_mib();
+    const ExpertCache& ec = m_.cards[0].ec;
+    const int ap = ec.arena_pool, lent = arena_slots_for(0, arena_w_);
+    long slots_full = 0;
+    size_t full = 0;
+    for (int p = 0; p < ec.n_pools; ++p) slots_full += ec.n[p], full += (size_t) ec.n[p] * ec.slot_bytes[p];
+    const size_t now_b = full - (size_t) lent * ec.slot_bytes[ap];
+    std::string per;
+    for (const long v : fr) per += (per.empty() ? "" : "/") + std::to_string(v);
+    const long held = (long) (el_[0]->given() >> 20);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "fnx: VRAM %ld MiB kept free: %ld MiB of each card's arena given to the driver (K/V pages %d..%d held), "
+                         "%ld of %ld slots hold experts, free %s MiB, in %.0f ms\n",
+                 std::max(0L, mib), held, hold_lo_, hold_hi_ > hold_lo_ ? hold_hi_ - 1 : hold_lo_, slots_full - lent, slots_full, per.c_str(), ms);
+    char line[320];
+    std::snprintf(line, sizeof line,
+                  "VRAM reserve_mib=%ld expert_slots=%ld expert_slots_full=%ld expert_cache_mib=%ld expert_cache_full_mib=%ld vram_free_mib=%ld "
+                  "held_mib=%ld cards_free_mib=%s ms=%.0f",
+                  std::max(0L, mib), slots_full - lent, slots_full, (long) (now_b >> 20), (long) (full >> 20),
+                  *std::min_element(fr.begin(), fr.end()), held, per.c_str(), ms);
+    return line;
+}
+
+// FNX_VRAM_CHURN=MIB (a test, with --vram-elastic): before every window MIB MiB given to the driver and taken back, so
+// the lend, the give-back and the refill run beside every kind of window (the answers must not change: a slot's
+// expert computes the same as the expert read from RAM)
+void Engine::vram_churn() {
+    static const long mib = (long) env_int("FNX_VRAM_CHURN", 0);
+    if (mib <= 0 || el_.empty()) return;
+    vram(mib);
+    vram(0);
 }
 
 void Engine::ensure_pages(int n_pos) { ensure_pages_of(cur_, n_pos); }
