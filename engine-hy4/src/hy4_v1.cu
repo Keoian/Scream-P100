@@ -10,6 +10,7 @@
 #include "hy4_kern.cuh"
 #include "hy4_pf.cuh"
 #include "hy4_dec.cuh"
+#include "hy4_pf2.cuh"
 
 #include <cuda_profiler_api.h>
 #include <pthread.h>
@@ -22,6 +23,7 @@
 #include <cctype>
 #include <csignal>
 #include <functional>
+#include <future>
 #include <thread>
 
 namespace hy4 {
@@ -639,6 +641,9 @@ struct Engine {
     void engram_rows(int e, const int* tok, const int* p, int T, std::vector<float>& out, std::vector<int>& ok) {
         out.assign((size_t) T * E_W, 0.0f);
         ok.assign(T, 1);
+        engram_rows(e, tok, p, T, out.data(), ok.data());
+    }
+    void engram_rows(int e, const int* tok, const int* p, int T, float* out, int* ok) {   // writes every value of out and ok
         const uint64_t* mu = M.mult.data() + (size_t) e * E_NGRAM;
         const int cols = (E_NGRAM - 1) * E_HPN;
         const uint64_t* pr = M.voc.data() + (size_t) e * cols;
@@ -662,7 +667,7 @@ struct Engine {
                     const int col = (o - 1) * E_HPN + h;
                     const int64_t rid = (int64_t) (rolling % pr[col] + of[col]);
                     const uint8_t* blk = M.etab->data + (size_t) rid * rb;
-                    float* y = out.data() + ((size_t) i * E_COLS + col) * E_DIM;
+                    float* y = out + ((size_t) i * E_COLS + col) * E_DIM;
                     for (int b = 0; b < E_DIM / 32; ++b) {
                         __half hh;
                         std::memcpy(&hh, blk + b * 18, 2);
@@ -1152,11 +1157,14 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
             CK(cudaSetDevice(c));
             CK(cudaProfilerStart());
         }
+    e.prep_p0[0] = e.prep_p0[1] = -1;   // v2f: nothing prepared for this request yet
     for (size_t p = (size_t) L; p < tok.size();) {
         const size_t left = tok.size() - p;
         if (pf && left >= pf_min && !getenv("HY4_PF_OFF")) {
             const int C = (int) std::min<size_t>(pf_chunk(), left);
-            last.assign(1, e.prefill(tok.data() + p, (int) p, C));
+            const size_t left2 = left - (size_t) C;   // v2f: the next chunk, prepared on the host while this one runs
+            const int C2 = left2 >= pf_min ? (int) std::min<size_t>(pf_chunk(), left2) : 0;
+            last.assign(1, e.prefill(tok.data() + p, (int) p, C, C2 ? tok.data() + p + C : nullptr, C2));
             p += C;
         } else {
             const int T = (int) std::min<size_t>(MAXT, left);
@@ -1312,6 +1320,12 @@ static void serve(Engine& e, const std::string& path, int eos) {
             g_g1_fused = e.dec_on;
             e.pf_gemm_on = json_int(req, "pfg", 1) != 0;
             e.pf_selh_on = json_int(req, "selh", 1) != 0;
+            auto env_int = [](const char* k, int d) { return getenv(k) ? atoi(getenv(k)) : d; };
+            e.pf_host = json_int(req, "host", env_int("HY4_PF_HOST", 1)) != 0;   // v2: see v1_pf_part.inc
+            e.pf_selk = (int) json_int(req, "selk", env_int("HY4_PF_SELK", 1));
+            e.pf_skip = json_int(req, "skip", env_int("HY4_PF_SKIP", 1)) != 0;
+            e.pf_xs = json_int(req, "xs", env_int("HY4_PF_XS", 0)) != 0;
+            e.pf_f16 = (int) json_int(req, "f16", env_int("HY4_PF_F16", 0));
             const size_t p0c = e.pref_copies;
             // "stream": 1 - a line {"tok": id, "b": base64 of its bytes} per written token before the summary line (tokens can end
             // inside a UTF-8 character: the client joins the bytes)
@@ -1384,6 +1398,11 @@ int main(int argc, char** argv) {
         Model& m = *new Model(model, ctx);
         Engine& e = *new Engine(m, slots);
         e.dump = dump;
+        e.pf_host = !getenv("HY4_PF_HOST") || atoi(getenv("HY4_PF_HOST")) != 0;   // serve: also a request's "host", "selk", "f16"
+        e.pf_selk = getenv("HY4_PF_SELK") ? atoi(getenv("HY4_PF_SELK")) : 1;
+        e.pf_skip = !getenv("HY4_PF_SKIP") || atoi(getenv("HY4_PF_SKIP")) != 0;
+        e.pf_xs = getenv("HY4_PF_XS") && atoi(getenv("HY4_PF_XS")) != 0;
+        e.pf_f16 = getenv("HY4_PF_F16") ? atoi(getenv("HY4_PF_F16")) : 0;
         const int eos = (int) m.g.i("tokenizer.ggml.eos_token_id");
         if (!sock.empty()) {
             serve(e, sock, eos);

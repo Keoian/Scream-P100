@@ -695,7 +695,7 @@ __global__ void __launch_bounds__(256) k_iq3_gemm2(const PJob* jobs, const int2*
 // a thread's 16 values each), each thread an 8-row by 4-token tile: 32 FMAs per 3 shared loads (k_iq3_gemm2: 16 per 3), 24 KB of
 // shared memory (two blocks an SM), the next step's bytes and inputs in registers during this step's products
 constexpr int G3M = 128, G3N = 64, G3K = 32;
-template <int NB>
+template <int NB, bool SKIP = false>
 __global__ void __launch_bounds__(256) k_iq3_gemm3(const PJob* jobs, const int2* lists, const float* x, int ldx, float* y, int ldy,
                                                    int rows, int in_is_pair) {
     __shared__ __align__(16) float ws[G3K][G3M];
@@ -707,7 +707,9 @@ __global__ void __launch_bounds__(256) k_iq3_gemm3(const PJob* jobs, const int2*
     if (J.n == 0) return;
     grid[threadIdx.x] = d_iq3xxs_grid[threadIdx.x];
     if (threadIdx.x < 128) sg[threadIdx.x] = d_ksigns_iq2xs[threadIdx.x];
-    const int r0 = blockIdx.x * G3M, ty = threadIdx.x >> 4, tx = threadIdx.x & 15;
+    // SKIP (v2g): a warp holds 8 tokens (tx = its two token groups), so a warp with no tokens of the tile skips the products
+    const int r0 = blockIdx.x * G3M, ty = SKIP ? threadIdx.x & 15 : threadIdx.x >> 4, tx = SKIP ? threadIdx.x >> 4 : threadIdx.x & 15;
+    const int wtok = (threadIdx.x >> 5) * 8;
     const int dr = threadIdx.x & (G3M - 1), dh = threadIdx.x >> 7;   // the row and the half sub-block (l4 pairs 2 dh, 2 dh + 1)
     const int tok = threadIdx.x >> 2, seg = (threadIdx.x & 3) * 8;
     const uint16_t* rowp = (const uint16_t*) (J.m + (size_t) (r0 + dr) * NB * 98);
@@ -762,6 +764,7 @@ __global__ void __launch_bounds__(256) k_iq3_gemm3(const PJob* jobs, const int2*
             }
             __syncthreads();
             if (ks + 1 < NB * 8) load(ks + 1);
+            if (SKIP && wtok >= nk) continue;
 #pragma unroll 8
             for (int k = 0; k < G3K; ++k) {
                 const float4 w0 = *(const float4*) &ws[k][ty * 8], w1 = *(const float4*) &ws[k][ty * 8 + 4];

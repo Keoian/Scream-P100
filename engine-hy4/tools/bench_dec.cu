@@ -2,6 +2,7 @@
 #include "hy4_kern.cuh"
 #include "hy4_pf.cuh"
 #include "hy4_dec.cuh"
+#include "hy4_pf2.cuh"
 
 #include <random>
 
@@ -207,10 +208,59 @@ static void bench_pf(int E, int nlo, int nhi) {
     }
 }
 
+// v2: gemm3 / gemm3 skip / gemm4 / gemm4 skip / gemm5 on experts with nlo .. nhi tokens each: time, useful TFLOPS, error against
+// gemm3 (f32) and gemm5 against gemm4 (should be 0: the same f16 sums)
+static void bench_pf4(int E, int nlo, int nhi) {
+    const int C = 2048;
+    for (int pass = 0; pass < 2; ++pass) {
+        const int rows = pass ? LAT : FFE / 2, cols = pass ? FFE / 2 : LAT;
+        const size_t mb = (size_t) rows * (cols / 256) * 98;
+        uint8_t* m = up(iq3_bytes((size_t) rows * E, cols));
+        std::vector<int2> lh;
+        std::vector<PJob> jh(E);
+        int pair = 0;
+        for (int j = 0; j < E; ++j) {
+            const int n = nlo + (int) (rng() % (unsigned) (nhi - nlo));
+            jh[j] = {m + (size_t) j * mb, (int) lh.size(), n};
+            for (int k = 0; k < n; ++k) lh.push_back(make_int2((int) (rng() % C), pair++));
+        }
+        PJob* jobs = up(jh);
+        int2* lists = up(lh);
+        const int xrows = pass ? pair : C;
+        std::vector<float> xh((size_t) xrows * cols);
+        for (auto& v : xh) v = urand() * (pass ? 4.0f : 1.0f);
+        float* x = up(xh);
+        float *y[5];
+        for (int i = 0; i < 5; ++i) { CK(cudaMalloc(&y[i], (size_t) pair * rows * 4)); CK(cudaMemset(y[i], 0, (size_t) pair * rows * 4)); }
+        const double fl = 2.0 * pair * rows * cols / 1e6;
+        double t[5];
+#define RUN(K, i) t[i] = time_us([&]() { if (pass) K<3><<<dim3(rows / G3M, E), 256>>>(jobs, lists, x, cols, y[i], rows, rows, 1); \
+                                       else K<6><<<dim3(rows / G3M, E), 256>>>(jobs, lists, x, cols, y[i], rows, rows, 0); }, 20)
+#define RUNS(K, i) t[i] = time_us([&]() { if (pass) K<3, true><<<dim3(rows / G3M, E), 256>>>(jobs, lists, x, cols, y[i], rows, rows, 1); \
+                                       else K<6, true><<<dim3(rows / G3M, E), 256>>>(jobs, lists, x, cols, y[i], rows, rows, 0); }, 20)
+        RUN(k_iq3_gemm3, 0); RUNS(k_iq3_gemm3, 1); RUN(k_iq3_gemm4, 2); RUNS(k_iq3_gemm4, 3); RUNS(k_iq3_gemm5, 4);
+#undef RUN
+#undef RUNS
+        const auto r0 = down(y[0], (size_t) pair * rows);
+        std::printf("%s, %d pairs (%d .. %d a expert):\n", pass ? "down" : "gate", pair, nlo, nhi - 1);
+        const char* nm[5] = {"gemm3", "gemm3 skip", "gemm4", "gemm4 skip", "gemm5"};
+        for (int i = 0; i < 5; ++i)
+            std::printf("  %-11s %7.0f us  %5.2f TFLOPS  rel vs gemm3 %.2e%s\n", nm[i], t[i], fl / t[i], rel(r0, down(y[i], (size_t) pair * rows)),
+                        i == 4 ? (rel(down(y[2], (size_t) pair * rows), down(y[4], (size_t) pair * rows)) == 0.0 ? "  (= gemm4 bit for bit)" : "  (differs from gemm4)") : "");
+        cudaFree(m); cudaFree(jobs); cudaFree(lists); cudaFree(x);
+        for (int i = 0; i < 5; ++i) cudaFree(y[i]);
+    }
+}
+
 int main() {
     CK(cudaSetDevice(0));
     if (getenv("SAMO_X")) {
         bench_iq3x();
+        return 0;
+    }
+    if (getenv("SAMO_PF4")) {   // v2: the expert kernels at a chunk's token counts (512 experts, 2048 tokens x 16 picks)
+        bench_pf4(512, 5, 125);
+        bench_pf4(512, 30, 100);
         return 0;
     }
     if (getenv("SAMO_PF")) {

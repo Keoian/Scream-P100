@@ -1,5 +1,5 @@
 #!/bin/bash
-# engine-hy4/build.sh: the Hy4 flash engine (hy4_v1) and its two checks for two Tesla P100 (sm_60), into engine-hy4/build/.
+# engine-hy4/build.sh: the Hy4 flash engine (hy4_v1) and its three checks for two Tesla P100 (sm_60), into engine-hy4/build/.
 # About two minutes. NVCC (nvcc) and CCBIN (the first of g++-13, g++-12, g++) can be set. CUDA 12.4 with g++-13 is what we used.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -16,4 +16,5 @@ echo "build.sh: $("$NVCC" --version | tail -1), host compiler $CCBIN"
 "$NVCC" "${FLAGS[@]}" -o build/hy4_v1 src/hy4_v1.cu src/gguf_min.cpp -lcublas
 "$NVCC" "${FLAGS[@]}" -o build/bench_dec tools/bench_dec.cu src/gguf_min.cpp -lcublas
 "$NVCC" "${FLAGS[@]}" -o build/bench_bw tools/bench_bw.cu
+"$NVCC" "${FLAGS[@]}" -o build/gemm_bench tools/gemm_bench.cu -lcublas
 sha256sum build/hy4_v1 | cut -c1-16 | sed 's/^/build.sh: build\/hy4_v1 /'

@@ -13,12 +13,14 @@ Our own engine for Hy4 flash, not a patch of `engine/`. The story, the numbers, 
 | `src/hy4_kern.cuh` | the first version's kernels: IQ3_XXS and Q8 GEMVs, norms, iHC, attention, Engram, the cross-card sums |
 | `src/hy4_dec.cuh` | the writing-path kernels: MLA over position ranges, grouped GEMVs, the router, the indexer's top-k |
 | `src/hy4_pf.cuh`, `src/v1_pf_part.inc` | the prompt path: tiled IQ3 GEMM, cuBLAS attention, staging of a chunk's experts |
+| `src/hy4_pf2.cuh` | v2's prompt-path kernels: token rows on the card, the sparse attention in one pass, and the f16 kernels (`HY4_PF_F16`) |
 | `src/gguf_min.cpp/.hpp` | a small GGUF reader (mmap; a split model's shards by name) |
 | `src/hy4_tables.h` | ggml's IQ3_XXS and IQ4_NL tables (MIT, the ggml authors) |
 | `serve/hy4_openai.py` | `/v1/chat/completions` (stream, tools, reasoning_content), `/v1/models`, `/health` |
-| `tools/bench_dec.cu`, `tools/bench_bw.cu`, `tools/sim_cache.py` | kernel checks, PCIe copy speed, the expert-cache simulator |
+| `tools/bench_dec.cu`, `tools/bench_bw.cu`, `tools/gemm_bench.cu`, `tools/sim_cache.py` | kernel checks, PCIe copy speed, cuBLAS f32 against f16 on the prompt path's shapes, the expert-cache simulator |
 
 The engine's own socket protocol (what `serve/hy4_openai.py` speaks): one JSON line a connection,
-`{"tokens": [...], "max": N, "stop": [...], "lookup": N, "stream": 1}` → with `stream`, one line `{"tok": id, "b": base64}` a
+`{"tokens": [...], "max": N, "stop": [...], "lookup": N, "stream": 1}` (plus the reading switches `"f16"`, `"selk"`, `"skip"`,
+`"host"`, `"xs"` and `"reuse": 0` for comparisons) → with `stream`, one line `{"tok": id, "b": base64}` a
 token, then `{"prompt_n", "cached", "read_s", "write_s", "hits", "misses", "drafted", "accepted", "tokens": [...]}`.
 `{"exit": 1}` ends the server.

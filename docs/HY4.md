@@ -11,7 +11,7 @@ CUDA and C++. It keeps the idea of the main engine: **both cards work on every l
 VRAM stream in from RAM over PCIe.
 
 On the same machine, llama.cpp with Hy4 support (PR #32517) writes at 6-9 tok/s, with the CPU computing about two thirds of
-the experts. This engine writes at **27 tok/s**.
+the experts. This engine writes at **27 tok/s** and reads at **337 tok/s** (442 with f16 sums).
 
 ![Hy4 flash on two Tesla P100](hy4-scream-p100.jpg)
 
@@ -34,17 +34,24 @@ downloading (and still checks their SHA-256).
 ## Speed
 
 Our machine: HPE DL380 Gen10, two Xeon sockets with one P100 on each (PCIe 3.0 x16, no P2P), 99 GiB of RAM, CUDA 12.4.
-`bench.py` on a freshly started engine, 64k context (`run.sh` defaults), no thinking (21 Nov 2026, 08:03):
+`bench.py` on a freshly started engine, 64k context (`run.sh` defaults), no thinking (21 Nov 2026, 10:00 and 10:15; the first
+build's of 08:03 for comparison):
 
-| Test | tok/s |
-|---|---|
-| Fresh writing, 12 prompts of 300 tokens | **27.0** (24.5-29.2) |
-| Edit, the Python file back with one name changed (2,016 tokens) | **28.2** |
-| Edit, the Markdown text back with one word changed (1,623 tokens) | **29.7** |
-| Reading 14,302 tokens | **294**, then writing at 23.7 |
+| Test | default (f32) | `HY4_PF_F16=7` | first build |
+|---|---|---|---|
+| Fresh writing, 12 prompts of 300 tokens | **27.0** | **28.1** | 27.0 |
+| Edit, the Python file back with one name changed (2,016 tokens) | **28.1** | **28.6** | 28.2 |
+| Edit, the Markdown text back with one word changed (1,623 tokens) | **29.9** | **30.0** | 29.7 |
+| Reading 14,302 tokens | **337** | **442** | 294 |
 
-Both edit answers were the exact expected text. Prompt lookup does the most for edits; on our own edit tasks (other files)
-the same engine wrote 32.1 (Python) and 34.7 (Markdown).
+Writing is the same in all three (the f16 switch changes only reading); the 28.1 is run-to-run spread. The edit answers were
+the exact expected text. Prompt lookup does the most for edits; on our own edit tasks (other files) the engine wrote 32.1
+(Python) and 34.7 (Markdown).
+
+**Reading with f16 sums** (`HY4_PF_F16=7`) is off by default because it is not bit-equal to the f32 path. On an 11,048-token
+prompt its last-row logits differ from the f32 path's by KL 0.024, the first token the same; for scale, the first build
+(which rounded the sparse attention's Q and P to f16) differs from today's f32 path by KL 0.018, and even another order of
+the f32 sums in that attention gives 0.006. On our test sets it scored the same as the first build (Quality, below).
 
 Long prompts (our own runs, 21 Nov): 29,273 tokens read at 277 tok/s, then writing at 26.9 tok/s; at `--ctx 65536`
 61,829 tokens at 252 tok/s, then 21.5 tok/s. For comparison, Qwen3.8-Flash-Next UD-Q4_K_XL on the main engine and the same
@@ -52,22 +59,24 @@ cards: 55-56 tok/s fresh, 63 edits, 785-880 tok/s reading.
 
 Where the time goes when writing (~36 ms a token): about 12 ms waiting for experts that missed the VRAM cache (~90 a token,
 0.13 ms each over PCIe), 8 ms the expert math, 8 ms the other weights, 3-4 ms waiting for the other card, the rest attention
-and launches. The cards hold ~37 % of the experts; more VRAM is the biggest lever. Reading is not limited by PCIe and has room
-left (the tiled expert GEMM runs at ~4.6 TFLOPS); that is the next thing we work on.
+and launches. The cards hold ~37 % of the experts; more VRAM is the biggest lever.
 
 ## Quality
 
 Our own test sets (Slovenian questions, language and open answers; HumanEval-style functions; code edits; English), greedy,
 against Flash-Next UD-Q4_K_XL on the same machine:
 
-| Set | Hy4 flash, no thinking | Hy4 flash, `reasoning_effort: high` | Flash-Next Q4 |
-|---|---|---|---|
-| Slovenian questions | 13/15 | 15/15 | 15/15 |
-| Answers not in Slovenian | 0/18 | | 0/18 |
-| Poor open answers | 0/6 | | 1/6 |
-| Functions (tests pass) | 44/45 | | 44/45 |
-| Code edits | 26/26 | | 26/26 |
-| English | 14/16 | 16/16 | 16/16 |
+| Set | Hy4 flash, no thinking | Hy4 flash, no thinking, `HY4_PF_F16=7` | Hy4 flash, `reasoning_effort: high` | Flash-Next Q4 |
+|---|---|---|---|---|
+| Slovenian questions | 13/15 | 12/15 | 15/15 | 15/15 |
+| Answers not in Slovenian | 0/18 | 0/18 | | 0/18 |
+| Poor open answers | 0/6 | 0/6 | | 1/6 |
+| Functions (tests pass) | 44/45 | 44/45 | | 44/45 |
+| Code edits | 26/26 | 26/26 | | 26/26 |
+| English | 14/16 | 15/16 | 16/16 | 16/16 |
+
+Short questions (under 80 tokens) go through the writing path, which the f16 switch does not touch; the functions and the
+code edits read longer prompts.
 
 Without a system prompt, Hy4 flash sometimes answers a Slovenian question in Croatian or Serbian (so does llama.cpp); with a
 system prompt that names the language it answers in Slovenian.
@@ -98,9 +107,15 @@ the one before it (`bench_dec` on random data, the same answers on our prompts).
   A miss copies over each card's own PCIe link while the hits compute. The host keeps one LRU for both cards.
 - **Writing:** attention over position ranges for all heads at once, grouped GEMVs, an exact bitonic router, a radix top-k
   for the indexer at any context, and prompt lookup (up to 8 drafted tokens, adaptive). Hy4 flash has no MTP layer.
-- **Reading:** 2048-token chunks; experts as a tiled IQ3 GEMM, window and sparse attention through cuBLAS, the chunk's
-  scratch borrowed from the top cache slots. A prompt that starts with the previous one reuses its cache (the window ring
-  permitting).
+- **Reading:** 2048-token chunks; experts as a tiled IQ3 GEMM whose warps skip tiles' empty token columns, window attention
+  through cuBLAS, the sparse layers' attention in one pass a token straight from the cache, the chunk's scratch borrowed from
+  the top cache slots, the next chunk's token rows and Engram rows made on host threads while this one runs. A prompt that
+  starts with the previous one reuses its cache (the window ring permitting).
+- **Reading in f16 (optional, `HY4_PF_F16=7`):** f16 sums where the P100 is twice as fast: the dense matrices as HGEMM
+  (13-15 TFLOPS against SGEMM's 7-8; f16 inputs with f32 sums are no faster on this card), the experts in half2 (each
+  32-column sub-block summed in f16, then scaled and added in f32: 8.2 TFLOPS against 4.6), the window attention as HGEMM on
+  its f16 rows. The router, Engram, the indexer and the sparse attention stay f32. This is the arithmetic class of
+  llama.cpp's prompt path on the P100.
 
 ## API
 
@@ -124,6 +139,13 @@ Environment variables of the engine; all are off or at the measured default.
 | `HY4_PF_CHUNK` | 2048 | prompt-path chunk (tokens) |
 | `HY4_PF_MIN` | 80 | shorter prompt rests go through the writing path |
 | `HY4_PF_OFF=1` | | no prompt path (16-token windows, slow) |
+| `HY4_PF_F16` | 0 | **reading with f16 sums** (bits: 1 dense matrices, 2 experts, 4 window attention; 7 all): ~+30 % reading, not bit-equal (see Speed) |
+| `HY4_PF_SKIP=0` | | expert kernels without skipping empty token columns (the same bits, slower) |
+| `HY4_PF_SELK` | 1 | sparse attention when reading: 1 one pass a token from the cache (f32), 0 the earlier gathered copy with Q and P in f16 |
+| `HY4_PF_HOST=0` | | the earlier host side of reading (token rows and Engram rows made on the host thread, the same bits) |
+| `HY4_PF_XS=1` | | the cross-card sum in one kernel (the same bits, measured no faster) |
+| `HY4_PF_LOGITS=FILE` | | each chunk's last-row logits into FILE.c0 / FILE.c1 (for comparisons) |
+| `HY4_PF_CHECK=1` | | count non-finite values after every layer when reading |
 | `HY4_PFIQ` | 5 | prompt-path expert kernel (5 = tiles of 128 rows × 64 tokens; 4 = 128 × 32; 1-3 the first ones) |
 | `HY4_PF_STAGE=0` | | prompt path: experts through the cache instead of staged a layer ahead |
 | `HY4_PF_SWAG=0`, `HY4_PF_SPG=0`, `HY4_PF_SELH=0` | 1 | window / sparse attention of the prompt path without cuBLAS / f32 instead of f16 |
@@ -139,6 +161,8 @@ Environment variables of the engine; all are off or at the measured default.
 ## Tools
 
 - `build/bench_dec`: the writing and prompt-path kernels against the first version's on random data (same results, time a call).
+- `SAMO_PF4=1 build/bench_dec`: the prompt path's expert kernels (f32, with and without skipping, half2) at a chunk's token counts.
+- `build/gemm_bench`: the prompt path's GEMM shapes with SGEMM, f16 inputs with f32 sums, and HGEMM: TFLOPS and error.
 - `build/bench_bw`: host → card copy speed of one expert half, from each NUMA node, one card and both at once.
 - `tools/sim_cache.py TRACE [SLOTS ...]`: the expert cache under LRU, LFU, 2-segment LRU and Belady's bound on a
   `HY4_TRACE` file. On ours: LRU 122 misses a token, Belady 56, other policies no better than LRU; 9000 slots −27 %.

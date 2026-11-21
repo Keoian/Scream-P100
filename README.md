@@ -1,6 +1,6 @@
 > **Branch `hy4-test`: TEST BUILD for Tencent Hy4 flash on two Tesla P100 16 GB, measured on one machine only.** It adds an
 > engine of its own (`bash engine-hy4/build.sh`, `engine-hy4/setup.sh DATA`, `engine-hy4/run.sh DATA`): [docs/HY4.md](docs/HY4.md).
-> Xylolabs's IQ3_XXS, 64k context, 96 GB of RAM: 27.0 tok/s writing, 28-35 tok/s edits, 294 tok/s reading.
+> Xylolabs's IQ3_XXS, 64k context, 96 GB of RAM: 27-28 tok/s writing, 28-35 tok/s edits, 337 tok/s reading (442 with f16 sums).
 > Everything else is `main` as of commit `00e6c5e`; for the Flash-Next release use the `main` branch.
 
 <div align="center">
@@ -160,6 +160,8 @@ with `setup.sh DATA --model iq3_xxs`. Only the 24 GB M40 was run.
 
 ## 🧪 Test build: Tencent Hy4 flash
 
+[![Hy4 flash on two Tesla P100: an engine of its own](docs/hy4-scream-p100.jpg)](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md)
+
 > ⚠️ **Test build, measured on one machine only**, on branch [`hy4-test`](https://github.com/Megla123/Scream-P100/tree/hy4-test)
 > ([docs/HY4.md](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md)). Written in the two days before
 > 21 Nov 2026; nobody else has run it yet. Reports are welcome.
@@ -167,9 +169,14 @@ with `setup.sh DATA --model iq3_xxs`. Only the 24 GB M40 was run.
 Tencent's **Hy4 flash** on the same two P100 16 GB, with an **engine of its own** (`engine-hy4/`): Strata's split engine does
 not know Hy4's Engram tables, indexed sparse attention and latent experts, so we wrote one with the same idea (both cards
 on every layer, the experts that do not fit streamed in over PCIe). Xylolabs's IQ3_XXS GGUF, 64k context, tools and
-thinking, 96 GB of RAM. On our machine: **27.0 tok/s** fresh writing, **28-35** edits (Python and Markdown files),
-**294 tok/s** reading a 14,302-token prompt; llama.cpp with Hy4 support did 6-9 tok/s writing on the same cards. Build
-with `bash engine-hy4/build.sh`, set up with `engine-hy4/setup.sh DATA`, run with `engine-hy4/run.sh DATA`.
+thinking, 96 GB of RAM. On our machine: **27-28 tok/s** fresh writing, **28-35** edits (Python and Markdown files),
+**337 tok/s** reading a 14,302-token prompt, or **442 tok/s** with f16 sums (`HY4_PF_F16=7`, the same scores on our test
+sets); llama.cpp with Hy4 support did 6-9 tok/s writing on the same cards.
+
+```bash
+git clone -b hy4-test https://github.com/Megla123/Scream-P100.git && cd Scream-P100
+bash engine-hy4/build.sh && bash engine-hy4/setup.sh /data/hy4 && bash engine-hy4/run.sh /data/hy4
+```
 
 ## 🔧 How it works
 
@@ -224,13 +231,17 @@ settles. What has and has not been tested is in [Known limitations](docs/GUIDE.m
 | [tune/README.md](tune/README.md) | `check.py` and `tune.py`: diagnose and tune your own machine |
 | [Branch `poc-4x-p100`](https://github.com/Megla123/Scream-P100/tree/poc-4x-p100/docs/POC-4X.md) | ⚠️ **Unverified proof of concept**, never run on four cards: a build for four P100 behind one PCIe switch (`build.sh --4x`) |
 | [Branch `m40-2x`](https://github.com/Megla123/Scream-P100/blob/m40-2x/docs/M40.md) | ⚠️ **Test build** for two Tesla M40 24 GB (sm_52), measured on one machine only: IQ3_XXS, 256k, 32 GB of RAM (`build.sh --m40`) |
-| [Branch `hy4-test`](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md) | ⚠️ **Test build** for Tencent Hy4 flash on the same two P100, an engine of its own, measured on one machine only: IQ3_XXS, 64k, 96 GB of RAM (`engine-hy4/`) |
+| [Branch `hy4-test`](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md) | ⚠️ **Test build** for Tencent Hy4 flash on the same two P100, an engine of its own, measured on one machine only: IQ3_XXS, 64k, 96 GB of RAM, 337 / 442 tok/s reading (`engine-hy4/`) |
 | [NOTICE.md](NOTICE.md) · [docs/PROVENANCE.md](docs/PROVENANCE.md) · [docs/upstream-v0.2.10.diff](docs/upstream-v0.2.10.diff) | What is ours and what is Strata's, file by file and line by line |
 
 Our scripts and docs refer to sections as *(README, "Section")*. Those sections are now in [docs/GUIDE.md](docs/GUIDE.md).
 
 ## 📰 News
 
+- **21 Nov 2026 (morning):** the Hy4 flash test build reads faster: 337 tok/s instead of 294 on a 14,302-token prompt, and
+  **442 tok/s** with f16 sums (`HY4_PF_F16=7`, off by default; on our test sets the same scores as the f32 path). The sparse
+  attention in one pass straight from the cache, expert kernels that skip empty token columns (the same bits), and f16 sums
+  for the dense matrices, the experts and the window attention ([branch `hy4-test`](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md)).
 - **21 Nov 2026:** ⚠️ a **test build for Tencent Hy4 flash** on branch [`hy4-test`](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md):
   an engine of its own for Hy4's Engram tables, sparse attention and latent experts, on the same two P100. Xylolabs's
   IQ3_XXS, 64k context, 96 GB of RAM: 27.0 tok/s fresh writing, 28-35 edits, 294 tok/s reading. Measured on
