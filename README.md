@@ -189,7 +189,7 @@ model fits in VRAM (8.9 GB a card), so nothing streams over PCIe. Xylolabs's NVF
 **~100-127 tok/s** edits, **794 tok/s** reading a 4k prompt (757 at 14k, 646 at 36k), context up to **262,144** (a needle found
 at 239k). llama.cpp did 13.0 tok/s writing and 143 reading on the same cards; its greedy outputs match ours. On the test
 set of our Flash-Next builds it writes fresh answers at 66.3 tok/s (Flash-Next UD-Q4_K_XL: 59.3 exact, 68.9 lossy) and
-edits Markdown at 126.8 (92.2 / 125.6). Greedy only for now, no pictures or tools.
+edits Markdown at 126.8 (92.2 / 125.6). Tool calls work; greedy only for now, no pictures.
 
 ```bash
 git clone -b inkling2 https://github.com/Megla123/Scream-P100.git && cd Scream-P100
