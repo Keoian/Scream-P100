@@ -83,5 +83,5 @@ for name, tools, eff, msgs in CASES:
     else:
         bad += 1
         k = next((i for i, (x, y) in enumerate(zip(ref, ours)) if x != y), min(len(ref), len(ours)))
-        print(f"{name}: RAZLICNO od znaka {k}\n  predloga: {ref[max(0, k - 80):k + 80]!r}\n  mi:       {ours[max(0, k - 80):k + 80]!r}")
+        print(f"{name}: DIFFERENT from character {k}\n  template: {ref[max(0, k - 80):k + 80]!r}\n  ours:     {ours[max(0, k - 80):k + 80]!r}")
 print("DONE", "all the same" if not bad else f"{bad} different")
