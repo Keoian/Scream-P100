@@ -85,17 +85,20 @@ Building by hand, preparing the files and every option are in the [full guide](d
 `bench/bench.py` on our server, tok/s, each a single run on a freshly loaded engine, exact routing (`FNX_ROUTE_PRIOR=0`),
 built from this repository's 17 Nov sources (`e56c3f60`, before the 18 Nov switch):
 
-| Model | Context | RAM | ✍️ Fresh writing | ✏️ Edits (Python / Markdown) | 📖 Cold read, 38,862 tokens |
+| Model | Context | RAM (most used) | ✍️ Fresh writing | ✏️ Edits (Python / Markdown) | 📖 Cold read, 38,862 tokens |
 |---|---:|---:|---:|---:|---:|
 | **Flash-Next IQ3_S** (ISTA-DASLab GSQ-RCO) | 512k | 96 GB | **66.5** | **110.7 / 115.8** | **1,012** |
-| Flash-Next IQ3_S, 64 GB mode ¹ | 256k | 64 GB | 63.8 | 93.6 / 99.2 | 807 |
+| Flash-Next IQ3_S, 64 GB mode ¹ | 256k | 64 GB (55.6 GiB) | 63.8 | 93.6 / 99.2 | 807 |
 | Flash-Next UD-Q4_K_XL (Unsloth) ² | 512k | 96 GB | 52.3 | 60.2 / 63.6 | 963 |
-| Flash-Next UD-Q4_K_XL, **64 GB mode** ⁶ | 512k | 64 GB | 37.6 | 38.9 / 42.8 | 429 |
+| Flash-Next UD-Q4_K_XL, **64 GB mode** ⁶ | 512k | 64 GB (55.5 GiB) | 37.6 | 38.9 / 42.8 | 429 |
+| Flash-Next UD-Q4_K_XL, **Coder** experts ⁷ | 512k | 96 GB | 59.3 | 100.6 / 91.8 | 802 |
+| Flash-Next UD-Q4_K_XL, **Coder** experts, **32 GB mode** ⁷ | 512k | 32 GB (22.5 GiB) | 50.1 | 73.6 / 63.4 | 987 |
 | Edge0-145B NVFP4 | 512k | 96 GB | 55.0 | 96.6 / 98.9 | 691 |
 | ⚠️ Fast UD-Q4_K_XL, **lossy** ⁴ | 512k | 96 GB | 73.9 | 125.1 / 126.4 | 1,007 |
-| ⚠️ Fast UD-Q4_K_XL, lossy, **32 GB mode** ⁵ | 512k | 32 GB | 67.1 | 118.5 / 120.2 | 754 |
+| ⚠️ Fast UD-Q4_K_XL, lossy, **32 GB mode** ⁵ | 512k | 32 GB (22.5 GiB) | 67.1 | 118.5 / 120.2 | 754 |
 
-¹ We have no 64 GB machine: this ran in a 58 GiB memory cgroup on our 96 GB server.<br>
+¹ We have no 64 GB machine: this ran in a 58 GiB memory cgroup on our 96 GB server. In brackets for the low-RAM modes:
+the most RAM the engine used in these tests (page-locked and its own memory, not the page cache, which Linux gives back).<br>
 ² With 18 Nov's switch and settings, our own test chain on 18-19 Nov (not `bench.py`), the same window as the fast
 profile; its long read is 36,424 tokens on a freshly loaded engine with the lookup table in the page cache, as it
 mostly is in use (a 29,700-token read in our production on the night of 18 Nov: 974 tok/s). `bench.py` on 16 Nov, before the switch:
@@ -111,7 +114,14 @@ the model files on our SAS array (about 0.5 GB/s for these reads): the same firs
 The edits' first runs read their prompts from the disk; the second and third ran at 43.0-43.1 / 46.5-46.8. Each new
 prompt of more than 144 tokens reads about 13.5 GB from the disk (6,000 characters: 23.6 s, with 96 GB 4.0 s), so the
 SSD sets the reading speed. At 510k tokens it read at 368 and wrote at 23.5 tok/s. See
-[UD-Q4_K_XL on 64 GB](docs/GUIDE.md#ud-q4_k_xl-on-64-gb).
+[UD-Q4_K_XL on 64 GB](docs/GUIDE.md#ud-q4_k_xl-on-64-gb).<br>
+⁷ The Coder's experts (a different, smaller model than the full one, see [Coder](docs/GUIDE.md#coder)) with exact
+routing (λ 0), our own test chain on 21 Nov, both in the same window. The 32 GB mode ran in a 28 GiB memory cgroup on
+our 96 GB server, the model files on our SAS array: the same first-token logits as with 96 GB in 150 of 150 requests
+(KL 0) and every answer the same to the character. It pins 19.6 GiB of RAM, at most 22.5 GiB with the engine's own
+memory. Writing code with reasoning: 73.6 / 54.0 tok/s, edits through an `edit` tool 69.2 / 42.4. A new 6,000-character
+prompt right after the long read took 8.9 s (96 GB: 3.1 s): it reads from the disk. See
+[32 GB of RAM](docs/GUIDE.md#32-gb-of-ram).
 
 <details>
 <summary><b>Our machine</b></summary>
@@ -133,11 +143,12 @@ Every number, including deep contexts, conversation reads and pictures, is in th
 |---|---|---|---|---|---:|---|
 | [ISTA-DASLab GSQ-RCO **IQ3_S**](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 96 GB, or **64 GB** with `--ram 64` | 512k (256k with 64 GB) | exact | `setup.sh /data/flash-next` | 85 GB | The fastest. |
 | [Unsloth **UD-Q4_K_XL**](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 96 GB | 512k | exact | `setup.sh /data/flash-next-q4 --model q4_k_xl` | 112 GB | The larger quantization. Fewer experts fit on the cards, so edits wait for PCIe, and 96 GB of RAM is tight. |
-| **UD-Q4_K_XL, 64 GB** | **64 GB** + the model on an SSD | 512k | exact | `build.sh --32g`, then `setup.sh /data/flash-next-q4-64 --models /data/flash-next-q4/models --model q4_k_xl --ram 64` | none | The exact UD-Q4_K_XL on a 64 GB machine, on the low-RAM engine of the 32 GB mode: no expert pinned in RAM, the ones the cards do not hold come from a 50 GiB RAM tier and the model files. The same answers as with 96 GB, writing at about 70 % of its speed; each new prompt reads about 13.5 GB from the SSD, so the SSD sets the reading speed. [Details](docs/GUIDE.md#ud-q4_k_xl-on-64-gb). |
+| **UD-Q4_K_XL, 64 GB** | **64 GB** + the model on an SSD (uses up to 55.5 GiB) | 512k | exact | `build.sh --32g`, then `setup.sh /data/flash-next-q4-64 --models /data/flash-next-q4/models --model q4_k_xl --ram 64` | none | The exact UD-Q4_K_XL on a 64 GB machine, on the low-RAM engine of the 32 GB mode: no expert pinned in RAM, the ones the cards do not hold come from a 50 GiB RAM tier and the model files. The same answers as with 96 GB, writing at about 70 % of its speed; each new prompt reads about 13.5 GB from the SSD, so the SSD sets the reading speed. [Details](docs/GUIDE.md#ud-q4_k_xl-on-64-gb). |
 | [Edge0 **Edge0-145B NVFP4**](https://huggingface.co/Edge0/Edge0-145B-NVFP4) | 96 GB | 512k | exact | `setup.sh /data/edge0 --model edge0` | 87 GB ³ | Flash-Next with its experts in a latent space (Edge0 Community Model License). Weaker Slovenian in our tests. |
 | **Coder** expert mask | as its file | as its file | ⚠️ lossy | `setup.sh /data/flash-next-coder --models /data/flash-next/models --coder` | none | Flash-Next only: the experts ISTA-DASLab's Coder keeps. At λ 0.15, code edits ran 11 % (IQ3_S) to 43 % (UD-Q4_K_XL) faster, but it is worse outside code and ignored instructions in Slovenian. |
+| **Coder UD-Q4_K_XL, 32 GB** | **32 GB** + the model on an SSD (uses up to 22.5 GiB) | 512k | the Coder's, exact | `build.sh --32g`, then `setup.sh /data/flash-next-q4-coder-32 --models /data/flash-next-q4/models --model q4_k_xl --coder --ram 32` | none | The Coder mask on UD-Q4_K_XL without the fast profile's lossy switches, on the low-RAM engine: the Coder's answers of 96 GB bit for bit (KL 0). Pins 19.6 GiB, at most 22.5 GiB with the engine's own memory. Writing 50.1 tok/s, code edits 70-75, a 36k read 987; 45 of 45 functions, 26 of 26 edits, 16 of 16 English questions. As the Coder, worse outside code. [Details](docs/GUIDE.md#32-gb-of-ram). |
 | ⚠️ **Fast UD-Q4_K_XL** | 96 GB | 512k | ⚠️ lossy | `setup.sh /data/flash-next-q4-fast --models /data/flash-next-q4/models --model q4_k_xl --fast` | none | The UD-Q4_K_XL file with the Coder mask, `FNX_ROUTE_PRIOR=1.0` and `FNX_ONEHOP=2`: 1.4x fresh writing, 2x code edits. **Answers are worded differently** from the exact profile; in our 87 code, edit and English tasks it did about as well (four loads: 0, 0, 2 and 0 failed tasks, the exact profile 1), but it may ignore instructions in other languages and is not repeatable at temperature 0. For code and English. [Details and warning](docs/GUIDE.md#fast-ud-q4_k_xl). |
-| ⚠️ **Fast UD-Q4_K_XL, 32 GB** | **32 GB** + the model on an SSD | 512k | ⚠️ lossy | `build.sh --32g`, then `setup.sh /data/flash-next-q4-32 --models /data/flash-next-q4/models --model q4_k_xl --fast --ram 32` | none | The fast profile on a 32 GB machine, with an engine of its own (`build-32g/`; the other profiles' engine is not touched): no expert pinned in RAM, the ones the cards do not hold come from the model files through a 17 GiB RAM tier. About as fast as with 96 GB when writing, reads 17 % slower; 45 of 45 functions, 16 of 16 English questions. [Details](docs/GUIDE.md#32-gb-of-ram). |
+| ⚠️ **Fast UD-Q4_K_XL, 32 GB** | **32 GB** + the model on an SSD (uses up to 22.5 GiB) | 512k | ⚠️ lossy | `build.sh --32g`, then `setup.sh /data/flash-next-q4-32 --models /data/flash-next-q4/models --model q4_k_xl --fast --ram 32` | none | The fast profile on a 32 GB machine, with an engine of its own (`build-32g/`; the other profiles' engine is not touched): no expert pinned in RAM, the ones the cards do not hold come from the model files through a 17 GiB RAM tier. About as fast as with 96 GB when writing, reads 17 % slower; 45 of 45 functions, 16 of 16 English questions. Pins 19.6 GiB. 1.4x the Coder profile's fresh writing on 32 GB, 1.7-1.9x its code edits. [Details](docs/GUIDE.md#32-gb-of-ram). |
 
 ³ 28.8 GB of it is the IQ3_S's second shard: point `--models` at the IQ3_S folder to share it.
 
@@ -209,7 +220,7 @@ The build-by-build story, with the gain of each step, is in [docs/HISTORY.md](do
   the [test build](#-test-build-two-tesla-m40-24-gb) on branch `m40-2x`.
 - **Above 4G Decoding** on in the BIOS, so each card gets its 16 GiB BAR1. The engine refuses a card without one.
 - **96 GB of RAM**, or 64 GB with the IQ3_S 64 GB mode or the exact UD-Q4_K_XL's 64 GB mode (model files on an SSD), or
-  32 GB with the fast UD-Q4_K_XL's 32 GB mode (lossy, model files on an SSD).
+  32 GB with UD-Q4_K_XL's 32 GB mode, the Coder's experts exact or the fast profile (lossy), model files on an SSD.
 - **CUDA 12.x** (CUDA 13 dropped sm_60) with a host compiler it accepts (CUDA 12.4: gcc 13 at most), CMake 3.22+,
   git and Python 3.10+. The driver must support both CUDA 12 and Pascal (the 580 branch is NVIDIA's last for Pascal).
 - **Disk:** about 95 GB for IQ3_S, 112 GB of files for UD-Q4_K_XL, and 87 GB for Edge0-145B (less when it shares the
@@ -237,6 +248,14 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
 
 ## 📰 News
 
+- **21 Nov 2026 (afternoon):** the **Coder on 32 GB of RAM** without lossy speed-ups (`bash build.sh --32g`, then
+  `setup.sh ... --model q4_k_xl --coder --ram 32`): the Coder's experts on UD-Q4_K_XL with exact routing (λ 0, no
+  `FNX_ONEHOP`), on the 32 GB mode's low-RAM engine. Its answers are the Coder's with 96 GB, bit for bit (KL 0 in 150 of
+  150 requests, every answer the same to the character). In a 28 GiB memory cgroup: fresh writing 50.1 tok/s (96 GB:
+  59.3), code edits 70-75 (100-101), a 36k read 987 (802); the fast 32 GB profile in the same window: 68.9, 124.0-124.5
+  and 987 (lossy). It pins 19.6 GiB of RAM, at most 22.5 GiB with the engine's own memory. There is no Q4 file of the
+  Coder on Hugging Face; the mask over Unsloth's file picks the same experts ([details](docs/GUIDE.md#32-gb-of-ram)).
+  Nothing to rebuild if your `build-32g/` is from 19 Nov's evening release or later.
 - **21 Nov 2026 (morning):** the Hy4 flash test build reads faster: 337 tok/s instead of 294 on a 14,302-token prompt, and
   **442 tok/s** with f16 sums (`HY4_PF_F16=7`, off by default; on our test sets within one question of the first build). The sparse
   attention in one pass straight from the cache, expert kernels that skip empty token columns (the same bits), and f16 sums

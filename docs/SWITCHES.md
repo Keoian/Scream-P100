@@ -83,8 +83,8 @@ UD-Q4_K_XL", has what they gave.
 
 ## The Coder experts
 
-Off in every template; `fill_profile.py --coder` (or `setup.sh --coder`) sets it, with either model file. GUIDE.md, "Coder",
-has what it gave.
+Off in every template; `fill_profile.py --coder` (or `setup.sh --coder`) sets it, with either model file, and with
+`--model q4_k_xl --coder --ram 32` on the low-RAM engine (see "The 32 GB mode" below). GUIDE.md, "Coder", has what it gave.
 
 | Switch | Coder profile | Unset | Origin | What it does | Output effect |
 |---|---|---|---|---|---|
@@ -103,16 +103,19 @@ these three on top. Lossy on purpose; GUIDE.md, "Fast UD-Q4_K_XL", has what they
 
 ## The 32 GB mode
 
-This section is both low-RAM modes. `fill_profile.py --model q4_k_xl --fast --ram 32` (the fast UD-Q4_K_XL on 32 GB) and
-`fill_profile.py --model q4_k_xl --ram 64` (the exact UD-Q4_K_XL on 64 GB), or `setup.sh ... --ram 32` / `--ram 64`, write
-the UD-Q4_K_XL profile with these on top, and without `FNX_EXPERT_DYN_GIB`. The `FNX_SSD_*` switches exist only in the
-low-RAM engine (`bash build.sh --32g`: `engine/` with `engine-32g/`'s patches); the engine in `build/` does not have them.
-GUIDE.md, "32 GB of RAM" and "UD-Q4_K_XL on 64 GB", has what they gave.
+This section is both low-RAM modes. `fill_profile.py --model q4_k_xl --coder --ram 32` (the Coder on 32 GB, λ 0),
+`fill_profile.py --model q4_k_xl --fast --ram 32` (the fast UD-Q4_K_XL on 32 GB) and `fill_profile.py --model q4_k_xl
+--ram 64` (the exact UD-Q4_K_XL on 64 GB), or `setup.sh ... --ram 32` / `--ram 64`, write the UD-Q4_K_XL profile with
+these on top, and without `FNX_EXPERT_DYN_GIB`. The two 32 GB profiles differ only in the fast profile's `FNX_ROUTE_PRIOR`
+and `FNX_ONEHOP` ("The fast UD-Q4_K_XL profile" above); both set `FNX_EXPERT_MASK`, without which the experts do not fit.
+The `FNX_SSD_*` switches exist only in the low-RAM engine (`bash build.sh --32g`: `engine/` with `engine-32g/`'s
+patches); the engine in `build/` does not have them. GUIDE.md, "32 GB of RAM" and "UD-Q4_K_XL on 64 GB", has what they
+gave.
 
 | Switch or argument | 32 GB profile | 64 GB profile | Unset | Origin | What it does | Output effect |
 |---|---|---|---|---|---|---|
-| `FNX_SSD_EXPERTS` | 1 | 1 | 0 | ours (`engine-32g/`) | no routed expert gets a page-locked RAM copy at the load; an expert's host copy is its bytes in the model's GGUF files (each card's part: its rows of gate and up, its blocks of every down row), read through the page cache when needed. The cards' slots are filled from the files at the load and by the arena; a decode window's misses are read by the card's copier thread before it copies them up; a prompt read stages every expert of a layer (none is read in place), its experts out of the tier read by worker threads `FNX_SSD_AHEAD` layers ahead into a page-locked ring. Needs `FNX_P100_DMA=1`, `FNX_PF_STAGE_ALL=1` and no `FNX_PF_REFILL` (the load stops with a message otherwise), and the file's experts as they are on disk (not IQ files whose experts are converted at the load, not Edge0-145B) | where the bytes come from only. The prompt path stages short prompts too, as long ones |
-| `FNX_SSD_RAM_GIB` | 9.5 | 25 | 0 (no tier: a bounce buffer per copier) | ours | the RAM tier, at most GiB a card: page-locked slots in classes by an expert's size on the card, sized at the load's warm fill by need (each class gets the experts of its size the cards do not hold and 64 slots more, all classes scaled down alike when the cap does not hold that; the fast profile needs 8.5 GiB, the exact 26.4), CLOCK within a class after the empty slots (it gives up after two sweeps: the evicted expert is then not kept, a read goes through a bounce buffer). Exclusive with the cards: the expert a plan evicts from a card slot (`ExpertCache::prev`, `DmaBox::prev`) is copied down into it on a stream of its own before the slot is written, gate\|up parts first and then down parts, an event each, and an expert copied up leaves it. Filled at the load with the hottest experts out of a slot (`FNX_EXPERT_PROFILE`'s order; the coldest in the first slots and none marked used, so CLOCK lets them go first); before a read lends the prompt path its slots, and when the K/V pool borrows arena slots, their experts are copied down into it; arena slots given back are filled from it; a read stages from it what it holds | none by itself |
+| `FNX_SSD_EXPERTS` | 1 | 1 | 0 | ours (`engine-32g/`) | no routed expert gets a page-locked RAM copy at the load; an expert's host copy is its bytes in the model's GGUF files (each card's part: its rows of gate and up, its blocks of every down row), read through the page cache when needed. The cards' slots are filled from the files at the load and by the arena; a decode window's misses are read by the card's copier thread before it copies them up; a prompt read stages every expert of a layer (none is read in place), its experts out of the tier read by worker threads `FNX_SSD_AHEAD` layers ahead into a page-locked ring. Needs `FNX_P100_DMA=1`, `FNX_PF_STAGE_ALL=1` and no `FNX_PF_REFILL` (the load stops with a message otherwise), and the file's experts as they are on disk (not IQ files whose experts are converted at the load, not Edge0-145B) | where the bytes come from only: at λ 0 the same first-token logits as with every expert pinned (KL 0: the exact UD-Q4_K_XL 19 Nov, the Coder 21 Nov). The prompt path stages short prompts too, as long ones |
+| `FNX_SSD_RAM_GIB` | 9.5 | 25 | 0 (no tier: a bounce buffer per copier) | ours | the RAM tier, at most GiB a card: page-locked slots in classes by an expert's size on the card, sized at the load's warm fill by need (each class gets the experts of its size the cards do not hold and 64 slots more, all classes scaled down alike when the cap does not hold that; the Coder's experts, in both 32 GB profiles, need 8.5 GiB, the full model's 26.4), CLOCK within a class after the empty slots (it gives up after two sweeps: the evicted expert is then not kept, a read goes through a bounce buffer). Exclusive with the cards: the expert a plan evicts from a card slot (`ExpertCache::prev`, `DmaBox::prev`) is copied down into it on a stream of its own before the slot is written, gate\|up parts first and then down parts, an event each, and an expert copied up leaves it. Filled at the load with the hottest experts out of a slot (`FNX_EXPERT_PROFILE`'s order; the coldest in the first slots and none marked used, so CLOCK lets them go first); before a read lends the prompt path its slots, and when the K/V pool borrows arena slots, their experts are copied down into it; arena slots given back are filled from it; a read stages from it what it holds | none by itself |
 | `FNX_SSD_AHEAD` | unset | 1 | 2 | ours | how many layers ahead of the one being staged the prompt path's readers read (1-6); the ring holds that many layers plus one | none |
 | `FNX_SSD_THREADS` | unset | unset | 8 | ours | readers of a prompt layer, of a fill at the load, of the RAM tier's warm fill | none |
 | `FNX_SSD_COPIERS` | unset | unset | 4 | ours | readers beside each card's copier for a decode list with two or more experts to read from the files (0: the copier reads them itself) | none |

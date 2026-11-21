@@ -1,17 +1,19 @@
 # The low-RAM engine (32 GB and 64 GB modes)
 
-Two profiles run an engine of their own, so the engine every other profile runs (`engine/`, `build/`) is not touched by
-them: the fast UD-Q4_K_XL on a machine with 32 GB of RAM ([docs/GUIDE.md, "32 GB of RAM"](../docs/GUIDE.md#32-gb-of-ram))
-and the exact UD-Q4_K_XL on a machine with 64 GB ([docs/GUIDE.md, "UD-Q4_K_XL on 64 GB"](../docs/GUIDE.md#ud-q4_k_xl-on-64-gb)):
+Three profiles run an engine of their own, so the engine every other profile runs (`engine/`, `build/`) is not touched by
+them. On a machine with 32 GB of RAM ([docs/GUIDE.md, "32 GB of RAM"](../docs/GUIDE.md#32-gb-of-ram)) there are two: the
+Coder's experts with exact routing, and the fast UD-Q4_K_XL. On a machine with 64 GB there is the exact UD-Q4_K_XL
+([docs/GUIDE.md, "UD-Q4_K_XL on 64 GB"](../docs/GUIDE.md#ud-q4_k_xl-on-64-gb)):
 
 ```bash
 bash build.sh --32g      # build-32g/split/strata-split-2
-bash setup.sh /data/flash-next-q4-32 --models /data/flash-next-q4/models --model q4_k_xl --fast --ram 32   # 32 GB
-bash setup.sh /data/flash-next-q4-64 --models /data/flash-next-q4/models --model q4_k_xl --ram 64          # 64 GB
+bash setup.sh /data/flash-next-q4-coder-32 --models /data/flash-next-q4/models --model q4_k_xl --coder --ram 32   # 32 GB, Coder
+bash setup.sh /data/flash-next-q4-32 --models /data/flash-next-q4/models --model q4_k_xl --fast --ram 32          # 32 GB, fast
+bash setup.sh /data/flash-next-q4-64 --models /data/flash-next-q4/models --model q4_k_xl --ram 64                 # 64 GB
 ```
 
 `build.sh --32g` copies `engine/` to `build-32g/engine-32g`, applies the four patches below to the copy, in this order, and
-builds it into `build-32g`. The profiles `setup.sh --ram 32` and `--model q4_k_xl --ram 64` (or `profile/fill_profile.py`
+builds it into `build-32g`. The profiles that `setup.sh --ram 32` and `--model q4_k_xl --ram 64` (or `profile/fill_profile.py`
 with the same options) write name that engine.
 
 | File | What it is |
@@ -24,6 +26,7 @@ with the same options) write name that engine.
 
 Every patch checks every edit it makes (the build stops if one does not match), and with `FNX_SSD_EXPERTS` unset the
 patched engine takes none of the new paths. They apply to `engine/`'s sources of 19 Nov 2026 (SHA-256 in
-[docs/PROVENANCE.md](../docs/PROVENANCE.md)); our build of the result, `3d1c17ba`, is what both modes were measured on (the
-32 GB mode first on `4b5107bf`, with the first two patches as they were that afternoon). The switches are in
-[docs/SWITCHES.md, "The 32 GB mode"](../docs/SWITCHES.md#the-32-gb-mode), which covers both modes.
+[docs/PROVENANCE.md](../docs/PROVENANCE.md)); our build of the result, `3d1c17ba`, is what all three profiles were measured
+on (the fast 32 GB mode first on `4b5107bf`, with the first two patches as they were that afternoon; the Coder's on 21 Nov,
+nothing rebuilt). The switches are in [docs/SWITCHES.md, "The 32 GB mode"](../docs/SWITCHES.md#the-32-gb-mode), which
+covers all three.

@@ -21,6 +21,7 @@
 #   bash setup.sh /data/flash-next-coder --models /data/flash-next/models --coder   # the Coder's experts only (README, "Coder")
 #   bash setup.sh /data/flash-next-q4-fast --models /data/flash-next-q4/models --model q4_k_xl --fast   # the fast UD-Q4_K_XL, lossy
 #   bash setup.sh /data/flash-next-q4-32 --models /data/flash-next-q4/models --model q4_k_xl --fast --ram 32   # the same with 32 GB of RAM
+#   bash setup.sh /data/flash-next-q4-coder-32 --models /data/flash-next-q4/models --model q4_k_xl --coder --ram 32   # the Coder, 32 GB
 #   bash setup.sh /data/flash-next-q4-64 --models /data/flash-next-q4/models --model q4_k_xl --ram 64   # the exact UD-Q4_K_XL, 64 GB
 #
 # Options:
@@ -34,11 +35,12 @@
 #                    UD-Q4_K_XL (exact, not with --fast; docs/GUIDE.md, "UD-Q4_K_XL on 64 GB"): 524,288 positions, no expert
 #                    pinned in RAM, the experts the cards do not hold in a RAM tier of 25 GiB a card and in the model's files
 #                    (keep them on an SSD); the low-RAM engine: run 'bash build.sh --32g' first (the profile names build-32g/)
-#   --ram 32         the 32 GB mode (with --fast only; docs/GUIDE.md, "32 GB of RAM"): no expert pinned in RAM, the experts the
-#                    cards do not hold read from the model's files into a RAM tier (FNX_SSD_EXPERTS); wants the files on an SSD.
-#                    It has an engine of its own: run 'bash build.sh --32g' first (the profile names build-32g/)
+#   --ram 32         the 32 GB mode (--model q4_k_xl with --coder or --fast; docs/GUIDE.md, "32 GB of RAM"): no expert pinned in
+#                    RAM, the Coder's experts the cards do not hold in a RAM tier filled from the model's files (FNX_SSD_EXPERTS);
+#                    wants the files on an SSD. It has an engine of its own: run 'bash build.sh --32g' first (the profile names
+#                    build-32g/). With --coder (and no --fast) it answers as the Coder profile does with 96 GB, bit for bit
 #   --coder          route only to the 256 experts a layer that ISTA-DASLab's Coder release keeps (FNX_EXPERT_MASK): faster,
-#                    lossy, for code; with either file
+#                    lossy against the full model (it is a different model), for code; with either file
 #   --fast           the fast UD-Q4_K_XL (--model q4_k_xl only; docs/GUIDE.md, "Fast UD-Q4_K_XL"): the Coder mask, FNX_ROUTE_PRIOR=1.0
 #                    and FNX_ONEHOP=2, about 1.4x fresh writing and 2x code edits. LOSSY: answers are worded differently from
 #                    the exact profile, instructions in other languages than English may be ignored; for code and English
@@ -98,7 +100,8 @@ while [ $# -gt 0 ]; do
 done
 [ "$RAM" != 64 ] || [ "$MODEL" != edge0 ] || die "--ram 64: not with Edge0 (its profile needs 96 GB); the IQ3_S file or the UD-Q4_K_XL"
 [ "$RAM" != 64 ] || [ "$FAST" = 0 ] || die "--ram 64: the exact UD-Q4_K_XL only; the fast profile below 96 GB is --ram 32 (it runs on 64 GB too)"
-[ "$RAM" != 32 ] || [ "$FAST" = 1 ] || die "--ram 32: only with --model q4_k_xl --fast (docs/GUIDE.md, \"32 GB of RAM\")"
+[ "$RAM" != 32 ] || { [ "$MODEL" = q4_k_xl ] && [ "$CODER$FAST" != 00 ]; } ||
+  die "--ram 32: only with --model q4_k_xl and --coder or --fast (docs/GUIDE.md, \"32 GB of RAM\")"
 [ "$CODER" = 0 ] || [ "$MODEL" != edge0 ] || die "--coder: not with --model edge0 (the Coder's list names Flash-Next's experts, not Edge0's)"
 [ "$FAST" = 0 ] || [ "$MODEL" = q4_k_xl ] || die "--fast: only with --model q4_k_xl (the settings were measured on UD-Q4_K_XL only)"
 [ "$FAST" = 0 ] || [ "$PRIOR" = 0 ] || die "--fast sets FNX_ROUTE_PRIOR=1.0 itself: leave --route-prior out"
@@ -152,7 +155,7 @@ else
 fi
 mem_gib=$(awk '/^MemTotal:/ {print int($2 / 1048576)}' /proc/meminfo)
 if [ "$RAM" = 96 ] && [ "$MODEL" = q4_k_xl ] && [ "$mem_gib" -lt 88 ]; then
-  say "WARNING: $mem_gib GiB of RAM; this profile needs 96 GB; with 64 GB use --ram 64 (with --fast: --ram 32)"
+  say "WARNING: $mem_gib GiB of RAM; this profile needs 96 GB; with 64 GB use --ram 64 (with --coder or --fast: --ram 32)"
 elif [ "$RAM" = 96 ] && [ "$MODEL" != iq3_s ] && [ "$mem_gib" -lt 88 ]; then
   say "WARNING: $mem_gib GiB of RAM; this model needs 96 GB; with 64 GB use the IQ3_S file and --ram 64"
 elif [ "$RAM" = 96 ] && [ "$mem_gib" -lt 88 ]; then

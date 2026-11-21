@@ -24,13 +24,15 @@
              FNX_EXPERT_DYN_GIB=13, --max-context 262144 without YaRN, --conversation-cache-mib 2000. With --model q4_k_xl
              (docs/GUIDE.md, "UD-Q4_K_XL on 64 GB"; exact, not with --fast): FNX_SSD_EXPERTS=1, FNX_SSD_RAM_GIB (--ssd-ram-gib,
              default 25), FNX_SSD_AHEAD=1, no FNX_EXPERT_DYN_GIB, --conversation-cache-mib 1000, the 524,288 positions kept.
-             32: the 32 GB mode (docs/GUIDE.md, "32 GB of RAM"; with --fast only): FNX_SSD_EXPERTS=1 (no expert pinned in RAM,
-             the ones the cards do not hold read from the model's files into a RAM tier), FNX_SSD_RAM_GIB (--ssd-ram-gib),
-             FNX_PF_TAIL_MIB=2700, no FNX_EXPERT_DYN_GIB, --conversation-cache-mib 1500
+             32: the 32 GB mode (docs/GUIDE.md, "32 GB of RAM"; --model q4_k_xl with --coder or --fast): FNX_SSD_EXPERTS=1
+             (no expert pinned in RAM, the Coder's experts the cards do not hold in a RAM tier filled from the model's files),
+             FNX_SSD_RAM_GIB (--ssd-ram-gib), FNX_PF_TAIL_MIB=2700, no FNX_EXPERT_DYN_GIB, --conversation-cache-mib 1500.
+             With --coder alone the profile's routing stays exact (λ 0): the Coder's answers of 96 GB, bit for bit
 --ssd-ram-gib the low-RAM engine's RAM tier, at most GiB a card, sized by need below that (default 9.5 with --ram 32, of
-             which the fast profile takes 8.5; 25 with --ram 64 --model q4_k_xl)
+             which the Coder's experts take 8.5; 25 with --ram 64 --model q4_k_xl)
 --coder      FNX_EXPERT_MASK=engine/data/coder_mask.txt: the router picks only from the 256 experts a layer that
-             ISTA-DASLab's Coder release keeps (README, "Coder"); faster, lossy, for code
+             ISTA-DASLab's Coder release keeps (README, "Coder"); faster, a different model than the full one (lossy against
+             it), for code
 --fast       the fast UD-Q4_K_XL (docs/GUIDE.md, "Fast UD-Q4_K_XL"; --model q4_k_xl only): the Coder mask as --coder plus
              FNX_ROUTE_PRIOR=1.0 and FNX_ONEHOP=2. LOSSY: answers are worded differently from the exact profile and
              instructions in other languages than English may be ignored; for code and English
@@ -73,7 +75,7 @@ def main():
     ap.add_argument("--gpu", default="0,1")
     ap.add_argument("--ram", choices=["96", "64", "32"], default="96",
                     help="64: the 64 GB mode (README, \"64 GB of RAM\"; with q4_k_xl docs/GUIDE.md, \"UD-Q4_K_XL on 64 GB\"); "
-                         "32: the 32 GB mode (with --fast; docs/GUIDE.md, \"32 GB of RAM\")")
+                         "32: the 32 GB mode (--model q4_k_xl with --coder or --fast; docs/GUIDE.md, \"32 GB of RAM\")")
     ap.add_argument("--ssd-ram-gib", type=float,
                     help="the RAM tier of the low-RAM engine, at most GiB a card (FNX_SSD_RAM_GIB; default 9.5 with --ram 32, "
                          "25 with --ram 64 --model q4_k_xl)")
@@ -90,8 +92,9 @@ def main():
         sys.exit("--ram 64: not with --model edge0 (its profile needs 96 GB)")
     if a.ram == "64" and a.fast:
         sys.exit("--ram 64: the exact UD-Q4_K_XL only; the fast profile below 96 GB is --ram 32 (it runs on 64 GB too)")
-    if a.ram == "32" and not a.fast:
-        sys.exit("--ram 32: only with --model q4_k_xl --fast (measured there only; docs/GUIDE.md, \"32 GB of RAM\")")
+    if a.ram == "32" and not (a.model == "q4_k_xl" and (a.coder or a.fast)):
+        sys.exit("--ram 32: only with --model q4_k_xl and --coder or --fast (the Coder's experts fit, the full model's do not; "
+                 "docs/GUIDE.md, \"32 GB of RAM\")")
     low = a.ram == "32" or (a.ram == "64" and a.model == "q4_k_xl")   # the low-RAM engine (build.sh --32g, FNX_SSD_EXPERTS)
     if a.ssd_ram_gib is None:
         a.ssd_ram_gib = 9.5 if a.ram == "32" else 25.0
@@ -161,9 +164,10 @@ def main():
         cfg["env"]["FNX_ROUTE_PRIOR"] = "1.0"
         cfg["env"]["FNX_ONEHOP"] = "2"
     if a.ram == "32":
-        # the 32 GB mode of 19 Nov 2026 (docs/GUIDE.md, "32 GB of RAM"): no expert pinned in RAM; the Coder's experts the cards do
-        # not hold sit in a RAM tier of --ssd-ram-gib a card, the rest is read from the model's files; the prompt path borrows no
-        # more expert slots than it uses (2700 of 4096 MiB), and parked conversations get 1500 MiB
+        # the 32 GB mode of 19 Nov 2026 (docs/GUIDE.md, "32 GB of RAM"; with --coder alone measured on 21 Nov): no expert pinned in
+        # RAM; the Coder's experts the cards do not hold sit in a RAM tier of --ssd-ram-gib a card, the rest is read from the
+        # model's files; the prompt path borrows no more expert slots than it uses (2700 of 4096 MiB), and parked conversations
+        # get 1500 MiB. Where an expert's bytes come from does not change what is computed: λ stays the profile's
         cfg["env"]["FNX_SSD_EXPERTS"] = "1"
         cfg["env"]["FNX_SSD_RAM_GIB"] = f"{a.ssd_ram_gib:g}"
         cfg["env"]["FNX_PF_TAIL_MIB"] = "2700"
