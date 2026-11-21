@@ -4,3 +4,5 @@
 __pycache__/
 /my-profile*.json
 /results*.json
+engine-hy4/build/
+bench-edit-*.txt

@@ -1,3 +1,8 @@
+> **Branch `hy4-test`: TEST BUILD for Tencent Hy4 flash on two Tesla P100 16 GB, measured on one machine only.** It adds an
+> engine of its own (`bash engine-hy4/build.sh`, `engine-hy4/setup.sh DATA`, `engine-hy4/run.sh DATA`): [docs/HY4.md](docs/HY4.md).
+> Xylolabs's IQ3_XXS, 64k context, 96 GB of RAM: 27.0 tok/s writing, 28-35 tok/s edits, 294 tok/s reading.
+> Everything else is `main` as of commit `00e6c5e`; for the Flash-Next release use the `main` branch.
+
 <div align="center">
 
 # 😱 Scream P100
@@ -15,7 +20,7 @@ Flash-Next IQ3_S: **~67 tok/s writing · 110+ tok/s edits · ~1,000 tok/s readin
 ![Context 512k](https://img.shields.io/badge/context-524%2C288%20tokens-orange)
 ![API: OpenAI-compatible](https://img.shields.io/badge/API-OpenAI--compatible-412991)
 
-[Quick start](#-quick-start) · [Speed](#-speed) · [Models](#-models) · [2× M40 test build](#-test-build-two-tesla-m40-24-gb) · [How it works](#-how-it-works) · [Full guide](docs/GUIDE.md)
+[Quick start](#-quick-start) · [Speed](#-speed) · [Models](#-models) · [2× M40 test build](#-test-build-two-tesla-m40-24-gb) · [Hy4 test build](#-test-build-tencent-hy4-flash) · [How it works](#-how-it-works) · [Full guide](docs/GUIDE.md)
 
 </div>
 
@@ -153,6 +158,19 @@ f16 arithmetic), on **32 GB of RAM**: ISTA-DASLab's GSQ-RCO IQ3_XXS, 256k contex
 layer-split engine did 35.2 tok/s writing and 275 tok/s reading on the same machine. Build with `bash build.sh --m40`, set up
 with `setup.sh DATA --model iq3_xxs`. Only the 24 GB M40 was run.
 
+## 🧪 Test build: Tencent Hy4 flash
+
+> ⚠️ **Test build, measured on one machine only**, on branch [`hy4-test`](https://github.com/Megla123/Scream-P100/tree/hy4-test)
+> ([docs/HY4.md](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md)). Written in the two days before
+> 21 Nov 2026; nobody else has run it yet. Reports are welcome.
+
+Tencent's **Hy4 flash** on the same two P100 16 GB, with an **engine of its own** (`engine-hy4/`): Strata's split engine does
+not know Hy4's Engram tables, indexed sparse attention and latent experts, so we wrote one with the same idea (both cards
+on every layer, the experts that do not fit streamed in over PCIe). Xylolabs's IQ3_XXS GGUF, 64k context, tools and
+thinking, 96 GB of RAM. On our machine: **27.0 tok/s** fresh writing, **28-35** edits (Python and Markdown files),
+**294 tok/s** reading a 14,302-token prompt; llama.cpp with Hy4 support did 6-9 tok/s writing on the same cards. Build
+with `bash engine-hy4/build.sh`, set up with `engine-hy4/setup.sh DATA`, run with `engine-hy4/run.sh DATA`.
+
 ## 🔧 How it works
 
 ```mermaid
@@ -206,12 +224,17 @@ settles. What has and has not been tested is in [Known limitations](docs/GUIDE.m
 | [tune/README.md](tune/README.md) | `check.py` and `tune.py`: diagnose and tune your own machine |
 | [Branch `poc-4x-p100`](https://github.com/Megla123/Scream-P100/tree/poc-4x-p100/docs/POC-4X.md) | ⚠️ **Unverified proof of concept**, never run on four cards: a build for four P100 behind one PCIe switch (`build.sh --4x`) |
 | [Branch `m40-2x`](https://github.com/Megla123/Scream-P100/blob/m40-2x/docs/M40.md) | ⚠️ **Test build** for two Tesla M40 24 GB (sm_52), measured on one machine only: IQ3_XXS, 256k, 32 GB of RAM (`build.sh --m40`) |
+| [Branch `hy4-test`](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md) | ⚠️ **Test build** for Tencent Hy4 flash on the same two P100, an engine of its own, measured on one machine only: IQ3_XXS, 64k, 96 GB of RAM (`engine-hy4/`) |
 | [NOTICE.md](NOTICE.md) · [docs/PROVENANCE.md](docs/PROVENANCE.md) · [docs/upstream-v0.2.10.diff](docs/upstream-v0.2.10.diff) | What is ours and what is Strata's, file by file and line by line |
 
 Our scripts and docs refer to sections as *(README, "Section")*. Those sections are now in [docs/GUIDE.md](docs/GUIDE.md).
 
 ## 📰 News
 
+- **21 Nov 2026:** ⚠️ a **test build for Tencent Hy4 flash** on branch [`hy4-test`](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md):
+  an engine of its own for Hy4's Engram tables, sparse attention and latent experts, on the same two P100. Xylolabs's
+  IQ3_XXS, 64k context, 96 GB of RAM: 27.0 tok/s fresh writing, 28-35 edits, 294 tok/s reading. Measured on
+  our machine only.
 - **20 Nov 2026:** ⚠️ a **test build for two Tesla M40 24 GB** (Maxwell) on branch [`m40-2x`](https://github.com/Megla123/Scream-P100/blob/m40-2x/docs/M40.md):
   the engine we ran on our second server until we sold it. ISTA-DASLab's IQ3_XXS, 256k context, 32 GB of RAM: 45.7 tok/s
   fresh writing, 62.9 / 66.7 edits, 420 tok/s reading 38.9k tokens. Measured on that one machine only.

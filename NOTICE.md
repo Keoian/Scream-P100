@@ -11,14 +11,16 @@
 | `engine/p100_compat.h`, `engine/src/p100_*`, the changes to the other files | ours | MIT (ours) |
 | `CMakeLists.txt`, `build.sh`, `setup.sh`, `run.sh`, `scripts/`, `profile/`, `bench/`, `docs/`, `history/` | ours; `bench/bench.py` reads its texts from a Strata checkout at run time | MIT (ours) |
 | `engine-32g/` | ours: the low-RAM engine's four patches and `ssd.hpp` (the 32 GB and 64 GB modes), which `build.sh --32g` applies to a copy of `engine/` | MIT (ours) |
+| `engine-hy4/` (this branch only; a test build for Tencent Hy4 flash, measured on one machine) | ours, written for Hy4 flash (not derived from Strata or sFNX); llama.cpp PR #32517's `src/models/hy-v4-flash.cpp` (commit `0a054d0b02454c998e068381d15f3f6615bdd987`) was the reference for the model graph, none of its code is included | MIT (ours) |
+| `engine-hy4/src/hy4_tables.h` | ggml's IQ3_XXS and IQ4_NL tables (`ggml-common.h`), generated from llama.cpp commit `0a054d0b` | MIT, The ggml authors, [third_party/ggml/LICENSE](third_party/ggml/LICENSE) |
 
 [docs/PROVENANCE.md](docs/PROVENANCE.md) says for every file in `engine/` whether it is Strata's unchanged, Strata's
 modified, or new, with its SHA-256. [docs/upstream-v0.2.10.diff](docs/upstream-v0.2.10.diff) is every change against
 Strata v0.2.10's `src/split/`. The paths in sFNX's `NOTICE.md` (`src/split/...`) are `engine/...` here.
 
 Not included and not redistributed: the model files (ISTA-DASLab's and Unsloth's GGUF, Edge0's Edge0-145B files under the Edge0
-Community Model License 1.0, Qwen's checkpoint for the MTP layer), Strata's server and tools, and llama.cpp (`build.sh` fetches
-the headers it needs). `setup.sh` downloads the model files from their own repositories; their licenses are theirs.
+Community Model License 1.0, Qwen's checkpoint for the MTP layer, Tencent's Hy4 flash under the Tencent Hy license as Xylolabs's
+GGUF), Strata's server and tools, and llama.cpp (`build.sh` fetches the headers it needs, `engine-hy4/setup.sh` its tokenizer). `setup.sh` downloads the model files from their own repositories; their licenses are theirs.
 
 Ideas taken from others, with thanks: the 16-bit form of the byte dot product (`fnx_dp4a_xmad`) from KaneQuah/Kmic-68's
 llama.cpp fork (commit `99eb48176d`); a host thread per card that copies missing experts with the copy engine
