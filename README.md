@@ -24,6 +24,10 @@ Flash-Next IQ3_S: **~67 tok/s writing · 110+ tok/s edits · ~1,000 tok/s readin
 
 </div>
 
+> 🧪 **New: Tencent Hy4 flash on the same two P100s**, with an engine of its own: 27 tok/s writing, 337 tok/s reading (442
+> with f16 sums). A test build on branch [`hy4-test`](https://github.com/Megla123/Scream-P100/tree/hy4-test):
+> [what it is and how to run it](#-test-build-tencent-hy4-flash).
+
 ---
 
 Scream P100 is a port of [Strata](https://github.com/Niko1221/Strata)'s all-cards split engine (`strata-split-2`, from
@@ -170,8 +174,8 @@ Tencent's **Hy4 flash** on the same two P100 16 GB, with an **engine of its own*
 not know Hy4's Engram tables, indexed sparse attention and latent experts, so we wrote one with the same idea (both cards
 on every layer, the experts that do not fit streamed in over PCIe). Xylolabs's IQ3_XXS GGUF, 64k context, tools and
 thinking, 96 GB of RAM. On our machine: **27-28 tok/s** fresh writing, **28-35** edits (Python and Markdown files),
-**337 tok/s** reading a 14,302-token prompt, or **442 tok/s** with f16 sums (`HY4_PF_F16=7`, the same scores on our test
-sets); llama.cpp with Hy4 support did 6-9 tok/s writing on the same cards.
+**337 tok/s** reading a 14,302-token prompt, or **442 tok/s** with f16 sums (`HY4_PF_F16=7`, on our test sets within one
+question of the first build); llama.cpp with Hy4 support did 6-9 tok/s writing on the same cards.
 
 ```bash
 git clone -b hy4-test https://github.com/Megla123/Scream-P100.git && cd Scream-P100
@@ -239,7 +243,7 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
 ## 📰 News
 
 - **21 Nov 2026 (morning):** the Hy4 flash test build reads faster: 337 tok/s instead of 294 on a 14,302-token prompt, and
-  **442 tok/s** with f16 sums (`HY4_PF_F16=7`, off by default; on our test sets the same scores as the f32 path). The sparse
+  **442 tok/s** with f16 sums (`HY4_PF_F16=7`, off by default; on our test sets within one question of the first build). The sparse
   attention in one pass straight from the cache, expert kernels that skip empty token columns (the same bits), and f16 sums
   for the dense matrices, the experts and the window attention ([branch `hy4-test`](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md)).
 - **21 Nov 2026:** ⚠️ a **test build for Tencent Hy4 flash** on branch [`hy4-test`](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md):
