@@ -964,7 +964,7 @@ and `FNX_YARN_ORIG_CTX`.
 ## Pictures on a card, only while they come
 
 By default the picture encoder runs on the CPU. `setup.sh ... --pictures-gpu` (or `fill_profile.py --pictures-gpu`)
-puts it on card 0 instead, but only while pictures come: Strata's server starts the encoder with the first picture and
+puts it on the first of the engine's two cards instead (card 0, or the first of `--gpu A,B`), but only while pictures come: Strata's server starts the encoder with the first picture and
 stops it 120 s after the last one. While it runs, each card lends about 1.4-1.5 GiB of its coldest expert slots to the
 driver for it; when it stops, the slots come back and are filled again, hottest first. Text requests keep working
 throughout, and without a picture nothing is lent.
@@ -977,7 +977,8 @@ you edit an existing `profile.json` by hand:
 "vision": { ..., "gpu": true, "cuda_device": 0, "elastic": true, "elastic_mib": 1623, "elastic_idle_s": 120 }
 ```
 
-`"vram_elastic": true` makes Strata's server start the engine with `--vram-elastic`. `elastic_mib` is what every card
+`"vram_elastic": true` makes Strata's server start the engine with `--vram-elastic`. `cuda_device` is the first card of
+the profile's `"gpu"`, numbered as nvidia-smi numbers it (`fill_profile.py` writes it so). `elastic_mib` is what every card
 keeps free while the encoder runs: its peak of 1,367 MiB with ISTA-DASLab's BF16 projector at the profile's 1,024
 picture tokens, plus 256. With `"max_tokens": 3600` (finer pictures) the encoder peaks at 1,719 MiB: set `elastic_mib`
 to 1975. On the Q4 below that read the 4K report in 22.1-22.4 s with every item and circle right (12/12, 3/3), as long as
@@ -989,7 +990,7 @@ same addresses. When the server sends `VRAM <mib>` between requests, the engine 
 coldest slots exactly as a long context does (the slots' experts are read from RAM, CLOCK skips the slots), keeps those
 pages out of the K/V pool and unmaps their chunks, so the driver has the memory for the encoder process. `VRAM 0` maps
 the chunks again, zeroes them and gives the slots back (`arena_refill`). Each expert is split across both cards, so both
-cards lend the same slots; the encoder uses card 0's. The switches are in [SWITCHES.md](SWITCHES.md#pictures-on-a-card---vram-elastic).
+cards lend the same slots; the encoder uses the first card's. The switches are in [SWITCHES.md](SWITCHES.md#pictures-on-a-card---vram-elastic).
 
 **Measured** (21 Nov 2026, our server: two Tesla P100 16 GB at a 150 W cap, card 0 at PCIe 3.0 x8, 2 x Xeon E5-2696 v3;
 ISTA-DASLab's BF16 projector at 1,024 picture tokens; Strata v0.2.9's server). Two models: ISTA-DASLab's IQ3_S with the
@@ -1043,6 +1044,8 @@ same one.
   starts the encoder anyway (it may not fit). Not run.
 - Measured with the 96 GB mode only; `setup.sh` refuses `--pictures-gpu` with `--ram 64` or `--ram 32`. Not built on HIP
   (the flag refuses there). Not run with Unsloth's UD-Q4_K_XL or Edge0's own files.
+- Measured on two P100 (cards 0 and 1). With more (`--gpu A,B`, or `setup.sh`'s pair from two CPUs) the encoder goes on
+  the first card of the pair; not run on such a machine.
 
 ## Benchmark and compare
 

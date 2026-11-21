@@ -30,9 +30,9 @@
 #   --models DIR     the model files somewhere else (for example already downloaded); missing ones are downloaded there
 #   --strata DIR     an existing Strata checkout at v0.2.9 instead of DATA/strata-v0.2.9
 #   --no-pictures    no projector download, no encoder build, a profile without pictures
-#   --pictures-gpu   the picture encoder on card 0 only while pictures come (the engine's --vram-elastic; docs/GUIDE.md,
-#                    "Pictures on a card"): a 4K picture in seconds instead of on the CPU, each card lends 1.6 GiB of expert
-#                    slots while the encoder runs. The default 96 GB mode only
+#   --pictures-gpu   the picture encoder on the first of the two cards only while pictures come (the engine's --vram-elastic;
+#                    docs/GUIDE.md, "Pictures on a card"): a 4K picture in seconds instead of on the CPU, each card lends
+#                    1.6 GiB of expert slots while the encoder runs. The default 96 GB mode only
 #   --route-prior X  FNX_ROUTE_PRIOR in the profile: 0 (default) is exact; 0.15 is our production setting, faster, lossy
 #   --ram 64         the 64 GB mode in the profile; default 96. IQ3_S: 262,144 positions, the lookup table from the disk.
 #                    UD-Q4_K_XL (exact, not with --fast; docs/GUIDE.md, "UD-Q4_K_XL on 64 GB"): 524,288 positions, no expert
