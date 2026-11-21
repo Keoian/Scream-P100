@@ -72,8 +72,10 @@ the weights.
 
 The server (`serve/ink2_server.py`) answers `/v1/chat/completions` (streamed or not; the thinking part as
 `reasoning_content`), `/v1/models`, `/health`, `/props`, `/slots`, `/tokenize` and `/apply-template`, so llama-server
-clients work. `reasoning_effort` (none … xhigh) sets Inkling's "Thinking effort level". Limits: **greedy only** (no sampler
-yet), no pictures, no tool calls, one request at a time. A follow-up turn of a conversation reads only the new part (the
+clients work. `reasoning_effort` (none … xhigh) sets Inkling's "Thinking effort level". **Tool calls** work: OpenAI `tools` go in
+as the template's `tool_declare`, the model's calls come back as `tool_calls` (streamed too), tool results as its tool messages;
+the prompt equals the GGUF template's to the character (`tools/template_check.py`), and a web search tool in a chat app and a
+coding agent's write / bash tools worked on our machine. Limits: **greedy only** (no sampler yet), no pictures, one request at a time. A follow-up turn of a conversation reads only the new part (the
 engine keeps a snapshot of its state before the last prompt token).
 
 ## How it works

@@ -3,7 +3,8 @@
 
 An OpenAI-compatible HTTP server in front of the engine (ink2_v1 --serve S), also answering the endpoints a llama-server
 client expects: /health, /props, /slots, /tokenize, /apply-template, /metrics, /v1/models and /v1/chat/completions with and
-without "stream". The prompt is Inkling 2's chat template as text (tools and pictures are not supported), tokens come from
+without "stream". The prompt is Inkling 2's chat template as text (pictures are not supported; tools go in as the template's
+tool_declare and the model's <|content_invoke_tool_json|> calls come back as tool_calls), tokens come from
 llama.cpp's llama-tokenize (vocabulary only), text back from the GGUF vocabulary (GPT-2 byte level). Greedy only: the engine
 has no sampler, so temperature and the like are ignored. Drafts: DSpark (MTP) 3 + prompt lookup 15 unless a request says
 "mtp" / "lookup". The reply's <|content_thinking|> part streams as reasoning_content, its <|content_text|> part as content.
@@ -61,6 +62,9 @@ BYTEDEC = {chr(c): b for b, c in zip(bs, cs)}
 SPECIAL = {i: t for i, t in enumerate(TOKS) if t.startswith("<|") and t.endswith("|>")}
 T_THINK = next(i for i, t in SPECIAL.items() if t == "<|content_thinking|>")
 T_TEXT = next(i for i, t in SPECIAL.items() if t == "<|content_text|>")
+T_MODEL = next(i for i, t in SPECIAL.items() if t == "<|message_model|>")
+T_TOOL = next(i for i, t in SPECIAL.items() if t == "<|content_invoke_tool_json|>")
+T_END = next(i for i, t in SPECIAL.items() if t == "<|end_message|>")
 
 LOCK = threading.Lock()
 STATE = {"busy": False, "n_prompt": 0, "n_decoded": 0, "n_ctx": A.ctx, "t_start": 0.0, "requests": 0, "tokens_out": 0}
@@ -71,26 +75,85 @@ def token_bytes(i):
     return t.encode() if i in SPECIAL else bytes(BYTEDEC.get(ch, ord("?")) for ch in t)
 
 
-def render(messages, effort):
+def _tojson(x, sort_keys=False, separators=None):
+    # the template engines' tojson (transformers / minja): json.dumps without ASCII escapes
+    return json.dumps(x, ensure_ascii=False, sort_keys=sort_keys, separators=separators)
+
+
+def _args(fn):
+    a = fn.get("arguments")
+    if isinstance(a, str):   # OpenAI sends the arguments as a JSON string; the template wants the object
+        try:
+            a = json.loads(a) if a.strip() else {}
+        except ValueError:
+            a = {}
+    return a if isinstance(a, dict) else {}
+
+
+def render(messages, effort, tools=None):
+    """The GGUF chat template as text (Inkling 2's own, rendered by hand; tools/template_check.py compares it with the Jinja
+    template): tool_declare first when there are tools, "Thinking effort level" before the first non-system message, each
+    message as <|message_role|><|content_.|>...<|end_message|>, an assistant's tool calls as
+    <|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>, a tool result's header with the
+    tool's name, <|content_model_end_sampling|> after an assistant turn. Pictures are dropped (no image encoder)."""
     num = EFFORT[effort] if isinstance(effort, str) and effort in EFFORT else float(effort if effort is not None else 0.9)
     num = max(0.0, min(0.99, num))
     eff = "0" if num == 0.0 else f"{num}"
+    effort_msg = f"<|message_system|><|content_text|>Thinking effort level: {eff}<|end_message|>"
     s, emitted = "", False
+    if tools:
+        specs = []
+        for t in tools:
+            fn = t.get("function", t) if isinstance(t, dict) else {}
+            specs.append({"description": fn.get("description") or "", "name": fn.get("name"), "parameters": fn.get("parameters") or {},
+                          "type": (t.get("type") if isinstance(t, dict) else None) or "function"})
+        s += "<|message_system|>tool_declare<|content_xml|>" + _tojson(specs, sort_keys=True, separators=(",", ":")) + "<|end_message|>"
     for m in messages:
         role = m.get("role", "user")
-        if not emitted and role not in ("system", "developer"):
-            s += f"<|message_system|><|content_text|>Thinking effort level: {eff}<|end_message|>"
+        if role == "developer":
+            role = "system"
+        if role not in ROLE:
+            role = "user"
+        if not emitted and role != "system":
+            s += effort_msg
             emitted = True
-        content = m.get("content") or ""
-        if isinstance(content, list):
-            content = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+        head = ROLE[role]
+        if role == "tool":
+            if m.get("name"):
+                head += m["name"]
+            elif m.get("tool_call_id"):
+                for prev in messages:
+                    if prev.get("role") == "assistant" and prev.get("tool_calls"):
+                        for tc in prev["tool_calls"]:
+                            if tc.get("id") == m["tool_call_id"] and (tc.get("function") or {}).get("name"):
+                                head = ROLE["tool"] + tc["function"]["name"]
+        elif role == "assistant" and m.get("name"):
+            head += m["name"]
+        calls = m.get("tool_calls") if role == "assistant" else None
         if role == "assistant" and m.get("reasoning_content"):
-            s += f"{ROLE['assistant']}<|content_thinking|>{m['reasoning_content']}<|end_message|>"
-        s += f"{ROLE.get(role, ROLE['user'])}<|content_text|>{content}<|end_message|>"
+            s += head + "<|content_thinking|>" + m["reasoning_content"] + "<|end_message|>"
+        content = m.get("content")
+        if isinstance(content, str) or content is None:
+            text = content or ""
+            if text or not (role == "assistant" and (calls or m.get("reasoning_content"))):
+                s += head + "<|content_text|>" + text + "<|end_message|>"
+        else:
+            for part in content:
+                if isinstance(part, str):
+                    s += head + "<|content_text|>" + part + "<|end_message|>"
+                elif part.get("type") in (None, "text", "input_text"):
+                    s += head + "<|content_text|>" + (part.get("text") if isinstance(part.get("text"), str) else "") + "<|end_message|>"
+        for tc in calls or []:
+            fn = tc.get("function") or {}
+            args = _args(fn)
+            s += "<|message_model|>" + str(fn.get("name")) + "<|content_invoke_tool_json|>"
+            s += '{"name":' + _tojson(fn.get("name"), sort_keys=True, separators=(",", ":")) + ',"args":{'
+            s += ",".join(_tojson(k) + ":" + _tojson(args[k], separators=(",", ":")) for k in sorted(args))
+            s += "}}<|end_message|>"
         if role == "assistant":
             s += "<|content_model_end_sampling|>"
     if not emitted:
-        s += f"<|message_system|><|content_text|>Thinking effort level: {eff}<|end_message|>"
+        s += effort_msg
     return s
 
 
@@ -112,27 +175,55 @@ def effort_of(body):
 
 
 class Parts:
-    """Turns the reply's tokens into (kind, text) pieces: kind "r" = reasoning, "c" = content; template tokens are dropped."""
+    """Turns the reply's tokens into events: ("r", text) reasoning, ("c", text) content, ("tool", {"name", "arguments"}) a
+    finished tool call (<|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>). The name
+    after <|message_model|> is not text; other template tokens are dropped; text outside any part counts as content."""
 
     def __init__(self):
-        self.kind = "c"
+        self.mode = "c"
         self.dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.tool = bytearray()
+
+    def _switch(self, out, mode):
+        tail = self.dec.decode(b"", final=True)
+        if tail and self.mode in ("r", "c"):
+            out.append((self.mode, tail))
+        self.mode = mode
+
+    def _tool_done(self, out):
+        raw = bytes(self.tool).decode("utf-8", errors="replace")
+        self.tool = bytearray()
+        try:
+            d = json.loads(raw)
+            out.append(("tool", {"name": d["name"], "arguments": json.dumps(d.get("args") or {}, ensure_ascii=False)}))
+        except (ValueError, KeyError, TypeError):
+            out.append(("c", raw))   # not a call after all: keep its text
 
     def feed(self, ids):
         out = []
         for i in ids:
-            if i == T_THINK:
-                out.append((self.kind, self.dec.decode(b"", final=True)))
-                self.kind = "r"
+            if i == T_MODEL:
+                self._switch(out, "head")
+            elif i == T_THINK:
+                self._switch(out, "r")
+            elif i == T_TEXT:
+                self._switch(out, "c")
+            elif i == T_TOOL:
+                self._switch(out, "tool")
+                self.tool = bytearray()
+            elif i == T_END:
+                if self.mode == "tool":
+                    self._tool_done(out)
+                self._switch(out, "c")
+            elif i in SPECIAL or i == EOS:
                 continue
-            if i == T_TEXT:
-                out.append((self.kind, self.dec.decode(b"", final=True)))
-                self.kind = "c"
-                continue
-            if i in SPECIAL or i == EOS:
-                continue
-            out.append((self.kind, self.dec.decode(token_bytes(i))))
-        return [(k, t) for k, t in out if t]
+            elif self.mode == "tool":
+                self.tool += token_bytes(i)
+            elif self.mode in ("r", "c"):
+                t = self.dec.decode(token_bytes(i))
+                if t:
+                    out.append((self.mode, t))
+        return [(k, v) for k, v in out if v]
 
 
 def engine_lines(req):
@@ -206,7 +297,7 @@ class H(BaseHTTPRequestHandler):
                 return self._send(500, {"error": str(ex)})
             return self._send(200, {"tokens": ids})
         if path == "/apply-template":
-            return self._send(200, {"prompt": render(body.get("messages") or [], effort_of(body))})
+            return self._send(200, {"prompt": render(body.get("messages") or [], effort_of(body), body.get("tools"))})
         if path in ("/v1/chat/completions", "/chat/completions"):
             return self.chat(body)
         return self._send(404, {"error": "not found"})
@@ -214,7 +305,8 @@ class H(BaseHTTPRequestHandler):
     def chat(self, body):
         t0 = time.time()
         try:
-            ids = tokenize(render(body.get("messages") or [], effort_of(body)))
+            tools = body.get("tools") if body.get("tool_choice") != "none" else None
+            ids = tokenize(render(body.get("messages") or [], effort_of(body), tools))
         except Exception as ex:
             return self._send(500, {"error": str(ex)})
         if len(ids) >= A.ctx - 1:
@@ -246,7 +338,7 @@ class H(BaseHTTPRequestHandler):
 
                 sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": A.alias,
                      "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]})
-            out, final, t_first = [], None, None
+            out, final, t_first, calls = [], None, None, []
             try:
                 for msg in engine_lines(req):
                     if "error" in msg:
@@ -257,10 +349,16 @@ class H(BaseHTTPRequestHandler):
                         out += msg["t"]
                         STATE["n_decoded"] = len(out)
                         if stream:
-                            for kind, text in parts.feed(msg["t"]):
+                            for kind, val in parts.feed(msg["t"]):
+                                if kind == "tool":
+                                    call = {"index": len(calls), "id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                                            "function": {"name": val["name"], "arguments": val["arguments"]}}
+                                    calls.append(call)
+                                    delta = {"tool_calls": [call]}
+                                else:
+                                    delta = {"reasoning_content" if kind == "r" else "content": val}
                                 sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": A.alias,
-                                     "choices": [{"index": 0, "delta": {"reasoning_content" if kind == "r" else "content": text},
-                                                  "finish_reason": None}]})
+                                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
                     elif "tokens" in msg:
                         final = msg
             except (BrokenPipeError, ConnectionResetError):
@@ -272,7 +370,15 @@ class H(BaseHTTPRequestHandler):
             n = len(out)
             STATE["tokens_out"] += n
             w = final.get("write_s") or 1e-9
-            finish = "stop" if out and out[-1] == EOS else "length"
+            if not stream:
+                think, content = [], []
+                for kind, val in Parts().feed(out):
+                    if kind == "tool":
+                        calls.append({"index": len(calls), "id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                                      "function": {"name": val["name"], "arguments": val["arguments"]}})
+                    else:
+                        (think if kind == "r" else content).append(val)
+            finish = "tool_calls" if calls else "stop" if out and out[-1] == EOS else "length"
             timings = {"prompt_n": len(ids) - final.get("cached", 0), "cache_n": final.get("cached", 0),
                        "prompt_ms": 1000 * final.get("read_s", 0),
                        "prompt_per_second": (len(ids) - final.get("cached", 0)) / max(final.get("read_s", 0), 1e-9),
@@ -286,13 +392,12 @@ class H(BaseHTTPRequestHandler):
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
                 return
-            think, content = [], []
-            for kind, text in Parts().feed(out):
-                (think if kind == "r" else content).append(text)
+            message = {"role": "assistant", "content": "".join(content).strip() or (None if calls else ""),
+                       "reasoning_content": "".join(think).strip()}
+            if calls:
+                message["tool_calls"] = [{k: v for k, v in c.items() if k != "index"} for c in calls]
             return self._send(200, {"id": cid, "object": "chat.completion", "created": created, "model": A.alias,
-                                    "choices": [{"index": 0, "finish_reason": finish,
-                                                 "message": {"role": "assistant", "content": "".join(content).strip(),
-                                                             "reasoning_content": "".join(think).strip()}}],
+                                    "choices": [{"index": 0, "finish_reason": finish, "message": message}],
                                     "usage": usage, "timings": timings})
         except Exception as ex:
             if stream:
