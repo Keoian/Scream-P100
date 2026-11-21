@@ -44,6 +44,8 @@
 #   --fast           the fast UD-Q4_K_XL (--model q4_k_xl only; docs/GUIDE.md, "Fast UD-Q4_K_XL"): the Coder mask, FNX_ROUTE_PRIOR=1.0
 #                    and FNX_ONEHOP=2, about 1.4x fresh writing and 2x code edits. LOSSY: answers are worded differently from
 #                    the exact profile, instructions in other languages than English may be ignored; for code and English
+#   --gpu A,B        the two P100 as nvidia-smi numbers them; default: the two there are, or with more the pair that hangs
+#                    from two CPUs with the least VRAM in use (only when the profile is written; it is kept afterwards)
 #   --check          only check and report
 # Environment: HF_TOKEN (sent to Hugging Face if set), CUDA, HOSTCXX (as for build.sh), JOBS (encoder build, default 6).
 set -euo pipefail
@@ -80,10 +82,10 @@ declare -A SHA=([${IQ3_S[0]}]=4c1eb2ceb4915e1192f4f386021897bde56a97f40a0bb78bb8
                 [${EDGE0_FILES[3]}]=ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06
                 [$MMPROJ]=b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0)
 
-[ $# -ge 1 ] && [ "${1#-}" = "$1" ] || die "usage: bash setup.sh DATA [--model iq3_s|q4_k_xl|edge0] [--models DIR] [--strata DIR] [--no-pictures] [--route-prior X] [--ram 96|64|32] [--coder] [--fast] [--check]"
+[ $# -ge 1 ] && [ "${1#-}" = "$1" ] || die "usage: bash setup.sh DATA [--model iq3_s|q4_k_xl|edge0] [--models DIR] [--strata DIR] [--no-pictures] [--route-prior X] [--ram 96|64|32] [--coder] [--fast] [--gpu A,B] [--check]"
 DATA=$1
 shift
-MODEL=iq3_s MODELS='' STRATA='' PICTURES=1 PRIOR=0 RAM=96 CODER=0 FAST=0 CHECK=0
+MODEL=iq3_s MODELS='' STRATA='' PICTURES=1 PRIOR=0 RAM=96 CODER=0 FAST=0 CHECK=0 GPU=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) MODEL=${2:?--model iq3_s, q4_k_xl or edge0}; case "$MODEL" in iq3_s|q4_k_xl|edge0) ;; *) die "--model: iq3_s, q4_k_xl or edge0" ;; esac; shift 2 ;;
@@ -94,6 +96,8 @@ while [ $# -gt 0 ]; do
     --ram) RAM=${2:?--ram 96, 64 or 32}; [ "$RAM" = 96 ] || [ "$RAM" = 64 ] || [ "$RAM" = 32 ] || die "--ram: 96, 64 or 32"; shift 2 ;;
     --coder) CODER=1; shift ;;
     --fast) FAST=1; shift ;;
+    --gpu) GPU=${2:?--gpu A,B}; echo "$GPU" | grep -Eq '^[0-9]+,[0-9]+$' && [ "${GPU%,*}" != "${GPU#*,}" ] ||
+             die "--gpu: two different card numbers as nvidia-smi shows them, e.g. 1,2"; shift 2 ;;
     --check) CHECK=1; shift ;;
     *) die "unknown option $1" ;;
   esac
@@ -141,14 +145,39 @@ if grep -qs '^STRATA_SPLIT_PF_JOB:[A-Z]*=64$' "$HERE/build/CMakeCache.txt"; then
   say "note: this engine was built with prompt-path jobs of 64 rows; one built with the current 'bash build.sh' (96 rows) reads long prompts faster (README, \"Build\")"
 fi
 
+# the two P100: --gpu, else with more than two the pair that hangs from two CPUs (each card its own link to memory) with the
+# least VRAM in use; a user's 4-card machine wrote 45 tok/s on two cards behind one PCIe switch and 58 on one card per CPU
+pick_pair() {   # lines "index used numa" -> "i,j"
+  awk 'BEGIN {n = 0}
+       {ix[n] = $1; used[n] = $2; node[n] = $3; n++}
+       END {best = -1
+            for (i = 0; i < n; i++) for (j = i + 1; j < n; j++) {
+              s = (node[i] == node[j] || node[i] < 0 ? 1000000 : 0) + (used[i] > used[j] ? used[i] : used[j])
+              if (best < 0 || s < best) {best = s; pair = ix[i] "," ix[j]}
+            }
+            print pair}'
+}
 GPU_LIST=0,1
-if command -v nvidia-smi >/dev/null; then
-  p100=$( (nvidia-smi --query-gpu=index,name --format=csv,noheader || true) | awk -F', ' '/P100/ && n < 2 {print $1; n++}' | paste -sd, -)
-  if [ "$(echo "$p100" | tr ',' '\n' | grep -c .)" = 2 ]; then
-    GPU_LIST=$p100
+if [ -n "$GPU" ]; then
+  GPU_LIST=$GPU
+  ok "two Tesla P100: cards $GPU_LIST (--gpu)"
+elif command -v nvidia-smi >/dev/null; then
+  p100=$( (nvidia-smi --query-gpu=index,name,pci.bus_id,memory.used --format=csv,noheader,nounits || true) | awk -F', ' '/P100/ {print $1, $3, $4}' |
+    while read -r i bus used; do
+      bdf=$(echo "$bus" | tr 'A-F' 'a-f'); bdf=${bdf: -12}
+      echo "$i $used $(cat "${SYSFS:-/sys}/bus/pci/devices/$bdf/numa_node" 2>/dev/null || echo -1)"
+    done)
+  n=$(echo "$p100" | grep -c . || true)
+  if [ "$n" = 2 ]; then
+    GPU_LIST=$(echo "$p100" | awk '{print $1}' | paste -sd, -)
     ok "two Tesla P100: cards $GPU_LIST"
+  elif [ "$n" -gt 2 ]; then
+    GPU_LIST=$(echo "$p100" | pick_pair)
+    ok "two Tesla P100: cards $GPU_LIST of $n ($(echo "$p100" | awk '{printf "%s%s: NUMA node %s, %s MiB in use", (NR > 1 ? "; " : ""), $1, $3, $2}'))"
+    say "note: the engine runs on two cards; from two CPUs (or at least two PCIe switches) they copy faster; --gpu A,B picks them (docs/GUIDE.md, \"Other machines\")"
   else
-    say "WARNING: nvidia-smi does not show two Tesla P100 (found: ${p100:-none}); the profile names cards 0,1"
+    found=$(echo "$p100" | awk '{print $1}' | paste -sd, -)
+    say "WARNING: nvidia-smi does not show two Tesla P100 (found: ${found:-none}); the profile names cards 0,1"
   fi
 else
   say "WARNING: no nvidia-smi; the profile names cards 0,1"
@@ -320,6 +349,8 @@ fi
 CFG=$DATA/profile.json
 if [ -f "$CFG" ]; then
   ok "run config $CFG (kept; delete it to write it again)"
+  had=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("gpu", ""))' "$CFG" 2>/dev/null || true)
+  [ -z "$GPU" ] || [ "$GPU" = "$had" ] || say "WARNING: the kept run config names cards $had, not $GPU (--gpu); set \"gpu\" in it or delete it"
 elif [ "$CHECK" = 1 ]; then
   todo "the run config $CFG"
 else

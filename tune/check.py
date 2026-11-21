@@ -5,6 +5,7 @@ NUMA, the IOMMU and the disk with the model, measures host-to-card copies, names
     python3 tune/check.py --data /data/flash-next                   # the folder setup.sh fills (its profile.json and models/)
     python3 tune/check.py --models /mnt/models --out report.md      # also writes the report for a GitHub issue
     python3 tune/check.py --data /data/flash-next --write-profile /data/flash-next/profile.check.json
+    python3 tune/check.py --data /data/flash-next --gpu 1,2                # with more than two P100: the pair to look at
 
 It takes about a minute and never loads the model. It needs Python 3.10, nvidia-smi and the driver's libcuda.so.1 (no
 CUDA toolkit). The copy test takes about 1 GiB of each card for a few seconds, so it is skipped on a card that is in use
@@ -141,6 +142,32 @@ def shared_bridge(a, b):
     """the bridges both cards' paths go through (a PCIe switch with one uplink): their BDFs"""
     pa = {x["bdf"] for x in a["path"][1:]}
     return [x["bdf"] for x in b["path"][1:] if x["bdf"] in pa]
+
+
+def pair_cost(a, b):
+    """lower is better for the engine's two cards: from two CPUs (each its own link to memory), then not behind one bridge,
+    then the least VRAM in use"""
+    return (a["numa_node"] == b["numa_node"] or a["numa_node"] < 0, bool(shared_bridge(a, b)),
+            max(a["memory.used"] or 0, b["memory.used"] or 0))
+
+
+def pick_pair(p100, want=None):
+    """the two P100 to look at: want ("1,2": --gpu or the profile's "gpu"), else the two there are, else the best pair"""
+    if want:
+        pair = [c for i in str(want).split(",") for c in p100 if c["index"] == i.strip()]
+        if len(pair) != 2 or pair[0] is pair[1]:
+            sys.exit(f"--gpu {want}: not two of the P100 here ({', '.join(c['index'] for c in p100) or 'none'})")
+        return pair
+    if len(p100) <= 2:
+        return p100
+    return list(min(((a, b) for i, a in enumerate(p100) for b in p100[i + 1:]), key=lambda ab: pair_cost(*ab)))
+
+
+def profile_gpu(data):
+    try:
+        return json.loads((Path(data) / "profile.json").read_text()).get("gpu") if data else None
+    except (OSError, ValueError):
+        return None
 
 
 def narrowest(c, live=None):
@@ -486,17 +513,31 @@ def os_name():
 
 
 # ------------------------------------------------------------------ verdict
-def judge(h, cs, copies, disk, model, data_free):
+def judge(h, cs, copies, disk, model, data_free, pair=None):
     """the profile to use and the findings: a list of (level, what, advice, basis); level is stop (does not run), slow
     (costs speed), warn (something breaks or needs a change) or note"""
     found = []
 
     def add(level, what, advice, basis):
         found.append({"level": level, "what": what, "advice": advice, "basis": basis})
-    p100 = [c for c in cs if "P100" in c["name"] and c["compute_cap"] == "6.0" and (c["memory.total"] or 0) >= 16000]
+    p100_all = [c for c in cs if "P100" in c["name"] and c["compute_cap"] == "6.0" and (c["memory.total"] or 0) >= 16000]
+    p100 = [c for c in (pair if pair is not None else p100_all[:2]) if c in p100_all]
     if len(p100) != 2:
-        add("stop", f"{len(p100)} Tesla P100 16 GB found (cards: {', '.join(c['name'] for c in cs) or 'none'})",
+        add("stop", f"{len(p100_all)} Tesla P100 16 GB found (cards: {', '.join(c['name'] for c in cs) or 'none'})",
             "the engine is built for exactly two P100 16 GB (cc 6.0); on other cards use Strata", "the engine refuses others")
+    elif len(p100_all) > 2:
+        ab = f"cards {p100[0]['index']} and {p100[1]['index']}"
+        add("note", f"{len(p100_all)} Tesla P100; this report is about {ab}",
+            "the engine runs on two: setup.sh --gpu A,B (or \"gpu\" in profile.json); check.py --gpu A,B looks at another pair", "")
+        best = pick_pair(p100_all)
+        if pair_cost(*p100)[:2] > pair_cost(*best)[:2]:
+            why = "hang from one CPU" if pair_cost(*p100)[0] else "hang from one bridge"
+            add("slow", f"{ab} {why}; cards {best[0]['index']} and {best[1]['index']} do not",
+                f"two cards from two CPUs (or two PCIe switches) each copy over a link of their own: setup.sh --gpu "
+                f"{best[0]['index']},{best[1]['index']} (or \"gpu\" in profile.json), and check.py --gpu "
+                f"{best[0]['index']},{best[1]['index']} to measure them",
+                "[measured] on a user's machine with four P100, two behind each CPU's PCIe switch: writing 45 tok/s on two cards "
+                "behind one switch, 58 on one card per CPU (their prompts, temperature 0.7)")
     drv = cs[0]["driver_version"] if cs else ""
     if drv and drv.split(".")[0].isdigit() and int(drv.split(".")[0]) > 580:
         add("note", f"driver {drv}", "NVIDIA's 580 branch is the last one for Pascal; ours is 580.178.04", "")
@@ -611,7 +652,8 @@ def judge(h, cs, copies, disk, model, data_free):
         pf = min(pf or 9, 3)
         add("slow", f"both cards at once: {' + '.join(map(str, both))} GB/s against {' and '.join(map(str, singles))} alone",
             "the two cards share a link (a PCIe switch or one root port); the engine copies to both at once. Put them on slots "
-            "of different root ports (or CPUs); else treat it like a narrow link", "[unmeasured]")
+            "of different root ports (or CPUs); else treat it like a narrow link",
+            "[unmeasured] threshold; on a user's machine two cards behind one PCIe switch wrote 45 tok/s, one card per CPU 58")
     if len(p100) == 2:
         sb = shared_bridge(*p100)
         if sb:
@@ -709,7 +751,9 @@ def inspect(a, log=print):
     h = host()
     log(f"  {h['cpu']}, {h['mem_gib']} GiB RAM ({h['avail_gib']} available), IOMMU units {h['iommu_units']}, kernel {' '.join(h['cmdline_iommu'])}")
     copies = None
-    p100 = [c for c in cs if "P100" in c["name"]]
+    p100 = pick_pair([c for c in cs if "P100" in c["name"]], a.gpu or profile_gpu(a.data))
+    if len([c for c in cs if "P100" in c["name"]]) > 2:
+        log(f"the pair: cards {', '.join(c['index'] for c in p100)} ({'--gpu' if a.gpu else 'the profile' if profile_gpu(a.data) else 'chosen'})")
     busy = [c for c in p100 if (c["memory.used"] or 0) > 1024]
     if a.no_copy:
         log("copies: skipped (--no-copy)")
@@ -718,7 +762,7 @@ def inspect(a, log=print):
     elif p100:
         log("copies (pinned host memory, driver API)")
         try:
-            copies = copy_tests(p100[:2], a.seconds, log)
+            copies = copy_tests(p100, a.seconds, log)
         except (OSError, RuntimeError, AttributeError) as e:   # AttributeError: a libcuda.so.1 without one of the calls
             log(f"  failed: {e}")
     folder, model, paths = find_models(a)
@@ -734,7 +778,7 @@ def inspect(a, log=print):
     elif not paths:
         log("disk: no model files found (--data or --models)")
     data_free = shutil.disk_usage(a.data).free / 1e9 if a.data and os.path.isdir(a.data) else None
-    prof, found = judge(h, cs, copies, disk, model, data_free)
+    prof, found = judge(h, cs, copies, disk, model, data_free, p100)
     text = report(h, cs, copies, disk, dinfo, folder, model, prof, found)
     return {"host": h, "cards": cs, "copies": copies, "disk": disk, "disk_device": dinfo, "model": model,
             "profile": prof, "findings": found, "report": text}
@@ -751,6 +795,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--data", help="the folder setup.sh fills (profile.json, models/)")
     ap.add_argument("--models", help="the folder with the model files, if not DATA/models")
+    ap.add_argument("--gpu", metavar="A,B", help="the two P100 to look at, as nvidia-smi numbers them (default: DATA/profile.json's, "
+                    "else the two there are, else the pair from two CPUs with the least VRAM in use)")
     ap.add_argument("--seconds", type=float, default=3, help="per copy and disk test (default 3)")
     ap.add_argument("--no-copy", action="store_true", help="skip the copy test")
     ap.add_argument("--force-copy", action="store_true", help="run the copy test on cards that are in use")

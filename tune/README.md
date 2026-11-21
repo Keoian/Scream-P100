@@ -14,10 +14,13 @@ Both need Python 3.10 and nothing beyond what `setup.sh` installs; `check.py` re
 
 ```bash
 python3 tune/check.py --data /data/flash-next --out report.md
+python3 tune/check.py --data /data/flash-next --gpu 1,2 --out report-1-2.md   # with more than two P100: the pair to look at
 ```
 
 Run it with the cards free: the copy test takes about 600 MiB of each card for a few seconds and is skipped on a card
-that has more than 1 GiB in use (`--force-copy` runs it anyway). It reads and measures:
+that has more than 1 GiB in use (`--force-copy` runs it anyway). With more than two P100 it looks at the pair in
+`DATA/profile.json` (else the pair from two CPUs with the least VRAM in use; `--gpu A,B` chooses), and says so when
+another pair hangs from two CPUs or two switches and this one does not. It reads and measures:
 
 - **The cards**: two Tesla P100 16 GB (cc 6.0), the driver (the 580 branch is NVIDIA's last for Pascal), power limit,
   clocks, the NUMA node, the IOMMU group and BAR1 of each card (a P100 needs a 16 GiB BAR1: Above 4G Decoding).
@@ -61,7 +64,8 @@ is what the design implies. The second kind has not been tried on another machin
 | the IOMMU translates the cards' DMA | `iommu=pt` (or VT-d off) | [measured] 7.6-8 GB/s instead of 11.9 on ours |
 | a card's link below Gen3 x16 while copying, or a narrower bridge above it | slot wiring, riser, BIOS slot speed | [measured] ours run Gen3 x16 |
 | below about 10 GB/s to a card (x8, Gen2, a shared switch uplink) | start `tune.py` from fewer guessed next-layer copies: `FNX_PREFETCH_WANT` 2-3, `FNX_PREFETCH_MIN_T` 2 | **[unmeasured]** rule. It comes from UD-Q4_K_XL on ours, where PCIe was the limit: 6 guesses a row → 2 gave edits +15-20 % |
-| both cards at once much slower than each alone | slots on different root ports or CPUs | [unmeasured] |
+| both cards at once much slower than each alone | slots on different root ports or CPUs | [unmeasured] threshold; a user's machine with two cards behind one switch wrote 45 tok/s there, 58 with one card per CPU |
+| more than two P100, the pair from one CPU or behind one switch while another pair is not | `setup.sh --gpu A,B` with that pair | [measured] on that user's machine (above) |
 | the other CPU's memory slower than the card's own | nothing: the engine pins each card's thread to its CPU; `FNX_NUMA_EXPERTS=1` also places the RAM copies (same bits) | [measured] the same on ours, `FNX_NUMA_EXPERTS=1` in the noise |
 | power limit under 185 W | raise it (`nvidia-smi -pl`) | [unmeasured]; 250 W gave reads at most 1-1.5 % over 185 W on ours [measured] |
 | slow disk in a row | only the load is slower | [measured] 0.5 GB/s, about 100 s of the load on ours |

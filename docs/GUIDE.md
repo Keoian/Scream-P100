@@ -989,6 +989,13 @@ as in our runs. The texts are read from the Strata v0.2.9 checkout, so every run
   2.6-2.7 s. On a 64-row build (`PF_JOB=64`) long prompts read slower, UD-Q4_K_XL's most (see "Unsloth's UD-Q4_K_XL").
 - Keep `FNX_PROF=0` and nothing else on the cards. Our cards ran at 1,328 MHz under load; the clock follows recent load,
   so short tests can differ by 4-5 %.
+- **Compare writing at temperature 0.** The fresh prompts run at temperature 0 with reasoning "low". Sampled writing takes
+  fewer of the draft layer's tokens: our only sampled number, the answer after the picture (temperature 0.7, top-p 0.8,
+  top-k 20), writes 52.4-52.9 tok/s where the fresh prompts give 66.5.
+- **Other benchmarks** (llama-benchy and the like), as a user found them on Strata's server: it sends a first SSE chunk
+  with only the role before it reads the prompt, so a prompt speed taken from the first chunk is meaningless; take the
+  time to the first token with text, or `bench/bench.py`. And `DATA/prep/tokenizer` is Strata's own minimal folder, which
+  `transformers` does not load: give such a tool a tokenizer of its own (the user dumped one from the GGUF's header).
 
 ## Exact and lossy
 
@@ -1035,7 +1042,18 @@ none of them was measured on another machine.
   Strata v0.2.10's split engine with a profile tuned for 16 GB P100s, older than current Strata. Use Strata there.
 - **Other Pascal cards** (P40, GTX 10x0, sm_61): not supported. The engine refuses an architecture it was not built for,
   and its kernels are built on FP16 arithmetic, which those chips run at a small fraction of the P100's rate.
-- **Three or four cards:** Strata's code has them; this port has only run on two.
+- **More than two P100** (measured on a user's machine): the engine runs on two of them; pick two from different CPUs,
+  or at least behind different PCIe switches. Two cards behind one switch share its link to memory, and the engine
+  copies to both at once. A user's machine has four P100, two behind each CPU's switch (2x Xeon E5-2680).
+  - Writing: about 45 tok/s on the two cards behind one switch, about 58 with one card per CPU (their prompts at
+    temperature 0.7, four loads each).
+  - Reading: the same on both pairs.
+
+  `nvidia-smi topo -m` shows the layout: `SYS` between two cards means two CPUs, `PIX` or `PXB` one switch. With more
+  than two P100, `setup.sh` picks a pair from two CPUs with the least VRAM in use by itself (`--gpu A,B` chooses), and
+  `tune/check.py --gpu A,B` looks at a given pair.
+- **Three or four cards in one engine:** Strata's code has them; this port runs on two (an unverified four-card build is
+  on branch `poc-4x-p100`).
 - **An older processor** (no AVX2, e.g. Sandy Bridge or Ivy Bridge Xeons): the engine and Strata's server need none, but
   Strata's picture encoder is built for an AVX2 baseline by default; on Sandy Bridge-EP NVIDIA's driver also runs the
   cards at PCIe Gen2 unless told otherwise. `tune/check.py` checks both (next section).
