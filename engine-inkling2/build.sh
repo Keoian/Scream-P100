@@ -2,7 +2,7 @@
 # engine-inkling2/build.sh: builds the Inkling 2 Mini engine (build/ink2_v1, one CUDA program for two Tesla P100, sm_60) and,
 # for the server's tokenizer, llama.cpp's llama-tokenize at commit 690b87d on the CPU (no CUDA in that build), plus its gguf-py.
 # Needs CUDA 12.x (nvcc, cuBLAS), a host compiler nvcc accepts (CUDA 12.4: g++ <= 13; set HOST_CXX=g++-13 if your default is
-# newer), cmake, curl. About 2 minutes for the engine and 3-5 for llama-tokenize.
+# newer), cmake, curl. About 1 minute for the engine and 2-3 for llama-tokenize (21 Nov: 2 min 55 s in all on our server).
 set -euo pipefail
 cd "$(dirname "$0")"
 H=$(pwd); B=$H/build; mkdir -p "$B"

@@ -41,8 +41,13 @@ writing after it at 42.2 tok/s with the drafter); also at 120k. The KV cache cos
 (the model's limit) cannot fit in 2× 16 GB; about 262k with the drafter, about 290k without.
 
 **Quality:** greedy outputs of 32 tokens on English, Slovenian and code prompts are the same as llama.cpp's; KL of the last
-row 0.0001 / 0.025 / 0.00001; on a 4k prompt KL 0.011 against llama.cpp (whose own inputs are quantized to q8_1). Our short
-task set: Slovenian questions 3/3, coding tasks with hidden tests 3/3, the same as llama.cpp on the same file.
+row 0.0001 / 0.025 / 0.00001; on a 4k prompt the first token is the same in 13 of the last 16 rows (in the other three the
+top two swap places, KL 0.0000-0.040, 0.014 on average; llama.cpp quantizes its own inputs to q8_1). On the task sets of our
+Flash-Next builds, through the server with its defaults: **44 of 45** functions with hidden tests (Flash-Next UD-Q4_K_XL 45),
+written at 85.6 tok/s (73.6); English questions **16/16** (16); Slovenian questions 12/15, the same three missed by llama.cpp
+on the same file (two authors of Slovenian classics
+and one clock sum missed); 0 of 18 Klepet-style answers in Croatian or Serbian, 0 of 6 open Slovenian prompts with foreign
+words. Inkling reasons before it answers even at the lowest effort, and once spent a whole 1,200-token answer on it.
 
 ## Run it
 
@@ -54,8 +59,10 @@ bash engine-inkling2/run.sh /data/inkling2    # OpenAI-compatible API on http://
 ```
 
 `run.sh DATA [CTX] [PORT]`: CTX up to 262144. `python3 engine-inkling2/tools/bench.py` measures fresh writing, an edit and a
-long read through the API. The build scripts were written for this release; the engine and server they build are the ones
-measured above, but the scripts themselves have not yet run from a clean clone on another machine.
+long read through the API. Checked from a clean clone of this branch on our machine (21 Nov, CUDA 12.4, `HOST_CXX=g++-13`):
+`build.sh`, `setup.sh`, `run.sh DATA 65536`, ready in 48 s, then `tools/bench.py`: fresh writing 70.8 tok/s, the edit 105.9, a
+34,699-token read at 684.8 tok/s and writing after it at 55.8. If your default g++ is newer than CUDA 12.4 accepts, set
+`HOST_CXX=g++-13`.
 
 Files: Xylolabs's [`Inkling-2-Mini-NVFP4-Q8_0.gguf`](https://huggingface.co/Xylolabs/Inkling-2-Mini-GGUF) (the original
 NVFP4 experts with a scale per expert, the last four layers Q8_0, the rest Q8_0 / F32) and Unsloth's
@@ -98,7 +105,7 @@ Defaults in brackets. Presence switches (on when set at all): `INK2_STARE` (the 
 `INK2_PF_QSF` (1024, smaller on its own past 96k), `INK2_PF_SMB` (MB for the score matrix), `INK2_PF_ATTB` (1),
 `INK2_PF_RB` (0), `INK2_PV_SPLIT` (1), `INK2_DS_T1` (1), `INK2_DS_ROWS` (1 = k + 1 rows, 0 = all 8), `INK2_DS_PMIN` (0.7),
 `INK2_DS_RING` (on past 64k), `INK2_NG_MIN` (6), `INK2_SNAP` (1). Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
-`--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--dump DIR]` for tests.
+`--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--logits-all F] [--dump DIR]` for tests (`--logits-all`: every row of the last window).
 
 ## What did not help
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 # engine-inkling2/setup.sh DATA: downloads Inkling 2 Mini (Xylolabs's NVFP4-Q8_0 GGUF, 17.6 GB) and its DSpark drafter
-# (Unsloth's Q8_0 GGUF, 0.4 GB) into DATA, checks both by SHA-256, and makes a Python venv with numpy for the server
-# (DATA/venv). Resumes a broken download. About 18 GB free in DATA.
+# (Unsloth's Q8_0 GGUF, 0.4 GB) into DATA, checks both by SHA-256, and makes a Python venv for the server (numpy and what
+# llama.cpp's gguf-py imports: pyyaml, tqdm, requests; DATA/venv). Resumes a broken download. About 18 GB free in DATA.
 set -euo pipefail
 D=${1:?usage: setup.sh DATA}
 mkdir -p "$D"; cd "$D"
@@ -15,8 +15,8 @@ get https://huggingface.co/Xylolabs/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-M
     Inkling-2-Mini-NVFP4-Q8_0.gguf d4fcaf47c7f3efbbe057bcf2e516076b7a517017308284b2032c92851edfbd37
 get https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main/dspark-Inkling-2-Mini-Q8_0.gguf \
     dspark-Inkling-2-Mini-Q8_0.gguf 2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773
-if [ ! -x venv/bin/python ]; then
-  python3 -m venv venv
-  venv/bin/pip install -q numpy
+if [ ! -x venv/bin/python ] || ! venv/bin/python -c "import numpy, yaml, tqdm, requests" 2>/dev/null; then
+  [ -x venv/bin/python ] || python3 -m venv venv
+  venv/bin/pip install -q numpy pyyaml tqdm requests   # what llama.cpp's gguf-py imports
 fi
 echo "done: $D (run: bash engine-inkling2/run.sh $D)"

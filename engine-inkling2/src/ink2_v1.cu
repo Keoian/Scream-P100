@@ -2032,6 +2032,7 @@ int main(int argc, char** argv) {
     signal(SIGPIPE, SIG_IGN);   // p15: a client that left makes write() fail instead of ending the server   // lazy loading can sync a context on a kernel's first launch (a cross-card wait deadlocks)
     std::string model, tokens, dump, sock, logits_out, mtp;   // --mtp F: the DSpark drafter (dspark-Inkling-2-Mini-Q8_0.gguf)   // --logits F: the last row's logits after the prompt (logiti.bin format)
     int gen = 0, ctx = 32768;
+    bool logits_all = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto nx = [&]() -> std::string {
@@ -2045,6 +2046,7 @@ int main(int argc, char** argv) {
         else if (a == "--ctx") ctx = std::stoi(nx());
         else if (a == "--serve") sock = nx();
         else if (a == "--logits") logits_out = nx();
+        else if (a == "--logits-all") { logits_out = nx(); logits_all = true; }   // every row of the last window (writing path)
         else if (a == "--mtp") mtp = nx();
         else if (a == "--draft-vocab") g_draft_vocab = nx();
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 1; }
@@ -2067,7 +2069,7 @@ int main(int argc, char** argv) {
         e.d_fout.resize(NSLOT);
     }
     const double t0 = now_s();
-    const int nr = e.feed(ids.data(), n, !dump.empty());
+    const int nr = e.feed(ids.data(), n, !dump.empty() || logits_all);
     const double t1 = now_s();
     std::printf("poziv %d zetonov v %.3f s (%.1f tok/s)\n", n, t1 - t0, n / (t1 - t0));
     if (!dump.empty()) {
@@ -2087,11 +2089,11 @@ int main(int argc, char** argv) {
     }
     if (!logits_out.empty()) {
         FILE* lf = std::fopen(logits_out.c_str(), "wb");
-        const int32_t first = n - 1, nv = NVU;
+        const int32_t first = logits_all ? n - nr : n - 1, nv = NVU;
         std::fwrite(&n, 4, 1, lf);
         std::fwrite(&nv, 4, 1, lf);
         std::fwrite(&first, 4, 1, lf);
-        std::fwrite(e.h_logits + (size_t) (nr - 1) * NV, 4, NVU, lf);
+        for (int r = logits_all ? 0 : nr - 1; r < nr; ++r) std::fwrite(e.h_logits + (size_t) r * NV, 4, NVU, lf);
         std::fclose(lf);
     }
     int next = Engine::argmax(e.h_logits + (size_t) (nr - 1) * NV);
