@@ -13,7 +13,8 @@ has no sampler, so temperature and the like are ignored. Drafts: DSpark (MTP) 3 
 "mtp" / "lookup". The reply's <|content_thinking|> part streams as reasoning_content, its <|content_text|> part as content.
 reasoning_effort (none / minimal / low / medium / high / xhigh) or chat_template_kwargs.reasoning_effort sets the template's
 "Thinking effort level". One generation at a time; the other endpoints answer meanwhile. A client that leaves stops the
-generation. SIGTERM stops the engine too when INK2_ENGINE_PID is set (run.sh does)."""
+generation. SIGTERM stops the engine too when INK2_ENGINE_PID is set (run.sh does). A reasoning that falls into repeating
+itself word for word (greedy decoding can) is cut after its first copy and the model writes its answer (Loop, reply())."""
 import argparse
 import base64
 import codecs
@@ -317,6 +318,128 @@ class Parts:
                     out.append((self.mode, t))
         return [(k, v) for k, v in out if v]
 
+def periodic_tail(t, min_p, max_p, min_span, min_copies):
+    """(start, p) when t from start on repeats one block of p characters (min_p..max_p) back to back, at least min_copies
+    times and over min_span characters, else None. Candidate periods are the distances back to the earlier places of the
+    last min_p characters (the nearest first)."""
+    n = len(t)
+    if n < min_span:
+        return None
+    key = t[n - min_p:]
+    lo, hi = max(0, n - max_p - min_p), n - min_p
+    for _ in range(16):
+        pos = t.rfind(key, lo, hi)
+        if pos < 0:
+            return None
+        p, hi = n - min_p - pos, pos + min_p - 1
+        L = p
+        while L + p <= n and t[n - L - p:n - L] == t[n - L:n - L + p]:
+            L += p
+        while L < n and t[n - L - 1] == t[n - L - 1 + p]:
+            L += 1
+        if L >= max(min_span, min_copies * p):
+            return n - L, p
+    return None
+
+
+class Loop:
+    """The engine has no sampler, and a long greedy reasoning can fall into repeating itself word for word (seen on 22 Nov
+    after ~20 tool calls: two lines 194 times over and a list 21 times, 84k characters, no answer). Watches
+    the reply's current reasoning part; step() gives how many of the reply's tokens to keep when its tail repeats one block
+    of 32 to 8,000 characters at least 3 times back to back and over 2,000 characters: the reasoning up to the end of the
+    block's first copy."""
+    MIN_P, MAX_P, MIN_SPAN, MIN_COPIES, EVERY = 32, 8000, 2000, 3, 128
+
+    def __init__(self):
+        self.mode, self.text, self.ends, self.checked, self.hit = None, "", [], 0, None
+
+    def step(self, mode, evs, n_out):
+        if mode != self.mode:
+            self.mode, self.text, self.ends, self.checked = mode, "", [(0, n_out - 1)], 0
+        if mode != "r":
+            return None
+        self.text += "".join(v for k, v in evs if k == "r")
+        self.ends.append((len(self.text), n_out))
+        if len(self.text) - self.checked < self.EVERY:
+            return None
+        self.checked = len(self.text)
+        self.hit = periodic_tail(self.text, self.MIN_P, self.MAX_P, self.MIN_SPAN, self.MIN_COPIES)
+        if self.hit is None:
+            return None
+        upto = self.hit[0] + self.hit[1]
+        return next(k for c, k in reversed(self.ends) if c <= upto)
+
+
+# what closes a looping reasoning before the answer is forced (the reasoning is in English)
+NUDGE = "\n\nI am repeating the same lines. I have enough to answer, so I stop thinking here and write the answer now."
+NUDGE_IDS = []
+
+
+def reply(ids, mx, req, on_part=None, mode="c"):
+    """The engine's reply to the prompt ids, at most mx tokens: (tokens, totals, stopped). Each token's parts go to
+    on_part(kind, val) as they come ("r" reasoning, "c" content, "tool" a call). A loop in the reasoning (Loop) stops
+    the engine; the reasoning is kept up to the end of the block's first copy, closed by NUDGE, and the model writes its
+    answer (<|end_message|><|message_model|><|content_text|>): the engine reads the kept part again from the prompt's
+    snapshot (from the start when over ~3,000 tokens were written) and goes on. A second loop ends the reply (stopped).
+    mode: the part the prompt ends in ("r" when it ends inside a reasoning)."""
+    parts, guard, out = Parts(), Loop(), []
+    parts.mode = mode
+    tot = {"cached": None, "read_s": 0.0, "write_s": 0.0, "drafted": 0, "accepted": 0, "cuts": 0}
+    while True:
+        t_req, t_first, final, keep = time.time(), None, None, None
+        lines = engine_lines(dict(req, tokens=ids + out, max=mx - len(out), stream=1))
+        try:
+            for msg in lines:
+                if "error" in msg:
+                    raise RuntimeError(msg["error"])
+                if "t" in msg:
+                    t_first = t_first or time.time()
+                    for t in msg["t"]:
+                        out.append(t)
+                        evs = parts.feed([t])
+                        if on_part:
+                            for kind, val in evs:
+                                on_part(kind, val)
+                        keep = guard.step(parts.mode, evs, len(out))
+                        if keep is not None:
+                            break
+                    STATE["n_decoded"] = len(out)
+                    if keep is not None:
+                        break
+                elif "tokens" in msg:
+                    final = msg
+        finally:
+            lines.close()   # a cut: the engine stops at its next write
+        if final is not None:
+            if tot["cached"] is None:
+                tot["cached"] = final.get("cached", 0)
+            for k in ("read_s", "write_s", "drafted", "accepted"):
+                tot[k] += final.get(k, 0)
+        elif keep is None:
+            raise RuntimeError("the engine closed without an answer")
+        else:   # the cut run sends no totals: its times from here
+            tot["cached"] = tot["cached"] if tot["cached"] is not None else 0
+            tot["read_s"] += (t_first or t_req) - t_req
+            tot["write_s"] += time.time() - (t_first or t_req)
+        if keep is None:
+            return out, tot, False
+        tot["cuts"] += 1
+        start, p = guard.hit
+        print(f"ink2_server: a loop in the reasoning (copies x characters, tokens cut / written): {(guard.checked - start) / p:.1f} x {p}, "
+              f"{len(out) - keep} / {len(out)}", file=sys.stderr, flush=True)
+        out = out[:keep]
+        if not NUDGE_IDS:
+            NUDGE_IDS.extend(i for i in tokenize(NUDGE) if i not in SPECIAL)
+        forced = NUDGE_IDS + [T_END, T_MODEL, T_TEXT]
+        if tot["cuts"] > 1 or len(out) + len(forced) >= mx:
+            return out, tot, True
+        evs = parts.feed(forced)
+        if on_part:
+            for kind, val in evs:
+                on_part(kind, val)
+        out += forced
+        guard = Loop()
+
 
 def engine_lines(req):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -408,8 +531,7 @@ class H(BaseHTTPRequestHandler):
         mx = int(body.get("max_tokens") or body.get("max_completion_tokens") or 0) or (A.ctx - len(ids) - 1)
         mx = max(1, min(mx, A.ctx - len(ids) - 1))
         stream = bool(body.get("stream"))
-        req = {"tokens": ids, "max": mx, "stop": [EOS], "mtp": int(body.get("mtp", MTP)), "lookup": int(body.get("lookup", LOOKUP)),
-               "stream": 1 if stream else 0, **img_req}
+        req = {"stop": [EOS], "mtp": int(body.get("mtp", MTP)), "lookup": int(body.get("lookup", LOOKUP)), **img_req}
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(t0)
         if not LOCK.acquire(timeout=3600):
@@ -417,7 +539,7 @@ class H(BaseHTTPRequestHandler):
         try:
             STATE.update(busy=True, n_prompt=len(ids), n_decoded=0, t_start=t0)
             STATE["requests"] += 1
-            parts = Parts()
+            calls, on_part = [], None
             if stream:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -432,38 +554,24 @@ class H(BaseHTTPRequestHandler):
 
                 sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": A.alias,
                      "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]})
-            out, final, t_first, calls = [], None, None, []
+
+                def on_part(kind, val):
+                    if kind == "tool":
+                        call = {"index": len(calls), "id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                                "function": {"name": val["name"], "arguments": val["arguments"]}}
+                        calls.append(call)
+                        delta = {"tool_calls": [call]}
+                    else:
+                        delta = {"reasoning_content" if kind == "r" else "content": val}
+                    sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": A.alias,
+                         "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
             try:
-                for msg in engine_lines(req):
-                    if "error" in msg:
-                        raise RuntimeError(msg["error"])
-                    if "t" in msg:
-                        if t_first is None:
-                            t_first = time.time()
-                        out += msg["t"]
-                        STATE["n_decoded"] = len(out)
-                        if stream:
-                            for kind, val in parts.feed(msg["t"]):
-                                if kind == "tool":
-                                    call = {"index": len(calls), "id": "call_" + uuid.uuid4().hex[:24], "type": "function",
-                                            "function": {"name": val["name"], "arguments": val["arguments"]}}
-                                    calls.append(call)
-                                    delta = {"tool_calls": [call]}
-                                else:
-                                    delta = {"reasoning_content" if kind == "r" else "content": val}
-                                sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": A.alias,
-                                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
-                    elif "tokens" in msg:
-                        final = msg
+                out, tot, stopped = reply(ids, mx, req, on_part)
             except (BrokenPipeError, ConnectionResetError):
                 return   # the client left: closing the engine's socket stops it at its next write
-            if final is None:
-                raise RuntimeError("the engine closed without an answer")
-            if not stream:
-                out = final["tokens"]
             n = len(out)
             STATE["tokens_out"] += n
-            w = final.get("write_s") or 1e-9
+            w = tot["write_s"] or 1e-9
             if not stream:
                 think, content = [], []
                 for kind, val in Parts().feed(out):
@@ -472,14 +580,15 @@ class H(BaseHTTPRequestHandler):
                                       "function": {"name": val["name"], "arguments": val["arguments"]}})
                     else:
                         (think if kind == "r" else content).append(val)
-            finish = "tool_calls" if calls else "stop" if out and out[-1] == EOS else "length"
-            timings = {"prompt_n": len(ids) - final.get("cached", 0), "cache_n": final.get("cached", 0),
-                       "prompt_ms": 1000 * final.get("read_s", 0),
-                       "prompt_per_second": (len(ids) - final.get("cached", 0)) / max(final.get("read_s", 0), 1e-9),
+            finish = "tool_calls" if calls else "stop" if stopped or (out and out[-1] == EOS) else "length"
+            timings = {"prompt_n": len(ids) - tot["cached"], "cache_n": tot["cached"], "prompt_ms": 1000 * tot["read_s"],
+                       "prompt_per_second": (len(ids) - tot["cached"]) / max(tot["read_s"], 1e-9),
                        "predicted_n": n, "predicted_ms": 1000 * w, "predicted_per_second": max(n - 1, 0) / w,
-                       "draft_n": final.get("drafted", 0), "draft_n_accepted": final.get("accepted", 0)}
+                       "draft_n": tot["drafted"], "draft_n_accepted": tot["accepted"]}
+            if tot["cuts"]:
+                timings["loop_cuts"] = tot["cuts"]
             usage = {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n,
-                     "prompt_tokens_details": {"cached_tokens": final.get("cached", 0)}}
+                     "prompt_tokens_details": {"cached_tokens": tot["cached"]}}
             if stream:
                 sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": A.alias,
                      "choices": [{"index": 0, "delta": {}, "finish_reason": finish}], "usage": usage, "timings": timings})

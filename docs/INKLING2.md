@@ -160,6 +160,24 @@ hash, so a conversation's cached state never mixes two pictures. The engine puts
 placeholder and, as llama.cpp does, skips `token_embd_norm` for them. Checked on this branch's card picture: the title read
 word for word (the 960-token prompt read in 1.5 s, the answer written at 85.5 tok/s).
 
+## Loops in the reasoning
+
+The engine has no sampler: every answer is greedy. On 22 Nov, after ~20 tool calls (web searches and pages, a 15k-token
+prompt), Inkling's reasoning fell into repeating itself word for word: two lines 194 times over, then a list 21 times, 84k
+characters in 13 minutes and no answer (the client asked it to go on each time it hit the length limit). Since then
+`serve/ink2_server.py` watches the reply's reasoning as it streams. When the reasoning's tail repeats one block of 32 to
+8,000 characters at least 3 times back to back and over 2,000 characters, the server stops the engine. It then keeps the
+reasoning up to the end of the block's first copy and closes it with one sentence ("I am repeating the same lines. I have
+enough to answer, so I stop thinking here and write the answer now."). The model then writes its answer. The engine reads
+the kept part again from the prompt's snapshot, so this costs about a second. A second loop in the same reply ends it.
+`timings.loop_cuts` counts the cuts, and the server's log prints each one.
+
+On that day's job, the guard would have cut after 5,248 characters of the last round instead of 84k. Tested on 562
+reasoning and answer texts from our test runs (1.74M characters), it never cut one. With a reasoning that starts by
+repeating the two lines, the engine was cut after 9.3 copies, and the model wrote a short answer from what it had found.
+Plain, streamed and tool-call requests give the same tokens as before. `tools/loop_check.py` checks the guard without the
+model. Answers themselves are not watched, since a long table or matrix can repeat a row legitimately.
+
 ## How it works
 
 - **Split:** query heads 12 + 12 and KV heads 4 + 4 per card; every expert's FF split in half (gate and up rows, down
