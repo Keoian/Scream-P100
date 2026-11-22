@@ -1165,6 +1165,9 @@ python3 tune/tune.py --data /data/flash-next --screen           # 2-3 hours, one
   checks the RAM before each load, stops when the machine keeps swapping, compares every arm's first-token logits with
   your starting profile's, and writes `DATA/profile.tuned.json`. `FNX_ROUTE_PRIOR` is tried only with `--allow-lossy`;
   `--coder`'s expert mask is never changed.
+  `FNX_CPU_EXPERTS=1` (see "Missing experts on the CPU") is tried only with `--allow-cpu-experts`: `check.py` names the
+  machines it is for (a card on a link of x8 or x4, or otherwise slow to copy to, and CPUs with AVX2 and cores to spare),
+  and it is not bit-exact, so nothing tries or writes it unasked.
 - **On our machine** (13 Nov 2026, a test window, the IQ3_S 512k profile at `FNX_ROUTE_PRIOR=0`, engine `c213636c`):
   `check.py` measured 12.3 GB/s to each card, the same from the other CPU's memory and with both cards at once, Gen3 x16
   while copying, and found no bottleneck. `tune.py --screen --only prefetch,dma` took 7 loads (about 70 minutes): the

@@ -103,6 +103,7 @@ def cards():
         dev = f"/sys/bus/pci/devices/{c['bdf']}"
         c["numa_node"] = int(rd(f"{dev}/numa_node", "-1") or -1)
         c["local_cpus"] = rd(f"{dev}/local_cpulist")
+        c["local_cores"] = phys_cores(parse_cpus(c["local_cpus"]))
         c["iommu_type"] = rd(f"{dev}/iommu_group/type") if os.path.exists(f"{dev}/iommu_group") else "none"
         c["bar1_gib"] = bar1_gib(f"{dev}/resource")
         out.append(c)
@@ -270,6 +271,15 @@ class Copier:
 
 def node_cpus(node):
     return parse_cpus(rd(f"/sys/devices/system/node/node{node}/cpulist")) if node >= 0 else set()
+
+
+def phys_cores(cpus):
+    """the cores among these logical CPUs (hyperthreads counted once), from each CPU's sibling list"""
+    seen = set()
+    for n in cpus:
+        sib = rd(f"/sys/devices/system/cpu/cpu{n}/topology/thread_siblings_list")
+        seen.add(min(parse_cpus(sib)) if sib else n)
+    return len(seen)
 
 
 def parse_cpus(s):
@@ -513,6 +523,51 @@ def os_name():
 
 
 # ------------------------------------------------------------------ verdict
+CPU_EXPERTS_CORES = 10   # cores a card's CPU needs before the hint is given: the pool leaves two free and wants eight or more
+
+
+def cpu_experts_hint(h, p100, copies, model, prof, add):
+    """FNX_CPU_EXPERTS=1 (docs/GUIDE.md, "Missing experts on the CPU") is for a machine whose cards receive the experts
+    that are not in VRAM slowly (a link of x8 or x4, an old PCIe generation, an IOMMU that translates) and whose CPUs can
+    compute them instead: AVX2, FMA and F16C, and enough cores at each card. Names the case when the machine looks like
+    it and sets prof["cpu_experts"] for tune.py, which measures it only with --allow-cpu-experts (it is not bit-exact)."""
+    if len(p100) != 2 or model != "q4_k_xl" or prof.get("ram") != 96:
+        return   # the path is for UD-Q4_K_XL with every expert's copy in RAM
+    slow = []
+    for c in p100:
+        r = (copies or {}).get(c["index"], {})
+        own = c["path"][0] if c["path"] else {}
+        live = r.get("link_live") or {}
+        w = live.get("width", own.get("width"))
+        if r.get("h2d") and r["h2d"] < 0.85 * OURS["h2d"]:
+            slow.append(f"card {c['index']} receives {r['h2d']} GB/s" + (f" (x{w})" if w else ""))
+        elif not r.get("h2d") and w and w < 16:
+            slow.append(f"card {c['index']}'s link is x{w}")
+    if not slow:
+        return
+    isa = set(h.get("isa") or ())
+    cores = [c.get("local_cores") or 0 for c in p100]
+    one_cpu = len({c["numa_node"] for c in p100}) == 1
+    per_card = [n // 2 if one_cpu else n for n in cores]
+    basis = ("[measured] on one machine: one card on Gen3 x8, 2 x 18 cores at 2.3 GHz with four DDR3-1600 channels each, one card a "
+             "CPU: UD-Q4_K_XL fresh writing +41 %, code edits 2.5x, prompt reads unchanged; [unmeasured] on any other, and the "
+             f"limit of {CPU_EXPERTS_CORES} cores is a guess")
+    if not {"avx2", "fma", "f16c"} <= isa:
+        add("note", f"{'; '.join(slow)}: the experts that are not in VRAM cross that link in every decode window",
+            "FNX_CPU_EXPERTS=1 computes them on the CPU instead, but it needs AVX2, FMA and F16C, which this processor lacks", "")
+    elif min(per_card) < CPU_EXPERTS_CORES:
+        add("note", f"{'; '.join(slow)}; {' and '.join(map(str, per_card))} cores at the cards",
+            "FNX_CPU_EXPERTS=1 (setup.sh --cpu-experts) computes the experts that are not in VRAM on the CPU instead of copying them "
+            "over that link, but its pool wants cores (16 a card where it was measured): with these it may lose. tune.py --allow-cpu-experts "
+            "measures it; it is NOT bit-exact and not repeatable run to run", basis)
+    else:
+        prof["cpu_experts"] = True
+        add("note", f"{'; '.join(slow)}, and {' and '.join(map(str, per_card))} cores with AVX2 at the cards",
+            "the experts that are not in VRAM cross that link in every decode window. FNX_CPU_EXPERTS=1 (setup.sh --cpu-experts) "
+            "computes them on the CPU instead: worth measuring here with tune.py --allow-cpu-experts. It is NOT bit-exact and "
+            "not repeatable run to run, so it is never tried or written without that option", basis)
+
+
 def judge(h, cs, copies, disk, model, data_free, pair=None):
     """the profile to use and the findings: a list of (level, what, advice, basis); level is stop (does not run), slow
     (costs speed), warn (something breaks or needs a change) or note"""
@@ -661,6 +716,7 @@ def judge(h, cs, copies, disk, model, data_free, pair=None):
     for n, v in h["numa"].items():
         if v["mem_gib"] is not None and v["mem_gib"] < 1 and any(c["numa_node"] == n for c in p100):
             add("slow", f"NUMA node {n} carries a card but has no memory", "fill that CPU's memory channels too", "[unmeasured]")
+    cpu_experts_hint(h, p100, copies, model, prof, add)
     if copies is None:
         add("note", "copies not measured", "run with the cards free (or --force-copy) for the most telling number", "")
 

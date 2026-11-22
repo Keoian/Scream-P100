@@ -35,8 +35,9 @@
 #                    1.6 GiB of expert slots while the encoder runs. The default 96 GB mode only
 #   --cpu-experts    FNX_CPU_EXPERTS=1 in the profile (--model q4_k_xl, the default 96 GB mode; docs/GUIDE.md, "Missing experts
 #                    on the CPU"): a decode window's experts that are not in VRAM are computed on the CPU from their RAM
-#                    copies while the cards compute the ones that are. Faster writing on cards that hold a small part of
-#                    the experts; needs AVX2 and free cores (16 threads a card by default). NOT BIT-EXACT: the CPU sums
+#                    copies while the cards compute the ones that are. For a machine with a card on a narrow or slow
+#                    PCIe link (x8, x4) and CPUs with AVX2 and cores to spare (16 threads a card by default): tune/check.py
+#                    says whether yours looks like one, tune/tune.py --allow-cpu-experts measures it. NOT BIT-EXACT: the CPU sums
 #                    in fp32 where the cards sum in fp16, so the answers are not the same bits as without it, and two
 #                    runs with it are not the same bits as each other. Without this option the profile is the exact one
 #   --route-prior X  FNX_ROUTE_PRIOR in the profile: 0 (default) is exact; 0.15 is our production setting, faster, lossy
