@@ -75,9 +75,21 @@ bash engine-inkling2/run.sh /data/inkling2 256k   # or 512k; OpenAI-compatible A
 on when DATA holds the projector (`setup.sh DATA --no-pictures` leaves it out, `INK2_PICTURES=0` turns them off).
 `python3 engine-inkling2/tools/bench.py` measures fresh writing, an edit and a long read through the API,
 `python3 engine-inkling2/tools/picture_check.py` sends a picture (by default this branch's card picture) and asks for its title.
-Checked from a clean clone of this branch on our machine (21 Nov, CUDA 12.4, `HOST_CXX=g++-13`): `build.sh`, `setup.sh`,
-`run.sh DATA 65536`, ready in 48 s, then `tools/bench.py`: fresh writing 70.8 tok/s, the edit 105.9, a 34,699-token read at
-684.8 tok/s and writing after it at 55.8. If your default g++ is newer than CUDA 12.4 accepts, set `HOST_CXX=g++-13`.
+Checked from a clean clone of this branch on our machine (22 Nov, CUDA 12.4, `HOST_CXX=g++-13`): `build.sh` in 3.5 min
+(llama.cpp downloaded and built anew), `setup.sh`, then for each option `run.sh`, `tools/picture_check.py` and `tools/bench.py`:
+
+| | `run.sh DATA 256k` | `run.sh DATA 512k` |
+|---|---|---|
+| Ready, VRAM a card | 48 s, 15.19 GiB | 48 s, 15.24 GiB |
+| Picture: the title | read word for word (30.6 s with the encoding, 952-token prompt in 1.5 s, writing 77.0 tok/s) | the same, 30.9 s |
+| Fresh writing | 70.4 tok/s | 70.4 |
+| The edit | 77.8 tok/s | 77.8 |
+| 34,699-token read / writing after it | 594.9 / 58.7 tok/s | 600.3 / 59.1 |
+
+The edit test repeats `serve/ink2_server.py`, which grew with the pictures (21 → 26 KB) and now makes Inkling reason longer
+first: its 21 Nov copy gives 99.1 tok/s on the same engine at 256k (105.9 on 21 Nov at CTX 65536). On 21 Nov at CTX 65536:
+fresh 70.8, a 34,699-token read at 684.8 (bigger reading blocks; see [Speed](#speed)). If your default g++ is newer than CUDA
+12.4 accepts, set `HOST_CXX=g++-13`.
 
 Files: Xylolabs's [`Inkling-2-Mini-NVFP4-Q8_0.gguf`](https://huggingface.co/Xylolabs/Inkling-2-Mini-GGUF) (the original
 NVFP4 experts with a scale per expert, the last four layers Q8_0, the rest Q8_0 / F32) and Unsloth's
