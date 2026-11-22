@@ -8,7 +8,7 @@ Qwen3.8-Flash-Next and Edge0-145B with a 512k context on a pair of 2016 server c
 and Thinking Machines' **Inkling 2 Mini** on an engine of its own, `ink2`.<br>
 Built and measured for exactly **two Tesla P100 16 GB, each on its own PCIe 3.0 x16 link**.<br>
 Flash-Next IQ3_S: **~67 tok/s writing · 110+ tok/s edits · ~1,000 tok/s reading a 38k-token prompt**.<br>
-Inkling 2 Mini (`ink2`, exact): **~79 tok/s writing · 100-127 tok/s edits · ~800 tok/s reading · 256k context**.
+Inkling 2 Mini (`ink2`, exact): **~79 tok/s writing · 100-127 tok/s edits · ~800 tok/s reading · 256k or 512k context · pictures**.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![GPU: 2× Tesla P100](https://img.shields.io/badge/GPU-2%C3%97%20Tesla%20P100%2016%20GB-76b900?logo=nvidia&logoColor=white)
@@ -22,8 +22,8 @@ Inkling 2 Mini (`ink2`, exact): **~79 tok/s writing · 100-127 tok/s edits · ~8
 </div>
 
 > 🦑 **New: Inkling 2 Mini on the same two P100s**, with an engine of its own (`ink2`): the whole model in VRAM, every sum
-> exact, 78.8 tok/s writing with its DSpark drafter, ~800 tok/s reading, up to 256k context; llama.cpp did 13 / 143 on the
-> same cards. On branch [`inkling2`](https://github.com/Megla123/Scream-P100/tree/inkling2): [what it is and how to run it](#-inkling-2-mini-an-engine-of-its-own).
+> exact, 78.8 tok/s writing with its DSpark drafter, ~800 tok/s reading, a 256k or a 512k context and pictures; llama.cpp
+> did 13 / 143 on the same cards. On branch [`inkling2`](https://github.com/Megla123/Scream-P100/tree/inkling2): [what it is and how to run it](#-inkling-2-mini-an-engine-of-its-own).
 
 > 🧪 **Tencent Hy4 flash on the same two P100s**, with an engine of its own: 27 tok/s writing, 337 tok/s reading (442
 > with f16 sums). A test build on branch [`hy4-test`](https://github.com/Megla123/Scream-P100/tree/hy4-test):
@@ -179,21 +179,24 @@ with `setup.sh DATA --model iq3_xxs`. Only the 24 GB M40 was run.
 [![Inkling 2 Mini on two Tesla P100: an engine of its own](docs/inkling2-scream-p100.jpg)](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md)
 
 > ⚠️ **Measured on one machine only**, on branch [`inkling2`](https://github.com/Megla123/Scream-P100/tree/inkling2)
-> ([docs/INKLING2.md](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md)). Written on 21 Nov 2026; nobody else has run it yet. Reports
+> ([docs/INKLING2.md](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md)). Written on 21-22 Nov 2026; nobody else has run it yet. Reports
 > are welcome.
 
 Thinking Machines' **Inkling 2 Mini** (26.4B looped MoE: layers 6-17 run three times, 128 experts, NVFP4) on the same two
 P100 16 GB with an **engine of its own**, `ink2` (`engine-inkling2/`): both cards on every layer at once, and here the whole
 model fits in VRAM (8.9 GB a card), so nothing streams over PCIe. Xylolabs's NVFP4-Q8_0 GGUF with Unsloth's DSpark drafter
 (the model's MTP). On our machine, everything exact: **56.6 tok/s** fresh writing without drafts and **78.8** with them,
-**~100-127 tok/s** edits, **794 tok/s** reading a 4k prompt (757 at 14k, 646 at 36k), context up to **262,144** (a needle found
-at 239k). llama.cpp did 13.0 tok/s writing and 143 reading on the same cards; its greedy outputs match ours. On the test
-set of our Flash-Next builds it writes fresh answers at 66.3 tok/s (Flash-Next UD-Q4_K_XL: 59.3 exact, 68.9 lossy) and
-edits Markdown at 126.8 (92.2 / 125.6). Tool calls work; greedy only for now, no pictures.
+**~100-127 tok/s** edits, **794 tok/s** reading a 4k prompt (757 at 14k, 578-646 at 37k, by the context it runs with). Two
+context options: **256k** (the KV cache in f16; a needle found at 239k) or **512k** (the long part of the KV cache in int8,
+the first 32k tokens bit for bit as 256k, the same speed; a needle found at 496k). llama.cpp did 13.0 tok/s writing and 143
+reading on the same cards; its greedy outputs match ours. On the test set of our Flash-Next builds it writes fresh answers
+at 67.4 tok/s (Flash-Next UD-Q4_K_XL: 59.3 exact, 68.9 lossy) and edits Markdown at 127.8 (92.2 / 125.6). Tool calls and
+**pictures** work (the vision projector runs on the CPU, ~20 s a picture); greedy only for now.
 
 ```bash
 git clone -b inkling2 https://github.com/Megla123/Scream-P100.git && cd Scream-P100
-bash engine-inkling2/build.sh && bash engine-inkling2/setup.sh /data/inkling2 && bash engine-inkling2/run.sh /data/inkling2
+bash engine-inkling2/build.sh && bash engine-inkling2/setup.sh /data/inkling2
+bash engine-inkling2/run.sh /data/inkling2 256k   # or 512k
 ```
 
 ## 🧪 Test build: Tencent Hy4 flash
@@ -269,7 +272,7 @@ settles. What has and has not been tested is in [Known limitations](docs/GUIDE.m
 | [tune/README.md](tune/README.md) | `check.py` and `tune.py`: diagnose and tune your own machine |
 | [Branch `poc-4x-p100`](https://github.com/Megla123/Scream-P100/tree/poc-4x-p100/docs/POC-4X.md) | ⚠️ **Unverified proof of concept**, never run on four cards: a build for four P100 behind one PCIe switch (`build.sh --4x`) |
 | [Branch `m40-2x`](https://github.com/Megla123/Scream-P100/blob/m40-2x/docs/M40.md) | ⚠️ **Test build** for two Tesla M40 24 GB (sm_52), measured on one machine only: IQ3_XXS, 256k, 32 GB of RAM (`build.sh --m40`) |
-| [Branch `inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md) | Thinking Machines' Inkling 2 Mini on the same two P100, an engine of its own (`ink2`), measured on one machine only: the whole model in VRAM, exact, 78.8 tok/s writing, 794 tok/s reading, 256k context (`engine-inkling2/`) |
+| [Branch `inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md) | Thinking Machines' Inkling 2 Mini on the same two P100, an engine of its own (`ink2`), measured on one machine only: the whole model in VRAM, exact, 78.8 tok/s writing, 794 tok/s reading, 256k or 512k context, pictures (`engine-inkling2/`) |
 | [Branch `hy4-test`](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md) | ⚠️ **Test build** for Tencent Hy4 flash on the same two P100, an engine of its own, measured on one machine only: IQ3_XXS, 64k, 96 GB of RAM, 337 / 442 tok/s reading (`engine-hy4/`) |
 | [NOTICE.md](NOTICE.md) · [docs/PROVENANCE.md](docs/PROVENANCE.md) · [docs/upstream-v0.2.10.diff](docs/upstream-v0.2.10.diff) | What is ours and what is Strata's, file by file and line by line |
 
@@ -277,6 +280,12 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
 
 ## 📰 News
 
+- **22 Nov 2026:** 🦑 **Inkling 2 Mini: 512k and pictures** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md).
+  `run.sh DATA 256k` or `512k`: at 512k the full layers' KV rows past 32,768 are int8 (groups of 32, an f16 scale) and
+  buffers that never run at once share memory, 15.24 GiB a card; below 32k the output is the 256k mode's bit for bit, the
+  speed the same (fresh 67.2, edits 127.8, a 37.6k read 581 tok/s), past it KL ~4·10⁻³ against f16 (our f16 against
+  llama.cpp: 1.2·10⁻²); a needle found at 496,073 tokens. Pictures through the model's vision projector (llama.cpp's mtmd
+  on the CPU, ~20 s for 1600×900), in both options. Measured on our machine only.
 - **21 Nov 2026 (evening):** 🦑 **Inkling 2 Mini with an engine of its own** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md):
   Thinking Machines' 26.4B looped MoE on the same two P100, the whole model in VRAM, every sum exact. 56.6 tok/s fresh
   writing (78.8 with the DSpark drafter and prompt lookup), edits 100-127, reading 794 tok/s at 4k and 646 at 36k, context
