@@ -76,19 +76,21 @@ on when DATA holds the projector (`setup.sh DATA --no-pictures` leaves it out, `
 `python3 engine-inkling2/tools/bench.py` measures fresh writing, an edit and a long read through the API,
 `python3 engine-inkling2/tools/picture_check.py` sends a picture (by default this branch's card picture) and asks for its title.
 Checked from a clean clone of this branch on our machine (22 Nov, CUDA 12.4, `HOST_CXX=g++-13`): `build.sh` in 3.5 min
-(llama.cpp downloaded and built anew), `setup.sh`, then for each option `run.sh`, `tools/picture_check.py` and `tools/bench.py`:
+(llama.cpp downloaded and built anew), `setup.sh`, then for each option `run.sh`, `tools/picture_check.py` and `tools/bench.py`;
+in the morning with the pictures and the 512k option, at noon again with p19's faster reading (the same clone, `build.sh`
+again in 46 s):
 
 | | `run.sh DATA 256k` | `run.sh DATA 512k` |
 |---|---|---|
-| Ready, VRAM a card | 48 s, 15.19 GiB | 48 s, 15.24 GiB |
-| Picture: the title | read word for word (30.6 s with the encoding, 952-token prompt in 1.5 s, writing 77.0 tok/s) | the same, 30.9 s |
-| Fresh writing | 70.4 tok/s | 70.4 |
-| The edit | 77.8 tok/s | 77.8 |
-| 34,699-token read / writing after it | 594.9 / 58.7 tok/s | 600.3 / 59.1 |
+| Ready, VRAM a card | 48 s, 15.19 GiB → **14.76** (p19) | 48 s, 15.24 GiB |
+| Picture: the title | read word for word (30.6 s with the encoding, 952-token prompt in 1.5 s → **1.2 s**) | the same, 30.9 s |
+| Fresh writing | 70.4 tok/s (p19: 70.4) | 70.4 (70.5) |
+| The edit | 77.8 tok/s (p19: 87.8) | 77.8 (88.0) |
+| 34,699-token read / writing after it | 594.9 / 58.7 → **789.6** / 57.3 tok/s | 600.3 / 59.1 → **800.0** / 58.5 |
 
-The edit test repeats `serve/ink2_server.py`, which grew with the pictures (21 → 26 KB) and now makes Inkling reason longer
-first: its 21 Nov copy gives 99.1 tok/s on the same engine at 256k (105.9 on 21 Nov at CTX 65536). On 21 Nov at CTX 65536:
-fresh 70.8, a 34,699-token read at 684.8 (bigger reading blocks; see [Speed](#speed)). If your default g++ is newer than CUDA
+The edit test repeats `serve/ink2_server.py`, which grew with the pictures (21 → 26 KB) and makes Inkling reason first, so
+its number follows the text of that reasoning (its 21 Nov copy gave 99.1 tok/s on the morning's engine at 256k, 105.9 on 21
+Nov at CTX 65536). On 21 Nov at CTX 65536: fresh 70.8, a 34,699-token read at 684.8. If your default g++ is newer than CUDA
 12.4 accepts, set `HOST_CXX=g++-13`.
 
 Files: Xylolabs's [`Inkling-2-Mini-NVFP4-Q8_0.gguf`](https://huggingface.co/Xylolabs/Inkling-2-Mini-GGUF) (the original
