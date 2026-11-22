@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """ink2_server.py --port N [--host H] [--alias A] --sock S --ctx C --model M.gguf --tokenizer llama-tokenize --gguf-py DIR
-                 [--mmproj MMPROJ.gguf --vis ink2_vis]
+                 [--tok ink2_tok] [--mmproj MMPROJ.gguf --vis ink2_vis]
 
 An OpenAI-compatible HTTP server in front of the engine (ink2_v1 --serve S), also answering the endpoints a llama-server
 client expects: /health, /props, /slots, /tokenize, /apply-template, /metrics, /v1/models and /v1/chat/completions with and
@@ -14,13 +14,19 @@ has no sampler, so temperature and the like are ignored. Drafts: DSpark (MTP) 3 
 reasoning_effort (none / minimal / low / medium / high / xhigh) or chat_template_kwargs.reasoning_effort sets the template's
 "Thinking effort level". One generation at a time; the other endpoints answer meanwhile. A client that leaves stops the
 generation. SIGTERM stops the engine too when INK2_ENGINE_PID is set (run.sh does). A reasoning that falls into repeating
-itself word for word (greedy decoding can) is cut after its first copy and the model writes its answer (Loop, reply())."""
+itself word for word (greedy decoding can) is cut after its first copy and the model writes its answer (Loop, reply()).
+With --tok the tokenizer is build/ink2_tok, started once and kept (llama-tokenize takes 0.9 s to start for every request),
+and a conversation's next request tokenizes only its new pieces (Tokens). The token offsets where the prompt's messages
+start go to the engine with every request: it keeps checkpoints there, so a request that parts from the conversation in
+the middle (a chat client moving a note from the last message to the new one, a shortened history) reads only from the
+latest checkpoint before that place."""
 import argparse
 import base64
 import codecs
 import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -41,6 +47,7 @@ ap.add_argument("--model", required=True)
 ap.add_argument("--tokenizer", required=True, help="llama.cpp's llama-tokenize")
 ap.add_argument("--gguf-py", required=True, help="llama.cpp's gguf-py folder (knows NVFP4)")
 ap.add_argument("--mmproj", default="", help="the vision projector GGUF; none = text only")
+ap.add_argument("--tok", default="", help="ink2_tok (the tokenizer that stays up); none = llama-tokenize once a request")
 ap.add_argument("--vis", default="", help="ink2_vis (build/ink2_vis, the image encoder)")
 A, _ = ap.parse_known_args()
 TOKENIZE = A.tokenizer
@@ -180,13 +187,88 @@ def render(messages, effort, tools=None, images=None):
     return s
 
 
-def tokenize(text):
-    p = subprocess.run([TOKENIZE, "-m", A.model, "--ids", "--log-disable", "--stdin"], input=text, capture_output=True, text=True,
-                       env={"CUDA_VISIBLE_DEVICES": ""}, timeout=600)
+def tokenize_once(text):
+    # --no-escape: the prompt as written. Without it llama-tokenize turns a written \n, \t or \\ (two characters, as in
+    # source code) into the character itself, and the model read code with broken string literals (so until p20)
+    p = subprocess.run([TOKENIZE, "-m", A.model, "--ids", "--log-disable", "--no-escape", "--stdin"], input=text,
+                       capture_output=True, text=True, env={"CUDA_VISIBLE_DEVICES": ""}, timeout=600)
     line = [x for x in p.stdout.splitlines() if x.startswith("[")]
     if not line:
         raise RuntimeError("llama-tokenize: " + p.stderr[-300:])
     return json.loads(line[-1])
+
+
+class Tokens:
+    """The prompt's tokens and where its pieces start. A piece starts at a role token (<|message_user|> and the like; special
+    tokens, so the pieces tokenize one by one exactly as in the whole text) and its tokens are cached by its text: a
+    conversation's next request tokenizes only its new pieces, all of them in one call. ink2_tok (--tok) stays up; without it,
+    or when it fails, llama-tokenize runs once a call (0.9 s to start)."""
+    ROLE = re.compile(r"(?=<\|message_(?:user|model|system|tool)\|>)")
+    MAX_CHARS = 64 << 20
+
+    def __init__(self):
+        self.proc, self.lock, self.cache, self.chars, self.role_ids = None, threading.Lock(), {}, 0, None
+
+    def raw(self, text):
+        if A.tok:
+            data = text.encode("utf-8")
+            try:
+                if self.proc is None or self.proc.poll() is not None:
+                    env = dict(os.environ, CUDA_VISIBLE_DEVICES="")   # the cards are the engine's
+                    self.proc = subprocess.Popen([A.tok, "--model", A.model], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                                 stderr=subprocess.DEVNULL, env=env)
+                    if not self.proc.stdout.readline().startswith(b"ready"):
+                        raise RuntimeError("ink2_tok did not start")
+                self.proc.stdin.write(str(len(data)).encode() + b"\n" + data)
+                self.proc.stdin.flush()
+                ans = self.proc.stdout.readline().split()
+                if not ans or ans[0] != b"ok":
+                    raise RuntimeError("ink2_tok: " + b" ".join(ans[:8]).decode("utf-8", "replace"))
+                return [int(x) for x in ans[1:]]
+            except Exception as ex:   # the next call starts it again; this one goes the old way
+                print(f"ink2_server: ink2_tok: {ex}", file=sys.stderr, flush=True)
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+                self.proc = None
+        return tokenize_once(text)
+
+    def ids(self, text):
+        """(tokens, token offsets of the pieces)"""
+        with self.lock:
+            if self.role_ids is None:
+                self.role_ids = {self.raw(f"<|message_{r}|>")[-1] for r in ("user", "model", "system", "tool")}
+            pieces = [x for x in self.ROLE.split(text) if x]
+            if not pieces or not self.ROLE.match(pieces[0]):   # text before the first message: no pieces
+                return self.raw(text), []
+            new = [x for x in dict.fromkeys(pieces) if x not in self.cache]
+            if new:
+                got = self.raw("".join(new))
+                at = [i for i, t in enumerate(got) if t in self.role_ids]
+                if len(at) == len(new) and at[0] == 0:
+                    parts = [got[a:b] for a, b in zip(at, at[1:] + [len(got)])]
+                else:   # a BOS, or a role token the split did not see: piece by piece
+                    parts = [self.raw(x) for x in new]
+                    if any(not q or q[0] not in self.role_ids for q in parts):
+                        return self.raw(text), []
+                if self.chars > self.MAX_CHARS:
+                    self.cache, self.chars = {}, 0
+                for x, q in zip(new, parts):
+                    self.cache[x] = q
+                    self.chars += len(x)
+            out, starts = [], []
+            for x in pieces:
+                starts.append(len(out))
+                out += self.cache[x]
+            return out, starts
+
+
+TOKENS = Tokens()
+
+
+def tokenize(text):
+    return TOKENS.ids(text)[0]
 
 
 VIS = {"proc": None, "lock": threading.Lock(), "cache": {}}
@@ -231,8 +313,9 @@ def encode_image(src):
     return h, str(rows), n
 
 
-def place_images(ids, images):
-    """ids with every placeholder replaced by its picture's rows, and the engine's image fields."""
+def place_images(ids, images, starts=None):
+    """ids with every placeholder replaced by its picture's rows, and the engine's image fields; starts (the pieces' offsets)
+    move with the rows put in before them."""
     if not images:
         return ids, {}
     ph = [i for i, t in enumerate(ids) if t == T_IMGPH]
@@ -251,6 +334,9 @@ def place_images(ids, images):
         off += n
         last = at + 1
     out += ids[last:]
+    if starts:
+        grow = [(at, n - 1) for (_, _, n), at in zip(enc, ph)]
+        starts[:] = [x + sum(g for at, g in grow if at < x) for x in starts]
     comb = IMG_DIR / ("request-" + hashlib.sha256("".join(h for h, _, _ in enc).encode()).hexdigest()[:16] + ".f32")
     if not comb.exists():
         with open(comb, "wb") as w:
@@ -413,6 +499,7 @@ def reply(ids, mx, req, on_part=None, mode="c"):
         if final is not None:
             if tot["cached"] is None:
                 tot["cached"] = final.get("cached", 0)
+                tot["back"], tot["ckpts"] = final.get("back"), final.get("ckpts")
             for k in ("read_s", "write_s", "drafted", "accepted"):
                 tot[k] += final.get(k, 0)
         elif keep is None:
@@ -522,8 +609,9 @@ class H(BaseHTTPRequestHandler):
         try:
             tools = body.get("tools") if body.get("tool_choice") != "none" else None
             images = []
-            ids = tokenize(render(body.get("messages") or [], effort_of(body), tools, images))
-            ids, img_req = place_images(ids, images)
+            ids, starts = TOKENS.ids(render(body.get("messages") or [], effort_of(body), tools, images))
+            t_tok = time.time() - t0
+            ids, img_req = place_images(ids, images, starts)
         except Exception as ex:
             return self._send(500, {"error": str(ex)})
         if len(ids) >= A.ctx - 1:
@@ -531,7 +619,8 @@ class H(BaseHTTPRequestHandler):
         mx = int(body.get("max_tokens") or body.get("max_completion_tokens") or 0) or (A.ctx - len(ids) - 1)
         mx = max(1, min(mx, A.ctx - len(ids) - 1))
         stream = bool(body.get("stream"))
-        req = {"stop": [EOS], "mtp": int(body.get("mtp", MTP)), "lookup": int(body.get("lookup", LOOKUP)), **img_req}
+        req = {"stop": [EOS], "mtp": int(body.get("mtp", MTP)), "lookup": int(body.get("lookup", LOOKUP)), **img_req,
+               "ckpt": starts[-4096:]}
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(t0)
         if not LOCK.acquire(timeout=3600):
@@ -572,6 +661,8 @@ class H(BaseHTTPRequestHandler):
             n = len(out)
             STATE["tokens_out"] += n
             w = tot["write_s"] or 1e-9
+            print(f"ink2_server: request: prompt tokens / cached / back to checkpoint / checkpoints, tokenize / read / written / write {len(ids)} / {tot['cached']} / {tot.get('back')} / {tot.get('ckpts')}, "
+                  f"{1000 * t_tok:.0f} ms / {tot['read_s']:.2f} s / {n} / {w:.2f} s", file=sys.stderr, flush=True)
             if not stream:
                 think, content = [], []
                 for kind, val in Parts().feed(out):

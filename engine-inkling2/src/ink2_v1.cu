@@ -7,6 +7,7 @@
 //   ink2_v1 --model M.gguf --tokens zetoni.bin [--gen N] [--dump DIR] [--ctx C]
 //   ink2_v1 --model M.gguf --serve SOCKET [--ctx C]
 #include "ink2_kern.cuh"
+#include "ink2_fuse.cuh"
 #include "ink2_pf.cuh"
 #include "ink2_dspark.cuh"
 #include "gguf_min.hpp"
@@ -21,6 +22,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <csignal>
 #include <cstring>
 #include <functional>
@@ -115,6 +117,7 @@ struct Card {
     int nb = 0, nparts_max = 0;
     unsigned* dtok = nullptr;                   // p4c: forwards so far (device), the exchanges' sequence numbers
     float *stbuf = nullptr, *stbak = nullptr, *hist = nullptr;   // p5a: conv states, their snapshot, a window's inputs
+    float* g64x = nullptr;   // p22: the three loop controllers' down outputs [3][MAXT][RANK]
     float* stsnap = nullptr;   // p8: the conv states before the last prompt token (the next request of a conversation goes back there)
     bool keep_hist = false;
     unsigned xidx = 0;                          // p4c: the next exchange of this forward
@@ -140,6 +143,10 @@ struct Engine {
     bool mt_off = getenv("INK2_MT") == nullptr;   // p5b: windows read each picked expert once (INK2_MT=1; measured 21. 11.: slower, off)
     bool attn_old = getenv("INK2_ATTN_OLD") != nullptr;   // p4f off: the attention by query head (k_attn_part)
     bool fuse = getenv("INK2_FUSE_OFF") == nullptr;   // p4e: fused writing kernels at T = 1
+    // p22: merged launches (ink2_fuse.cuh), a mask: 1 mixes, 2 controllers, 4 norms + matrices, 8 routing. Measured 22. 11. against 0, the
+    // same bits each: 1: +0.1 %; 2: single tokens +2.7 %, windows +1.2..1.5 %; 4: +7.1 % / +0.2..1.5 %; 8: +0.1 % / -1.8..-2.7 % (the last
+    // block routes a window's rows one after another); 15: +9.3 % / -2.0..+0.2 %. Default 6
+    int fuse2 = getenv("INK2_FUSE2") ? atoi(getenv("INK2_FUSE2")) : 6;
     bool ilv = getenv("INK2_FP4_ILV") != nullptr;   // p4d off: NVFP4 experts interleaved as in the file (the older kernels need it)
     bool rows2 = getenv("INK2_ROWS2") != nullptr;   // p4b off: p4a's NVFP4 writing kernel
     bool gemm5 = getenv("INK2_GEMM5") ? atoi(getenv("INK2_GEMM5")) != 0 : true;
@@ -152,11 +159,11 @@ struct Engine {
     float* h_tau = nullptr;
     bool graf = getenv("INK2_GRAF") != nullptr;   // p4c: the writing path's forward as a CUDA graph (measured 21. 11.: no gain, off)
     int pfc = 2048;                           // p3: INK2_PF_CHUNK, tokens a reading chunk
-    int pf_min = MAXT + 1;                    // p3: INK2_PF_MIN, shortest piece that goes the reading path (INK2_PF_OFF: never)
+    int pf_min = 41;                          // p3: INK2_PF_MIN, shortest piece that goes the reading path (INK2_PF_OFF: never); p23: 41, was MAXT + 1
     std::atomic<unsigned> pf_rec[NC];         // p3: the exchange each card has recorded
     static constexpr int EB = 16, QS = 256;   // p3: experts dequantized at once; queries per attention block
     bool perm_on = getenv("INK2_PERM") ? atoi(getenv("INK2_PERM")) != 0 : false;   // p11: a window's expert jobs by expert (21. 11.: same speed, off)
-    int feed_t = getenv("INK2_FEED_T") ? std::max(1, std::min(MAXT, atoi(getenv("INK2_FEED_T")))) : MAXT;   // windows of the writing path when reading (test: 1 = token by token)
+    int feed_t = getenv("INK2_FEED_T") ? std::max(1, std::min(MAXT, atoi(getenv("INK2_FEED_T")))) : 8;   // p23: 8 rows (16 rows: 239 ms, 8 rows: 56 ms)   // windows of the writing path when reading (test: 1 = token by token)
     bool t1tt_on = getenv("INK2_T1TT") ? atoi(getenv("INK2_T1TT")) != 0 : true;   // p9: window GEMV with T at compile time
     bool ds_t1 = getenv("INK2_DS_T1") ? atoi(getenv("INK2_DS_T1")) != 0 : true;      // p9: the drafter's GEMV by gemv8_t1T
     bool pf_attb = getenv("INK2_PF_ATTB") ? atoi(getenv("INK2_PF_ATTB")) != 0 : true;   // p3f: window layers' attention in one batched call
@@ -175,6 +182,39 @@ struct Engine {
     int n_past = 0;
     int snap_n = -1;   // p8: tokens before the snapshot of the conv states (stsnap), -1 = none
     std::vector<int> processed;   // the tokens whose state the caches hold
+    // p21: checkpoints of the conversation, page-locked in RAM: the conv states and the last SWA rows of every window slot's ring
+    // (with the drafter's rings: their windows). A request goes back to the latest one its prompt still shares, however far the
+    // conversation went since: p8's one snapshot stood only at the prompt's end and died RING - SWA - MAXT tokens after it
+    struct Ckpt {
+        int pos = 0;
+        char* buf[NC] = {};
+    };
+    std::vector<Ckpt> ckpts;     // by position; all of them describe a prefix of `processed`
+    std::vector<Ckpt> ck_pool;   // buffers not in use
+    bool ck_on = getenv("INK2_CKPT") ? atoi(getenv("INK2_CKPT")) != 0 : true;
+    int ck_max = 0, ck_made = 0;   // INK2_CKPT_MB of RAM (16384) by both cards' buffers
+    int ck_gap = getenv("INK2_CKPT_GAP") ? atoi(getenv("INK2_CKPT_GAP")) : 4096;        // hinted checkpoints this far apart (the last hint always)
+    int ck_every = getenv("INK2_CKPT_EVERY") ? atoi(getenv("INK2_CKPT_EVERY")) : 16384;   // one at least every so many tokens of a long read
+    static constexpr int DS_TAIL = SWA + 1;   // the drafter's layers 0 and 2 see P - 1024 .. P
+    // p21b: conversations set aside in RAM (the cards hold one conversation's rows; a request of another one wiped it): the full
+    // slots' rows [0, the last checkpoint) of both cards, the tokens, the first and the last three checkpoints
+    struct Park {
+        std::vector<int> tok;
+        std::vector<Ckpt> cks;
+        char* kv[NC] = {};
+        size_t bytes = 0;
+        unsigned long long use = 0;
+    };
+    std::vector<Park> parks;
+    size_t park_bytes = 0, park_max = (size_t) (getenv("INK2_PARK_MB") ? std::max(0LL, atoll(getenv("INK2_PARK_MB"))) : 32768LL) << 20;
+    int park_min = getenv("INK2_PARK_MIN") ? atoi(getenv("INK2_PARK_MIN")) : 1024;   // fewer tokens than this are read again instead
+    static constexpr int PARK_CK = 4;
+    unsigned long long use_no = 0;
+    struct KvArr {
+        char* p;
+        size_t rb;
+        int r0, r1;   // the positions it holds: row q at index q - r0
+    };
     // dumps (card 0): per slot l_out, attn_out, ffn_out rows of every window
     bool dumping = false;
     std::vector<std::vector<float>> d_lout, d_aout, d_fout;
@@ -516,6 +556,7 @@ struct Engine {
         for (int i = 0; i < 4; ++i) K.XC[i] = dev(K, TN);
         K.xm = dev(K, 2 * TN);
         K.g64 = dev(K, (size_t) MAXT * RANK);
+        K.g64x = dev(K, (size_t) 3 * MAXT * RANK);
         K.gp = dev(K, TN);
         K.fpp = dev(K, TN);
         K.NQ = dev(K, TN);
@@ -655,6 +696,12 @@ struct Engine {
             CK(cudaHostAlloc((void**) &h_ami_pinned, NC * 4, cudaHostAllocPortable));
             CK(cudaHostAlloc((void**) &h_prev_pinned, NC * 4, cudaHostAllocPortable));
             ds_on = true;
+        }
+        if (ck_on) {   // p21
+            const long long mb = getenv("INK2_CKPT_MB") ? atoll(getenv("INK2_CKPT_MB")) : 24576;
+            ck_max = (int) std::max(0LL, mb * 1048576 / (long long) (NC * ck_bytes()));
+            std::fprintf(stderr, "ink2_v1: kontrolne tocke pogovora v RAM-u: do %d po %.0f MiB (obe kartici); odlozeni pogovori do %zu MiB\n",
+                         ck_max, NC * ck_bytes() / 1048576.0, park_max >> 20);
         }
         if (getenv("INK2_VRAM_LOG"))
             for (auto& [k, v] : vtag[0]) std::fprintf(stderr, "ink2_v1: VRAM %-20s %8.1f / %8.1f MiB\n", k.c_str(), v / 1048576.0, vtag[1][k] / 1048576.0);
@@ -808,16 +855,43 @@ struct Engine {
         const LW& L = K.L[p];
         const int c = K.c, T_N = T * N;
         const float* xin[3] = {K.cur, K.cur, K.cur};
-        if (L.attn_rq) {
-            mix(K, states(K, K.cur), L.attn_rq, L.nrq, K.X3, T);
-            for (int j = 0; j < 3; ++j) xin[j] = K.X3 + (size_t) (L.full ? j : 0) * T_N;
-        }
-        if (loop) {
+        const int f2 = fuse && !stare && !dumping ? fuse2 : 0;   // p22: ink2_fuse.cuh's merged launches (a mask)
+        if ((f2 & 1) && L.attn_rq && loop) {   // p22: the layer's depth mix and the loop messages' in one launch
             States S{};
             S.p[0] = K.bankS;
             S.p[1] = K.bankO;
             S.n = 2;
-            mix(K, S, L.msg_q, 4, K.MS, T);
+            k_mix2x<<<dim3(T, 2), 768, 0, K.st>>>(states(K, K.cur), L.attn_rq, L.nrq, K.X3, S, L.msg_q, 4, K.MS);
+            for (int j = 0; j < 3; ++j) xin[j] = K.X3 + (size_t) (L.full ? j : 0) * T_N;
+        } else {
+            if (L.attn_rq) {
+                mix(K, states(K, K.cur), L.attn_rq, L.nrq, K.X3, T);
+                for (int j = 0; j < 3; ++j) xin[j] = K.X3 + (size_t) (L.full ? j : 0) * T_N;
+            }
+            if (loop) {
+                States S{};
+                S.p[0] = K.bankS;
+                S.p[1] = K.bankO;
+                S.n = 2;
+                mix(K, S, L.msg_q, 4, K.MS, T);
+            }
+        }
+        if (loop && (f2 & 2)) {   // p22: the three controllers' down projections in one launch, their gains and forgets in another
+            Ctl3 A{};
+            for (int j = 0; j < 3; ++j) {
+                A.W[j] = L.c_down[j];
+                A.Wg[j] = L.c_gain[j];
+                A.Wf[j] = L.c_forget[j];
+                A.x[j] = xin[j];
+                A.m[j] = K.MS + (size_t) j * T_N;
+                A.g[j] = K.g64x + (size_t) j * MAXT * RANK;
+                A.y[j] = K.XC[j];
+            }
+            if (T == 1) k_ctrl_down1x<<<dim3(RANK, 3), 256, 0, K.st>>>(A);
+            else k_ctrl_downTx<<<dim3(RANK, T, 3), 256, 0, K.st>>>(A);
+            k_ctrl_gfx<<<dim3(N / 8, 3), 256, 0, K.st>>>(A, T);
+            for (int j = 0; j < 3; ++j) xin[j] = K.XC[j];
+        } else if (loop) {
             for (int j = 0; j < 3; ++j) {
                 control(K, L, j, xin[j], K.MS + (size_t) j * T_N, K.XC[j], T);
                 xin[j] = K.XC[j];
@@ -828,15 +902,85 @@ struct Engine {
             rms(K, xin[0], L.attn_norm, K.NQ, T, eps);
             nq = nk = nv = K.NQ;
         } else {
-            rms(K, xin[0], L.full ? L.q_norm : L.attn_norm, K.NQ, T, eps);
-            rms(K, xin[1], L.full ? L.k_norm : L.attn_norm, K.NK, T, eps);
-            rms(K, xin[2], L.full ? L.v_norm : L.attn_norm, K.NV, T, eps);
+            if (f2 & 4) {   // p22: the three norms in one launch
+                k_rms3<<<dim3(T, 3), 256, 0, K.st>>>(xin[0], xin[1], xin[2], L.full ? L.q_norm : L.attn_norm, L.full ? L.k_norm : L.attn_norm,
+                                                     L.full ? L.v_norm : L.attn_norm, K.NQ, K.NK, K.NV, eps);
+            } else {
+                rms(K, xin[0], L.full ? L.q_norm : L.attn_norm, K.NQ, T, eps);
+                rms(K, xin[1], L.full ? L.k_norm : L.attn_norm, K.NK, T, eps);
+                rms(K, xin[2], L.full ? L.v_norm : L.attn_norm, K.NV, T, eps);
+            }
             nq = K.NQ;
             nk = K.NK;
             nv = K.NV;
         }
         const bool fzT = fuse && !stare && !dumping;   // p6b: the fused path for any T <= MAXT
-        if (T > 1 && fzT) {   // p6b: the matrices of one input in one launch, T rows
+        const bool g3 = (f2 & 4) && nq != nk && L.cat.cols == N && (T == 1 || (t1tt_on && !win_seg));   // p22: the three inputs' matrices in one launch
+        if (g3) {
+            const int nqr = 2 * QC + NH_C * NREL + NH_C, nkr = KVC + (L.full ? NKV_C * NCONV : 0);
+            typedef std::vector<std::pair<int, float*>> Outs;
+            const Outs oq = {{QC, K.q}, {QC, K.gate}, {NH_C * NREL, K.r}, {NH_C, K.sink}};
+            Outs ok = {{KVC, K.k}}, ov = {{KVC, K.v}};
+            if (L.full) {
+                ok.push_back({NKV_C * NCONV, K.dk});
+                ov.push_back({NKV_C * NCONV, K.dv});
+            }
+            struct PD {
+                Mat m;
+                const float* x;
+                const Outs* out;
+            };
+            const PD pd[3] = {{rows_of(L.cat, 0, nqr), nq, &oq}, {rows_of(L.cat, nqr, nkr), nk, &ok}, {rows_of(L.cat, nqr + nkr, nkr), nv, &ov}};
+            GParts1 A1{};
+            GPartsT AT{};
+            const int nch = (N + 511) / 512;
+            int b0 = 0, p0 = 0, c0 = 0;
+            for (int i = 0; i < 3; ++i) {
+                GPart g{};
+                g.q = pd[i].m.q;
+                g.d = (const __half*) pd[i].m.d;
+                g.x = pd[i].x;
+                g.rows = pd[i].m.rows;
+                g.blocks = (g.rows + G1_BR - 1) / G1_BR;
+                g.S = g.blocks >= 112 ? 1 : std::min(nch, (112 + g.blocks - 1) / g.blocks);   // gemv8_t1's split
+                g.b0 = b0;
+                g.p0 = p0;
+                g.c0 = c0;
+                b0 += g.blocks * g.S;
+                p0 += g.S * T * g.rows;
+                c0 += g.blocks;
+                A1.p[i] = AT.p[i] = g;
+                int r = 0;
+                for (const auto& [n, d] : *pd[i].out) {
+                    Segs& s1 = A1.sg[i];
+                    SegsT& sT = AT.sg[i];
+                    s1.r0[s1.n] = sT.r0[sT.n] = r;
+                    sT.ld[sT.n] = n;
+                    s1.dst[s1.n++] = sT.dst[sT.n++] = d;
+                    r += n;
+                }
+            }
+            A1.n = AT.n = 3;
+            if (p0 > GM_PART || c0 > 4096) throw std::runtime_error("k_gemv8_p: parts too big");
+            switch (T) {
+                case 1: k_gemv8_p1<<<b0, 256, 0, K.st>>>(A1); break;
+                case 2: k_gemv8_pT<2><<<b0, 256, 0, K.st>>>(AT); break;
+                case 3: k_gemv8_pT<3><<<b0, 256, 0, K.st>>>(AT); break;
+                case 4: k_gemv8_pT<4><<<b0, 256, 0, K.st>>>(AT); break;
+                case 5: k_gemv8_pT<5><<<b0, 256, 0, K.st>>>(AT); break;
+                case 6: k_gemv8_pT<6><<<b0, 256, 0, K.st>>>(AT); break;
+                case 7: k_gemv8_pT<7><<<b0, 256, 0, K.st>>>(AT); break;
+                case 8: k_gemv8_pT<8><<<b0, 256, 0, K.st>>>(AT); break;
+                case 9: k_gemv8_pT<9><<<b0, 256, 0, K.st>>>(AT); break;
+                case 10: k_gemv8_pT<10><<<b0, 256, 0, K.st>>>(AT); break;
+                case 11: k_gemv8_pT<11><<<b0, 256, 0, K.st>>>(AT); break;
+                case 12: k_gemv8_pT<12><<<b0, 256, 0, K.st>>>(AT); break;
+                case 13: k_gemv8_pT<13><<<b0, 256, 0, K.st>>>(AT); break;
+                case 14: k_gemv8_pT<14><<<b0, 256, 0, K.st>>>(AT); break;
+                case 15: k_gemv8_pT<15><<<b0, 256, 0, K.st>>>(AT); break;
+                default: k_gemv8_pT<16><<<b0, 256, 0, K.st>>>(AT); break;
+            }
+        } else if (T > 1 && fzT) {   // p6b: the matrices of one input in one launch, T rows
             const int nqr = 2 * QC + NH_C * NREL + NH_C, nkr = KVC + (L.full ? NKV_C * NCONV : 0);
             auto st = [&](std::initializer_list<std::pair<int, float*>> l) {
                 SegsT sg{};
@@ -994,9 +1138,12 @@ struct Engine {
             f = K.F2;
         }
         rms(K, f, L.ffn_norm, K.FN, T, eps);
-        if (stare) gemv32(K, L.gate_inp, NE, N, K.FN, N, K.lg, NE, T);
+        const bool f2r = (f2 & 8) && fz;   // p22: the router's rows and the routing in one launch
+        if (f2r) k_route2<<<NE, 256, 0, K.st>>>(L.gate_inp, K.FN, K.lg, T, L.probs_b, wscale, K.topi, K.topw, K.jobs);
+        else if (stare) gemv32(K, L.gate_inp, NE, N, K.FN, N, K.lg, NE, T);
         else k_gemv32_rows<<<NE, 256, 0, K.st>>>(L.gate_inp, N, K.FN, N, K.lg, NE, T);
-        if (fz) {
+        if (f2r) {
+        } else if (fz) {
             k_route_jobs<<<T, NE, 0, K.st>>>(K.lg, L.probs_b, wscale, K.topi, K.topw, K.jobs);
         } else {
             k_route<<<T, NE, 0, K.st>>>(K.lg, L.probs_b, wscale, K.topi, K.topw);
@@ -1912,7 +2059,7 @@ struct Engine {
                 processed.insert(processed.end(), ids + i, ids + i + T);
                 continue;
             }
-            T = std::min(feed_t, n - i);
+            T = std::min(all_rows ? MAXT : feed_t, n - i);   // p23b: a draft window (verify, --logits-all) is ONE window of up to MAXT rows; feed_t is for reading short pieces only
             if (n_past + T > ctx) throw std::runtime_error("context full");
             for (int t = 0; t < T; ++t) {
                 h_raw[t] = embed(t, ids[i + t]);
@@ -1957,10 +2104,232 @@ struct Engine {
         processed.resize(snap_n);
         return true;
     }
+    // p21: the checkpoints
+    bool win_slot(int s) const { return !cards[0].L[s < NPHYS ? s : LS + (s - NPHYS) % NCORE].full; }
+    size_t ck_bytes() const {
+        size_t b = (size_t) NSLOT * SLOTST * 4;
+        for (int s = 0; s < NSLOT; ++s)
+            if (win_slot(s)) b += (size_t) 2 * SWA * KVC * 2;
+        if (ds_on && ds_ring) b += (size_t) (2 * DS_TAIL + DS_WIN1) * NKVD * 2 * 2;
+        return b;
+    }
+    // card c's state at position pos to RAM (save) or back: the conv states, then of every cache kept by position modulo a ring
+    // the rows of positions [pos - W, pos) (the ones below 0 are skipped; they are never read unmasked)
+    void ck_copy(int c, char* h, int pos, bool save) {
+        Card& K = cards[c];
+        CK(cudaSetDevice(K.dev));
+        auto mv = [&](void* d, char* hp, size_t n) {
+            CK(save ? cudaMemcpyAsync(hp, d, n, cudaMemcpyDeviceToHost, K.st) : cudaMemcpyAsync(d, hp, n, cudaMemcpyHostToDevice, K.st));
+        };
+        auto rows = [&](void* dev, int W, int ring, size_t rb) {
+            for (int q = std::max(0, pos - W); q < pos;) {
+                const int r = q % ring, n = std::min(pos - q, ring - r);
+                mv((char*) dev + (size_t) r * rb, h + (size_t) (q - (pos - W)) * rb, (size_t) n * rb);
+                q += n;
+            }
+            h += (size_t) W * rb;
+        };
+        mv(K.stbuf, h, (size_t) NSLOT * SLOTST * 4);
+        h += (size_t) NSLOT * SLOTST * 4;
+        for (int s = 0; s < NSLOT; ++s)
+            if (win_slot(s)) {
+                rows(K.kc[s], SWA, RING, (size_t) KVC * 2);
+                rows(K.vc[s], SWA, RING, (size_t) KVC * 2);
+            }
+        if (ds_on && ds_ring)
+            for (int il = 0; il < DSL; ++il) {
+                const int W = il == 1 ? DS_WIN1 : DS_TAIL, rg = il == 1 ? DS_RING1 : DS_RING;
+                rows(K.D.kc[il], W, rg, (size_t) NKVD * 2);
+                rows(K.D.vc[il], W, rg, (size_t) NKVD * 2);
+            }
+        CK(cudaStreamSynchronize(K.st));
+    }
+    // a checkpoint of the state now (n_past tokens). With no free buffer the closest pair gives up its later one (never the newest)
+    void ck_take() {
+        if (!ck_on || ck_max <= 0 || n_past <= 0) return;
+        const int pos = n_past;
+        auto by_pos = [](const Ckpt& a, int q) { return a.pos < q; };
+        auto it = std::lower_bound(ckpts.begin(), ckpts.end(), pos, by_pos);
+        Ckpt cp;   // (not `ck`: that is CK()'s function)
+        if (it != ckpts.end() && it->pos == pos) {
+            cp = *it;
+            ckpts.erase(it);
+        } else if (!ck_pool.empty()) {
+            cp = ck_pool.back();
+            ck_pool.pop_back();
+        } else if (ck_made < ck_max) {
+            for (int c = 0; c < NC; ++c) CK(cudaHostAlloc((void**) &cp.buf[c], ck_bytes(), cudaHostAllocPortable));
+            ++ck_made;
+        } else if (!parks.empty()) {   // p21b: the least recently used parked conversation gives one up (its last one last)
+            const size_t i = park_lru();
+            if (parks[i].cks.size() > 1) {
+                cp = parks[i].cks.front();
+                parks[i].cks.erase(parks[i].cks.begin());
+            } else {
+                park_drop(i);
+                if (ck_pool.empty()) return;
+                cp = ck_pool.back();
+                ck_pool.pop_back();
+            }
+        } else if (!ckpts.empty()) {
+            size_t v = 0;
+            int best = INT_MAX;
+            for (size_t i = 0; i + 1 < ckpts.size(); ++i) {
+                const int gap = ckpts[i].pos - (i ? ckpts[i - 1].pos : 0);
+                if (gap < best) {
+                    best = gap;
+                    v = i;
+                }
+            }
+            cp = ckpts[v];
+            ckpts.erase(ckpts.begin() + (long) v);
+        } else {
+            return;
+        }
+        cp.pos = pos;
+        both([&](int c) { ck_copy(c, cp.buf[c], pos, true); });
+        ckpts.insert(std::lower_bound(ckpts.begin(), ckpts.end(), pos, by_pos), cp);
+    }
+    // the latest checkpoint at or before limit becomes the state; later ones are dropped. -1: there is none (the caller starts over)
+    int ck_back(int limit) {
+        while (!ckpts.empty() && ckpts.back().pos > limit) {
+            ck_pool.push_back(ckpts.back());
+            ckpts.pop_back();
+        }
+        if (ckpts.empty() || (int) processed.size() < ckpts.back().pos) return -1;
+        const Ckpt cp = ckpts.back();
+        both([&](int c) { ck_copy(c, cp.buf[c], cp.pos, false); });
+        n_past = cp.pos;
+        processed.resize((size_t) cp.pos);
+        return cp.pos;
+    }
+    // p21b: parked conversations
+    static int ck_at(const std::vector<Ckpt>& v, int limit) {   // the latest checkpoint's position at or before limit; 0: none
+        int u = 0;
+        for (const Ckpt& k : v)
+            if (k.pos <= limit) u = std::max(u, k.pos);
+        return u;
+    }
+    // the arrays with card c's rows that are kept by position: the full slots' caches (f16; in the int8 mode rows from f0 on in
+    // int8 with their scales) and the drafter's caches when they are no rings
+    std::vector<KvArr> kv_arrays(int c) {
+        Card& K = cards[c];
+        std::vector<KvArr> a;
+        for (int s = 0; s < NSLOT; ++s) {
+            if (win_slot(s)) continue;
+            const KV8& q = K.q8[s];
+            const int fk = q.k ? q.f0 : ctx, fv = q.v ? q.f0 : ctx;
+            a.push_back({(char*) K.kc[s], (size_t) KVC * 2, 0, fk});
+            if (q.k) {
+                a.push_back({(char*) q.k, (size_t) KVC, fk, ctx});
+                a.push_back({(char*) q.ks, (size_t) KQN * 2, fk, ctx});
+            }
+            a.push_back({(char*) K.vc[s], (size_t) KVC * 2, 0, fv});
+            if (q.v) {
+                a.push_back({(char*) q.v, (size_t) KVC, fv, ctx});
+                a.push_back({(char*) q.vs, (size_t) KQN * 2, fv, ctx});
+            }
+        }
+        if (ds_on && !ds_ring)
+            for (int il = 0; il < DSL; ++il) {
+                a.push_back({(char*) K.D.kc[il], (size_t) NKVD * 2, 0, ctx});
+                a.push_back({(char*) K.D.vc[il], (size_t) NKVD * 2, 0, ctx});
+            }
+        return a;
+    }
+    static size_t kv_rows(const KvArr& x, int pos) { return (size_t) std::max(0, std::min(pos, x.r1) - x.r0); }
+    size_t kv_bytes(int c, int pos) {
+        size_t b = 0;
+        for (const KvArr& x : kv_arrays(c)) b += x.rb * kv_rows(x, pos);
+        return b;
+    }
+    // card c's rows of positions [0, upto) to RAM (save) or back; the RAM buffer is laid out for positions [0, lay)
+    void kv_copy(int c, char* h, int lay, int upto, bool save) {
+        Card& K = cards[c];
+        CK(cudaSetDevice(K.dev));
+        CK(cudaStreamSynchronize(K.st));
+        for (const KvArr& x : kv_arrays(c)) {
+            const size_t n = x.rb * kv_rows(x, std::min(upto, lay));
+            if (n) CK(save ? cudaMemcpy(h, x.p, n, cudaMemcpyDeviceToHost) : cudaMemcpy(x.p, h, n, cudaMemcpyHostToDevice));
+            h += x.rb * kv_rows(x, lay);
+        }
+    }
+    size_t park_lru() const {
+        size_t v = 0;
+        for (size_t i = 1; i < parks.size(); ++i)
+            if (parks[i].use < parks[v].use) v = i;
+        return v;
+    }
+    void park_drop(size_t i) {
+        for (int c = 0; c < NC; ++c) std::free(parks[i].kv[c]);
+        for (const Ckpt& k : parks[i].cks) ck_pool.push_back(k);
+        park_bytes -= parks[i].bytes;
+        parks.erase(parks.begin() + (long) i);
+    }
+    // the conversation on the cards into RAM: its rows up to its last checkpoint, and the checkpoints after `above` (the ones up
+    // to there stay: the request goes back to one of them). False: too short, or more than the room there is
+    bool park_live(int above) {
+        if (park_max == 0 || ckpts.empty()) return false;
+        const int pos = ckpts.back().pos;
+        if (pos - above < park_min || (int) processed.size() < pos) return false;
+        size_t need[NC], bytes = 0;
+        for (int c = 0; c < NC; ++c) bytes += need[c] = kv_bytes(c, pos);
+        if (bytes > park_max) return false;
+        while (park_bytes + bytes > park_max && !parks.empty()) park_drop(park_lru());
+        Park pk;
+        for (int c = 0; c < NC; ++c)
+            if (!(pk.kv[c] = (char*) std::malloc(need[c]))) {
+                for (int d = 0; d < c; ++d) std::free(pk.kv[d]);
+                return false;
+            }
+        both([&](int c) { kv_copy(c, pk.kv[c], pos, pos, true); });
+        pk.tok.assign(processed.begin(), processed.begin() + pos);
+        std::vector<Ckpt> mine;
+        while (!ckpts.empty() && ckpts.back().pos > above) {
+            mine.insert(mine.begin(), ckpts.back());
+            ckpts.pop_back();
+        }
+        for (size_t i = 0; i < mine.size(); ++i)   // its first and its last PARK_CK - 1
+            (i == 0 || i + (PARK_CK - 1) >= mine.size() ? pk.cks : ck_pool).push_back(mine[i]);
+        pk.bytes = bytes;
+        pk.use = ++use_no;
+        park_bytes += bytes;
+        parks.push_back(pk);
+        return true;
+    }
+    // parked conversation i onto the cards at its checkpoint u (the caller parked or gave up the one that was there). whole: the
+    // prompt goes on from its end, so it moves back; else it stays parked and the cards get a copy of its rows up to u
+    void park_load(size_t i, int u, bool whole) {
+        for (const Ckpt& k : ckpts) ck_pool.push_back(k);
+        ckpts.clear();
+        const int lay = (int) parks[i].tok.size();
+        const Park pk = parks[i];
+        both([&](int c) { kv_copy(c, pk.kv[c], lay, u, false); });
+        if (whole) {
+            processed = pk.tok;
+            ckpts = pk.cks;
+            for (int c = 0; c < NC; ++c) std::free(pk.kv[c]);
+            park_bytes -= pk.bytes;
+            parks.erase(parks.begin() + (long) i);
+            if (ck_back(u) != u) throw std::runtime_error("park_load: no checkpoint");
+        } else {
+            const Ckpt* src = nullptr;
+            for (const Ckpt& k : pk.cks)
+                if (k.pos == u) src = &k;
+            if (!src) throw std::runtime_error("park_load: no checkpoint");
+            processed.assign(pk.tok.begin(), pk.tok.begin() + u);
+            both([&](int c) { ck_copy(c, src->buf[c], u, false); });
+            n_past = u;
+            parks[i].use = ++use_no;
+            ck_take();   // the cards' own checkpoint there
+        }
+    }
     void reset() {
         n_past = 0;
         snap_n = -1;
         processed.clear();
+        for (const Ckpt& k : ckpts) ck_pool.push_back(k);   // p21
+        ckpts.clear();
         both([&](int c) {
             Card& K = cards[c];
             CK(cudaSetDevice(K.dev));
@@ -2060,6 +2429,10 @@ struct Gen {
     std::vector<int> out;
     int cached = 0, drafted = 0, accepted = 0, rounds = 0;
     double read_s = 0, write_s = 0, draft_s = 0, verify_s = 0;   // p6: time in the drafter and in the target's windows
+    int park = 0;    // p21b: the request started from a parked conversation
+    int back = -1;   // p21: the checkpoint the request went back to (-1: none), the time taking new ones, a hash of the first logits
+    double ck_s = 0;
+    unsigned long long lh = 0, lh2 = 1469598103934665603ULL;   // p22b: lh2 over every step's logits (g_lhall)
 };
 // p5a: draft tokens from the history: the latest earlier place where the last 3 tokens (then 2) occurred, and what followed it
 // p7: the longest suffix of the history (3..NG_MAX tokens) that occurred before, at its most recent place, and the tokens that
@@ -2086,8 +2459,14 @@ static std::vector<int> ngram_draft(const std::vector<int>& h, int D, int* len =
     return d;
 }
 // p15: on_out(new tokens) after each step when given (the server streams them); false stops the generation (the client left)
+static bool g_lhall = false;   // p22b (tests): hash the logits of every step
+static unsigned long long fnv_row(unsigned long long h, const float* row) {
+    const unsigned* w = (const unsigned*) row;
+    for (int i = 0; i < NVU; ++i) h = (h ^ w[i]) * 1099511628211ULL;
+    return h;
+}
 static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::vector<int>& stop, int eos, int lookup = 0, int mtp = 0,
-                    const std::function<bool(const int*, int)>* on_out = nullptr) {
+                    const std::function<bool(const int*, int)>* on_out = nullptr, const std::vector<int>* hints = nullptr) {
     Gen g;
     size_t sent = 0;
     auto flush = [&]() {
@@ -2099,17 +2478,79 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
     static const bool snap = getenv("INK2_SNAP") ? atoi(getenv("INK2_SNAP")) != 0 : true;   // p8
     size_t same = 0;
     while (same < tok.size() && same < e.processed.size() && tok[same] == e.processed[same]) ++same;
-    if (same != e.processed.size() || same == tok.size()) {   // not a continuation (or nothing new to read)
-        if (!(snap && e.restore(same))) {   // p8: back to the last prompt's snapshot, or start over
-            e.reset();
-            same = 0;
-        }
-        same = std::min(same, e.processed.size());
-    }
-    g.cached = (int) same;
     const double t0 = now_s();
     const int n = (int) tok.size();
-    if (snap && n - (int) same >= 2) {   // p8: all but the last token, the snapshot, then the last token
+    if (same != e.processed.size() || same == tok.size()) {   // not a continuation (or nothing new to read)
+        if (e.ck_on) {   // p21: back to the latest checkpoint the prompt still shares (one token is always read), or start over
+            const int lim = (int) std::min(same, tok.size() - 1), u_live = Engine::ck_at(e.ckpts, lim);
+            const int last = e.ckpts.empty() ? 0 : e.ckpts.back().pos;
+            int best = -1, u_best = u_live;
+            size_t same_best = 0;
+            for (size_t i = 0; i < e.parks.size(); ++i) {   // p21b: a parked conversation that shares more
+                const std::vector<int>& pt = e.parks[i].tok;
+                size_t sp = 0;
+                while (sp < tok.size() && sp < pt.size() && tok[sp] == pt[sp]) ++sp;
+                const int u = Engine::ck_at(e.parks[i].cks, (int) std::min(sp, tok.size() - 1));
+                if (u > u_best) {
+                    u_best = u;
+                    best = (int) i;
+                    same_best = sp;
+                }
+            }
+            if (best >= 0) {
+                const std::vector<int> want = e.parks[(size_t) best].tok;   // park_live may drop others, never the newest... find it again
+                e.parks[(size_t) best].use = ++e.use_no;
+                e.park_live(0);
+                size_t at = e.parks.size();
+                for (size_t i = 0; i < e.parks.size(); ++i)
+                    if (e.parks[i].tok == want) at = i;
+                if (at < e.parks.size()) {
+                    e.park_load(at, u_best, same_best + 64 >= want.size());
+                    g.back = u_best;
+                    g.park = 1;
+                } else {
+                    e.reset();
+                }
+            } else {
+                if (u_live < last / 2) e.park_live(u_live);   // another conversation (less than half is shared): this one is set aside
+                g.back = e.ck_back(lim);
+                if (g.back < 0) e.reset();
+            }
+            same = (size_t) std::max(g.back, 0);
+        } else {
+            if (!(snap && e.restore(same))) {   // p8: back to the last prompt's snapshot, or start over
+                e.reset();
+                same = 0;
+            }
+            same = std::min(same, e.processed.size());
+        }
+    }
+    g.cached = (int) same;
+    if (e.ck_on) {
+        // p21: checkpoints on the way: at the hints (where the prompt's messages start: the last one always, others when ck_gap
+        // tokens past the stop before), every ck_every tokens of a long stretch, and before the last token (p8's place)
+        std::vector<int> cand, stops;
+        if (hints)
+            for (int h : *hints)
+                if (h > (int) same && h < n - 1) cand.push_back(h);
+        std::sort(cand.begin(), cand.end());
+        cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+        int at = (int) same;
+        for (size_t i = 0; i <= cand.size(); ++i) {
+            const int h = i < cand.size() ? cand[i] : n - 1;
+            while (h - at > e.ck_every) stops.push_back(at += e.ck_every);
+            if (h > at && (i + 1 >= cand.size() || h - at >= e.ck_gap)) stops.push_back(at = h);   // the last hint and n - 1 always
+        }
+        at = (int) same;
+        for (int st : stops) {
+            e.feed(tok.data() + at, st - at, false);
+            at = st;
+            const double tc = now_s();
+            e.ck_take();
+            g.ck_s += now_s() - tc;
+        }
+        e.feed(tok.data() + at, n - at, false);
+    } else if (snap && n - (int) same >= 2) {   // p8: all but the last token, the snapshot, then the last token
         e.feed(tok.data() + same, n - 1 - (int) same, false);
         e.snapshot();
         e.feed(tok.data() + n - 1, 1, false);
@@ -2117,6 +2558,12 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
         e.feed(tok.data() + same, n - (int) same, false);
     }
     g.read_s = now_s() - t0;
+    {   // p21: FNV-1a of the logits after the prompt (tests compare a read after going back with a read from the start)
+        unsigned long long h = 1469598103934665603ULL;
+        const unsigned* w = (const unsigned*) e.h_logits;
+        for (int i = 0; i < NVU; ++i) h = (h ^ w[i]) * 1099511628211ULL;
+        g.lh = h;
+    }
     const double t1 = now_s();
     int next = Engine::argmax(e.h_logits);
     auto ends = [&](int t) { return t == eos || std::find(stop.begin(), stop.end(), t) != stop.end(); };
@@ -2146,6 +2593,7 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
         if (d.empty()) {
             e.feed(&next, 1, false);
             next = Engine::argmax(e.h_logits);
+            if (g_lhall) g.lh2 = fnv_row(g.lh2, e.h_logits);
             continue;
         }
         std::vector<int> win{next};
@@ -2153,6 +2601,8 @@ static Gen generate(Engine& e, const std::vector<int>& tok, int max, const std::
         int nn = 0;
         const double tv = now_s();
         const int right = e.verify(win.data(), (int) win.size(), nn);
+        if (g_lhall)
+            for (int i = 0; i <= right; ++i) g.lh2 = fnv_row(g.lh2, e.h_logits + (size_t) i * NV);
         g.verify_s += now_s() - tv;
         ++g.rounds;
         g.drafted += (int) d.size();
@@ -2235,15 +2685,24 @@ static int serve(Engine& e, const std::string& path, int eos) {
                 return write(c, l.data(), l.size()) == (ssize_t) l.size();
             };
             const bool streaming = json_int(req, "stream", 0) != 0;
+            if (json_int(req, "forget", 0)) {   // p21b (tests): no conversation on the cards or in RAM
+                e.reset();
+                while (!e.parks.empty()) e.park_drop(e.parks.size() - 1);
+            }
+            g_lhall = json_int(req, "lhall", 0) != 0;
+            std::vector<int> hints;   // p21: where the prompt's messages start
+            for (long long x : json_ints(req, "ckpt")) hints.push_back((int) x);
             Gen g = generate(e, tok, max, stop, json_int(req, "noeos", 0) ? -1 : eos, (int) json_int(req, "lookup", 0),
-                             (int) json_int(req, "mtp", 0), streaming ? &out_line : nullptr);   // noeos: a fixed length
+                             (int) json_int(req, "mtp", 0), streaming ? &out_line : nullptr, &hints);   // noeos: a fixed length
             rep = "{\"tokens\": [";
             for (size_t i = 0; i < g.out.size(); ++i) rep += (i ? ", " : "") + std::to_string(g.out[i]);
-            char hd[512];
+            char hd[640];
             std::snprintf(hd, sizeof hd,
                           "], \"prompt_n\": %zu, \"cached\": %d, \"read_s\": %.4f, \"write_s\": %.4f, \"drafted\": %d, \"accepted\": %d, "
-                          "\"rounds\": %d, \"draft_s\": %.4f, \"verify_s\": %.4f}\n",
-                          tok.size(), g.cached, g.read_s, g.write_s, g.drafted, g.accepted, g.rounds, g.draft_s, g.verify_s);
+                          "\"rounds\": %d, \"draft_s\": %.4f, \"verify_s\": %.4f, \"back\": %d, \"ckpts\": %zu, \"ck_s\": %.4f, "
+                          "\"park\": %d, \"parks\": %zu, \"park_mb\": %zu, \"lh\": \"%016llx\", \"lh2\": \"%016llx\"}\n",
+                          tok.size(), g.cached, g.read_s, g.write_s, g.drafted, g.accepted, g.rounds, g.draft_s, g.verify_s, g.back,
+                          e.ckpts.size(), g.ck_s, g.park, e.parks.size(), e.park_bytes >> 20, g.lh, g.lh2);
             rep += hd;
         } catch (const std::exception& ex) {
             e.reset();

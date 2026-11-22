@@ -1,7 +1,8 @@
 #!/bin/bash
 # engine-inkling2/build.sh: builds the Inkling 2 Mini engine (build/ink2_v1, one CUDA program for two Tesla P100, sm_60) and,
 # from llama.cpp at commit 690b87d on the CPU (no CUDA in that build): llama-tokenize and gguf-py for the server's tokenizer,
-# libmtmd for build/ink2_vis, the picture encoder (the vision projector runs on the CPU; the cards are full of the engine).
+# libmtmd for build/ink2_vis, the picture encoder (the vision projector runs on the CPU; the cards are full of the engine),
+# and build/ink2_tok, the same tokenizer as a process that stays up (llama-tokenize takes 0.9 s to start for every request).
 # Needs CUDA 12.x (nvcc, cuBLAS), a host compiler nvcc accepts (CUDA 12.4: g++ <= 13; set HOST_CXX=g++-13 if your default is
 # newer), cmake, curl. About 1 minute for the engine and 3-5 for the llama.cpp part. A build from before pictures (no
 # libmtmd yet) gets only the missing part.
@@ -25,4 +26,7 @@ fi
 echo "== ink2_vis (pictures, $HOST_CXX)"
 "$HOST_CXX" -O2 -std=c++17 -I"$LB/include" -I"$LB/ggml/include" -I"$LB/tools/mtmd" -o "$B/ink2_vis" src/ink2_vis.cpp \
   -L"$LB/build/bin" -lmtmd -lllama -lggml -lggml-base -Wl,-rpath,"$LB/build/bin"
-echo "done: $B/ink2_v1, $B/ink2_vis, $LB/build/bin/llama-tokenize"
+echo "== ink2_tok (the tokenizer that stays up, $HOST_CXX)"
+"$HOST_CXX" -O2 -std=c++17 -I"$LB/include" -I"$LB/ggml/include" -o "$B/ink2_tok" src/ink2_tok.cpp \
+  -L"$LB/build/bin" -lllama -lggml -lggml-base -Wl,-rpath,"$LB/build/bin"
+echo "done: $B/ink2_v1, $B/ink2_vis, $B/ink2_tok, $LB/build/bin/llama-tokenize"
