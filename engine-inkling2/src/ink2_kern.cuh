@@ -323,14 +323,79 @@ __global__ void k_headnorm(float* v, int H, int D, const float* s, int h0, float
         if (i < D) x[i] = (a[k] * f) * tt;
     }
 }
-// K and V rows of T tokens into the slot's cache (f16): row = pos (full) or pos % RING (window)
-__global__ void k_kv_store(const float* k, const float* v, const int* pos, int ring, __half* kc, __half* vc, int T) {
+// p18: a full slot's cache in int8 (INK2_KV8, on by itself past 256k: the 512k profile). Rows from f0 on: values in groups of
+// KQG = 32 (one warp) with an f16 scale absmax / 127, k, v [row - f0][KVC], ks, vs [row - f0][KQN]; rows below f0 stay in the f16
+// cache (kc / vc), so a conversation shorter than f0 is computed as in the f16 mode. A null k or v = that part all in f16 (window
+// slots: both). rot: the slot's rows (int8 and f16) hold H x (orthonormal Walsh-Hadamard per head): q . k = Hq . Hk, and the
+// attention's sum of V rows is turned back with H.
+constexpr int KQG = 32, KQN = KVC / KQG;
+struct KV8 {
+    int8_t *k = nullptr, *v = nullptr;
+    __half *ks = nullptr, *vs = nullptr;
+    int f0 = 0, rot = 0;
+};
+__device__ __forceinline__ void kv8_put(int8_t* q, __half* s, size_t row, int c, float y) {   // all 32 lanes of group c / KQG
+    const __half hs = __float2half(warp_max(fabsf(y)) * (1.0f / 127.0f));
+    const float sc = __half2float(hs);
+    q[row * KVC + c] = sc > 0.0f ? (int8_t) __float2int_rn(fminf(fmaxf(y / sc, -127.0f), 127.0f)) : (int8_t) 0;
+    if ((c & (KQG - 1)) == 0) s[row * KQN + c / KQG] = hs;
+}
+__device__ __forceinline__ float kv8_get(const int8_t* q, const __half* s, size_t row, int c) {
+    return (float) q[row * KVC + c] * __half2float(s[row * KQN + c / KQG]);
+}
+// a K (isk) or V value of a row, int8 or f16 by the row (a warp puts 32 values of one row)
+__device__ __forceinline__ void kv_put(const KV8& q8, bool isk, __half* fc, size_t row, int c, float y) {
+    int8_t* q = isk ? q8.k : q8.v;
+    if (q && row >= (size_t) q8.f0) kv8_put(q, isk ? q8.ks : q8.vs, row - q8.f0, c, y);
+    else fc[row * KVC + c] = __float2half(y);
+}
+__device__ __forceinline__ float kv_get(const KV8& q8, bool isk, const __half* fc, size_t row, int c) {
+    const int8_t* q = isk ? q8.k : q8.v;
+    if (q && row >= (size_t) q8.f0) return kv8_get(q, isk ? q8.ks : q8.vs, row - q8.f0, c);
+    return __half2float(fc[row * KVC + c]);
+}
+// the orthonormal Walsh-Hadamard transform of a head's 128 values, a value a thread (all 128 threads of the block call it)
+__device__ __forceinline__ float fwht128(float x, float* sh) {
+    const int t = threadIdx.x & 127;
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+        const float o = __shfl_xor_sync(0xffffffffu, x, h);
+        x = (t & h) ? o - x : x + o;
+    }
+#pragma unroll
+    for (int h = 32; h < 128; h <<= 1) {
+        __syncthreads();
+        sh[t] = x;
+        __syncthreads();
+        const float o = sh[t ^ h];
+        x = (t & h) ? o - x : x + o;
+    }
+    __syncthreads();
+    return x * 0.088388347648318447f;   // 1 / sqrt(128)
+}
+// K and V rows of T tokens into the slot's cache (f16): row = pos (full) or pos % RING (window); p18: int8 when q8.k (a warp is
+// 32 values of one row: KVC is a multiple of 32)
+__global__ void k_kv_store(const float* k, const float* v, const int* pos, int ring, __half* kc, __half* vc, int T, KV8 q8) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * KVC) return;
     const int t = i / KVC, c = i % KVC;
     const size_t row = ring ? (size_t) (pos[t] % RING) : (size_t) pos[t];
-    kc[row * KVC + c] = __float2half(k[i]);
-    vc[row * KVC + c] = __float2half(v[i]);
+    kv_put(q8, true, kc, row, c, k[i]);
+    kv_put(q8, false, vc, row, c, v[i]);
+}
+// p18: k_kv_store of a full slot with q8.rot: a block a (head, token, K or V), the head turned by H before it is stored
+__global__ void __launch_bounds__(128) k_kv_store_rot(const float* k, const float* v, const int* pos, __half* kc, __half* vc, KV8 q8) {
+    __shared__ float sh[HD];
+    const int h = blockIdx.x, t = blockIdx.y, isv = blockIdx.z, c = h * HD + threadIdx.x;
+    const float y = fwht128((isv ? v : k)[(size_t) t * KVC + c], sh);
+    kv_put(q8, !isv, isv ? vc : kc, (size_t) pos[t], c, y);
+}
+// p18: x = H x for every head (blockIdx.x) of row blockIdx.y (rows of ld floats): the reading path's queries into the int8 cache's
+// basis and the attention's outputs back
+__global__ void __launch_bounds__(128) k_rot(float* x, int ld) {
+    __shared__ float sh[HD];
+    float* p = x + (size_t) blockIdx.y * ld + blockIdx.x * HD + threadIdx.x;
+    *p = fwht128(*p, sh);
 }
 // one block of 128 threads per (t, head, part of KC keys): scores q.k / sqrt(HD) + R.B[min(d, EXT)] - sink, masked to the
 // window or the causal range, their max m, sum l and the unnormalized sum of V rows; parts are joined by k_attn_comb
@@ -393,7 +458,8 @@ __global__ void __launch_bounds__(128) k_attn_part(const float* q, const float* 
     o[2 + threadIdx.x] = acc;
 }
 // the parts of (t, head) and the zero sink logit (ggml_soft_max_add_sinks: one more logit 0, not scaled), times sigmoid(gate)
-__global__ void __launch_bounds__(128) k_attn_comb(const float* part, int nparts, const float* gate, float* out) {
+__global__ void __launch_bounds__(128) k_attn_comb(const float* part, int nparts, const float* gate, float* out, int rot) {
+    __shared__ float sh[HD];
     const int t = blockIdx.y, h = blockIdx.x;
     const float* p = part + ((size_t) t * NH_C + h) * nparts * (HD + 2);
     float M = 0.0f;   // the sink
@@ -407,7 +473,9 @@ __global__ void __launch_bounds__(128) k_attn_comb(const float* part, int nparts
         acc += pi[2 + threadIdx.x] * f;
     }
     const size_t o = ((size_t) t * NH_C + h) * HD + threadIdx.x;
-    out[o] = (acc / L) * sigm(gate[o]);
+    float y = acc / L;
+    if (rot) y = fwht128(y, sh);   // p18: the sum of H v rows (a full slot with q8.rot) back with H, before the gate
+    out[o] = y * sigm(gate[o]);
 }
 
 // ------------------------------------------------------------------------------------------------ MoE
@@ -1051,15 +1119,17 @@ __global__ void __launch_bounds__(1024) k_xchg_conv(const float* y, const float*
 __global__ void __launch_bounds__(128) k_post_qkv(float* q, float* r, const float* k, const float* v, const float* dk, const float* dv,
                                                   float* sk, float* sv, const float* kw, const float* vw, const float* qclip, const float* rclip,
                                                   int h0, float qk_thr, float rel_thr, const float* tau, float eps, float kconv, const int* pos,
-                                                  int ring, __half* kc, __half* vc) {
-    __shared__ float red[32];
+                                                  int ring, __half* kc, __half* vc, KV8 q8) {
+    __shared__ float red[32], rsh[HD];
     const int b = blockIdx.x, i = threadIdx.x;
     const float tt = tau ? tau[0] : 1.0f;
     if (b < NH_C) {   // q head b
         float x = q[b * HD + i] * qclip[(size_t) (h0 + b) * HD + i];
         const float ss = block_sum(x * x, red);
         const float f = fminf(fmaxf(qk_thr / (sqrtf(ss) + 1e-6f), 0.0f), 1.0f);
-        q[b * HD + i] = (x * f) * tt;
+        float y = (x * f) * tt;
+        if (q8.rot) y = fwht128(y, rsh);   // p18: Hq . Hk = q . k
+        q[b * HD + i] = y;
         return;
     }
     if (b < 2 * NH_C) {   // r head b - NH_C (16 values)
@@ -1102,7 +1172,8 @@ __global__ void __launch_bounds__(128) k_post_qkv(float* q, float* r, const floa
         y = y * (1.0f / sqrtf(ss / HD + eps));
     }
     const size_t row = ring ? (size_t) (pos[0] % RING) : (size_t) pos[0];
-    (isk ? kc : vc)[row * KVC + c] = __float2half(y);
+    if (q8.rot) y = fwht128(y, rsh);   // p18 (the block is one head; a warp = 32 values of it)
+    kv_put(q8, isk, isk ? kc : vc, row, c, y);
 }
 
 // the loop controller's down projection with the rms of x and m inside (T = 1): a block per output row, [rms(x); rms(m)] . W[row]
@@ -1166,21 +1237,23 @@ __global__ void k_route_jobs(const float* logits, const float* bias, float wscal
 // (K and V rows read once); 8 lanes a key (16 dims each, two 16-byte loads), 4 keys a warp at a time, the 3 dots reduced over the 8
 // lanes; scores q.k / sqrt(HD) + R.B[min(d, EXT)] - sink (one lane a key adds the bias); then each head's max, exp and sum, and P.V
 // with a thread a dimension. The parts go to k_attn_comb in its layout ([t = 0][q head][part]).
+// p18: KCB keys a block (64; 128 past half of a 512k context, where K.part holds half the parts) and Q8 = the int8 cache (q8)
 constexpr int KC2 = 64, GQ = NH / NKV;
+template <int KCB, bool Q8>
 __global__ void __launch_bounds__(128) k_attn_dec(const float* q, const float* R, const float* B, const float* sink, const __half* kc,
-                                                  const __half* vc, const int* pos, int window, float* part, int nparts) {
+                                                  const __half* vc, const int* pos, int window, float* part, int nparts, KV8 q8, int poff) {
     __shared__ float qs[GQ][HD];
     __shared__ float rs[GQ][NREL];
-    __shared__ float sc[GQ][KC2];
+    __shared__ float sc[GQ][KCB];
     __shared__ float red[GQ][4];
-    const int g = blockIdx.y, p = blockIdx.x, tid = threadIdx.x, t = blockIdx.z;   // p5a: token t of a window (grid z)
+    const int g = blockIdx.y, p = blockIdx.x + poff, tid = threadIdx.x, t = blockIdx.z;   // p5a: token t of a window (grid z); p18: parts from poff
     const int P = pos[t];
     q += (size_t) t * QC;
     R += (size_t) t * NH_C * NREL;
     sink += t * NH_C;
     part += (size_t) t * NH_C * nparts * (HD + 2);
     const int lo = window ? max(0, P - (SWA - 1)) : 0, hi = P + 1;
-    const int j0 = lo + p * KC2, j1 = min(hi, j0 + KC2);
+    const int j0 = lo + p * KCB, j1 = min(hi, j0 + KCB);
     if (j0 >= hi) {
         for (int hh = 0; hh < GQ; ++hh) {
             float* o = part + ((size_t) (g * GQ + hh) * nparts + p) * (HD + 2);
@@ -1189,7 +1262,7 @@ __global__ void __launch_bounds__(128) k_attn_dec(const float* q, const float* R
         }
         return;
     }
-    for (int hh = 0; hh < GQ; ++hh) qs[hh][tid] = q[(g * GQ + hh) * HD + tid];
+    for (int hh = 0; hh < GQ; ++hh) qs[hh][tid] = q[(g * GQ + hh) * HD + tid];   // p18 rot: q is H q already (post_qkv)
     if (tid < GQ * NREL) rs[tid / NREL][tid % NREL] = R[(g * GQ + tid / NREL) * NREL + tid % NREL];
     __syncthreads();
     const int warp = tid >> 5, lane = tid & 31, sub = lane >> 3, l8 = lane & 7;
@@ -1205,19 +1278,31 @@ __global__ void __launch_bounds__(128) k_attn_dec(const float* q, const float* R
         const bool ok = jj < n;
         const int j = j0 + (ok ? jj : 0);
         const size_t row = window ? (size_t) (j % RING) : (size_t) j;
-        const uint4* kr = (const uint4*) (kc + row * KVC + g * HD + l8 * 16);
-        uint4 a = make_uint4(0, 0, 0, 0), b = make_uint4(0, 0, 0, 0);
-        if (ok) {
-            a = __ldg(kr);
-            b = __ldg(kr + 1);
-        }
-        const __half2* h2a = (const __half2*) &a;
-        const __half2* h2b = (const __half2*) &b;
-        float kf[16];
+        float kf[16], ksc = 1.0f;
+        if (Q8 && q8.k && row >= (size_t) q8.f0) {   // p18: the lane's 16 values (one 16-byte load) lie in one group of 32
+            uint4 a = make_uint4(0, 0, 0, 0);
+            if (ok) {
+                const size_t r8 = row - q8.f0;
+                a = __ldg((const uint4*) (q8.k + r8 * KVC + g * HD + l8 * 16));
+                ksc = __half2float(q8.ks[r8 * KQN + (g * HD + l8 * 16) / KQG]);
+            }
+            const int8_t* b8 = (const int8_t*) &a;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float2 fa = __half22float2(h2a[i]), fb = __half22float2(h2b[i]);
-            kf[2 * i] = fa.x; kf[2 * i + 1] = fa.y; kf[8 + 2 * i] = fb.x; kf[8 + 2 * i + 1] = fb.y;
+            for (int i = 0; i < 16; ++i) kf[i] = (float) b8[i];
+        } else {
+            const uint4* kr = (const uint4*) (kc + row * KVC + g * HD + l8 * 16);
+            uint4 a = make_uint4(0, 0, 0, 0), b = make_uint4(0, 0, 0, 0);
+            if (ok) {
+                a = __ldg(kr);
+                b = __ldg(kr + 1);
+            }
+            const __half2* h2a = (const __half2*) &a;
+            const __half2* h2b = (const __half2*) &b;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float2 fa = __half22float2(h2a[i]), fb = __half22float2(h2b[i]);
+                kf[2 * i] = fa.x; kf[2 * i + 1] = fa.y; kf[8 + 2 * i] = fb.x; kf[8 + 2 * i + 1] = fb.y;
+            }
         }
         float d[GQ];
 #pragma unroll
@@ -1225,6 +1310,7 @@ __global__ void __launch_bounds__(128) k_attn_dec(const float* q, const float* R
             float s = 0;
 #pragma unroll
             for (int i = 0; i < 16; ++i) s += kf[i] * qv[hh][i];
+            if (Q8) s *= ksc;
             s += __shfl_xor_sync(0xffffffffu, s, 1);
             s += __shfl_xor_sync(0xffffffffu, s, 2);
             s += __shfl_xor_sync(0xffffffffu, s, 4);
@@ -1263,7 +1349,7 @@ __global__ void __launch_bounds__(128) k_attn_dec(const float* q, const float* R
     for (int jj = 0; jj < n; ++jj) {
         const int j = j0 + jj;
         const size_t row = window ? (size_t) (j % RING) : (size_t) j;
-        const float vv = __half2float(vc[row * KVC + g * HD + tid]);
+        const float vv = Q8 ? kv_get(q8, false, vc, row, g * HD + tid) : __half2float(vc[row * KVC + g * HD + tid]);
 #pragma unroll
         for (int hh = 0; hh < GQ; ++hh) acc[hh] += sc[hh][jj] * vv;
     }
@@ -1474,8 +1560,9 @@ __global__ void __launch_bounds__(256) k_gemv8_seg(const int8_t* __restrict__ q,
 __global__ void __launch_bounds__(128) k_post_qkvT(float* q, float* r, const float* k, const float* v, const float* dk, const float* dv,
                                                    const float* sk, const float* sv, const float* kw, const float* vw, const float* qclip,
                                                    const float* rclip, int h0, float qk_thr, float rel_thr, const float* tau, float eps,
-                                                   float kconv, const int* pos, int ring, __half* kc, __half* vc, float* hk, float* hv) {
-    __shared__ float red[32];
+                                                   float kconv, const int* pos, int ring, __half* kc, __half* vc, float* hk, float* hv,
+                                                   KV8 q8) {
+    __shared__ float red[32], rsh[HD];
     const int b = blockIdx.x, i = threadIdx.x, t = blockIdx.y;
     const float tt = tau ? tau[t] : 1.0f;
     if (b < NH_C) {
@@ -1483,7 +1570,9 @@ __global__ void __launch_bounds__(128) k_post_qkvT(float* q, float* r, const flo
         float x = qr[b * HD + i] * qclip[(size_t) (h0 + b) * HD + i];
         const float ss = block_sum(x * x, red);
         const float f = fminf(fmaxf(qk_thr / (sqrtf(ss) + 1e-6f), 0.0f), 1.0f);
-        qr[b * HD + i] = (x * f) * tt;
+        float y = (x * f) * tt;
+        if (q8.rot) y = fwht128(y, rsh);   // p18
+        qr[b * HD + i] = y;
         return;
     }
     if (b < 2 * NH_C) {
@@ -1527,7 +1616,8 @@ __global__ void __launch_bounds__(128) k_post_qkvT(float* q, float* r, const flo
         y = y * (1.0f / sqrtf(ss / HD + eps));
     }
     const size_t row = ring ? (size_t) (pos[t] % RING) : (size_t) pos[t];
-    (isk ? kc : vc)[row * KVC + c] = __float2half(y);
+    if (q8.rot) y = fwht128(y, rsh);   // p18
+    kv_put(q8, isk, isk ? kc : vc, row, c, y);
 }
 __global__ void k_post_state(const float* k, const float* v, float* sk, float* sv, int T) {   // the K and V states after T rows
     const int i = blockIdx.x * blockDim.x + threadIdx.x;

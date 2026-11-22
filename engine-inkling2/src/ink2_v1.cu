@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -70,6 +71,7 @@ struct PFB {
     size_t S_n = 0;   // p14: floats in S
     float* PV = nullptr;   // p14b: P.V parts by key pieces [3][nsbmax][QSF][HD]
     int pv_nsb = 0;
+    bool shared = false;   // p18: Kf, Vf, RB and PV inside Xg, EY and GU (the int8 mode)
     cublasHandle_t cb;
     float *x0, *cur, *B[MAXB], *prel, *bankS, *bankO, *X3, *MS, *XC[4], *xm, *g64, *gp, *fpp, *NQ, *NK, *NV, *q, *k, *v, *kcv, *vcv, *r,
         *sink, *gate, *dk, *dv, *ao, *ab, *A, *F, *F2, *FN, *lg, *topw, *MO, *tau, *Xg, *GU, *HH, *EY, *Wf, *Wo, *Egu, *Edn, *Kf, *Vf, *S,
@@ -94,6 +96,8 @@ struct Card {
     unsigned seq = 1;
     // per slot: KV caches (f16) and the convolutions' last 3 inputs
     __half *kc[NSLOT], *vc[NSLOT];
+    KV8 q8[NSLOT];   // p18: the full slots' int8 caches (INK2_KV8); window slots and the f16 mode leave them null
+    size_t part_n = 0;   // p18: K.part's floats (the reading path's S shares it in the int8 mode)
     float *sk[NSLOT], *sv[NSLOT], *sa[NSLOT], *sf[NSLOT];
     // scratch
     float *x0, *cur, *B[MAXB], *prel, *bankS, *bankO, *X3, *MS, *XC[4], *xm, *g64, *gp, *fpp, *NQ, *NK, *NV, *q, *k, *v, *kcv, *vcv, *r,
@@ -124,6 +128,8 @@ struct Engine {
     const GTensor* tok = nullptr;
     int ctx;
     bool stare = getenv("INK2_STARE") != nullptr;   // p4a: v1's writing kernels
+    bool kv8 = false;   // p18: the full layers' KV in int8 (INK2_KV8=1/0; by itself when ctx > 262144)
+    int kv8_f16 = 32768, kv8_rot = 0, kv8_part = 3;   // p18: rows kept in f16 (INK2_KV8_F16), Hadamard (INK2_KV8_ROT), 1 K / 2 V / 3 both (INK2_KV8_PART)
     bool gemm2 = getenv("INK2_GEMM2") != nullptr;   // p3e
     bool win_seg = getenv("INK2_WIN_SEG") != nullptr;   // p6c off: windows' dense rows by k_gemv8_seg (other f32 order than T = 1)
     bool mt_off = getenv("INK2_MT") == nullptr;   // p5b: windows read each picked expert once (INK2_MT=1; measured 21. 11.: slower, off)
@@ -167,11 +173,14 @@ struct Engine {
     std::function<void(int)> job;
     bool quit = false;
 
+    std::map<std::string, size_t> vtag[NC];   // p18: VRAM by part (INK2_VRAM_LOG=1 prints it after loading)
+    std::string vt[NC] = {"ostalo", "ostalo"};
     void* alloc(Card& K, size_t bytes) {
         void* p = nullptr;
         CK(cudaSetDevice(K.dev));
         CK(cudaMalloc(&p, bytes));
         K.vram += bytes;
+        vtag[K.c][vt[K.c]] += bytes;
         return p;
     }
     float* dev(Card& K, size_t floats) {
@@ -372,10 +381,12 @@ struct Engine {
         CK(cudaSetDevice(K.dev));
         CK(cudaStreamCreateWithFlags(&K.st, cudaStreamNonBlocking));
         const int c = K.c, h0 = c * NH_C, kv0 = c * NKV_C;
+        vt[c] = "izhod";
         K.tok_norm = f32(K, "token_embd_norm.weight");
         K.out_norm = f32(K, "output_norm.weight");
         K.out_rq = f32(K, "output_res_query.weight");
         K.out = q8(K, "output.weight", c * NV_C, (c + 1) * NV_C);
+        vt[c] = "plasti";
         const std::vector<int64_t> swa = g.ia("inkling2_loop.attention.sliding_window_pattern");
         for (int p = 0; p < NPHYS; ++p) {
             LW& L = K.L[p];
@@ -432,7 +443,9 @@ struct Engine {
             L.ffn_norm = f32(K, b + "ffn_norm.weight");
             L.gate_inp = f32(K, b + "ffn_gate_inp.weight");
             L.probs_b = f32(K, b + "exp_probs_b.bias");
+            vt[c] = p >= NPHYS - 4 ? "strokovnjaki-q8" : (p >= LS && p < LE ? "strokovnjaki-zanka" : "strokovnjaki-fp4");
             experts(K, L, p);
+            vt[c] = "plasti";
             if (p >= LS && p < LE) {
                 L.msg_q = f32(K, b + "loop_msg_query.weight");
                 const char* nm[4] = {"q", "k", "v", "ffn"};
@@ -448,8 +461,27 @@ struct Engine {
         for (int s = 0; s < NSLOT; ++s) {
             const int p = s < NPHYS ? s : LS + (s - NPHYS) % NCORE;
             const size_t rows = K.L[p].full ? (size_t) ctx : (size_t) RING;
-            K.kc[s] = (__half*) alloc(K, rows * KVC * 2);
-            K.vc[s] = (__half*) alloc(K, rows * KVC * 2);
+            vt[c] = K.L[p].full ? "kv-polno" : "kv-okno";
+            if (kv8 && K.L[p].full) {   // p18: rows below f0 in f16, the rest in int8
+                const size_t f = std::min(rows, (size_t) kv8_f16), nq = rows - f;
+                const bool qk = (kv8_part & 1) && nq, qv = (kv8_part & 2) && nq;
+                K.q8[s].f0 = (int) f;
+                K.q8[s].rot = kv8_rot;
+                K.kc[s] = (__half*) alloc(K, std::max<size_t>(1, qk ? f : rows) * KVC * 2);
+                K.vc[s] = (__half*) alloc(K, std::max<size_t>(1, qv ? f : rows) * KVC * 2);
+                if (qk) {
+                    K.q8[s].k = (int8_t*) alloc(K, nq * KVC);
+                    K.q8[s].ks = (__half*) alloc(K, nq * KQN * 2);
+                }
+                if (qv) {
+                    K.q8[s].v = (int8_t*) alloc(K, nq * KVC);
+                    K.q8[s].vs = (__half*) alloc(K, nq * KQN * 2);
+                }
+            } else {
+                K.kc[s] = (__half*) alloc(K, rows * KVC * 2);
+                K.vc[s] = (__half*) alloc(K, rows * KVC * 2);
+            }
+            vt[c] = "vmesni";
             if (s == 0) {   // p5a: all slots' convolution states in one buffer (a draft window's snapshot is one copy)
                 K.stbuf = dev(K, (size_t) NSLOT * SLOTST);
                 K.stbak = dev(K, (size_t) NSLOT * SLOTST);
@@ -490,7 +522,8 @@ struct Engine {
         K.dv = dev(K, (size_t) MAXT * NKV_C * NCONV);
         K.ao = dev(K, (size_t) MAXT * QC);
         K.nparts_max = (ctx + KC - 1) / KC + 1;
-        K.part = dev(K, (size_t) MAXT * NH_C * 2 * K.nparts_max * (HD + 2));   // p4f: parts of 64 keys at T = 1
+        K.part_n = (size_t) MAXT * NH_C * (kv8 ? 1 : 2) * K.nparts_max * (HD + 2);   // p4f: parts of 64 keys (p18: int8: half)
+        K.part = dev(K, K.part_n);
         K.ab = dev(K, TN);
         K.A = dev(K, TN);
         K.F = dev(K, TN);
@@ -517,6 +550,11 @@ struct Engine {
 
     Engine(const std::string& path, int ctx_, const std::string& mtp = "") : g(path), ctx(ctx_) {
         ds_ring = getenv("INK2_DS_RING") ? atoi(getenv("INK2_DS_RING")) != 0 : ctx > 65536;   // p14
+        kv8 = getenv("INK2_KV8") ? atoi(getenv("INK2_KV8")) != 0 : ctx > 262144;   // p18
+        if (getenv("INK2_KV8_F16")) kv8_f16 = std::max(0, atoi(getenv("INK2_KV8_F16")));
+        if (getenv("INK2_KV8_ROT")) kv8_rot = atoi(getenv("INK2_KV8_ROT")) != 0;
+        if (getenv("INK2_KV8_PART")) kv8_part = atoi(getenv("INK2_KV8_PART")) & 3;
+        if (kv8 && (stare || attn_old)) throw std::runtime_error("INK2_KV8 needs the p4f attention (no INK2_STARE / INK2_ATTN_OLD)");
         if (!getenv("INK2_PF_QSF")) {   // p14: the full layers' score matrix 3 x QSF x (ctx + QSF) within the budget
             const double mb = getenv("INK2_PF_SMB") ? atof(getenv("INK2_PF_SMB")) : (ctx <= 98304 ? 1100.0 : ctx <= 196608 ? 450.0 : 220.0);
             while (pf_qs_full > 64 && 3.0 * pf_qs_full * (ctx + pf_qs_full) * 4 > mb * 1048576.0) pf_qs_full /= 2;
@@ -593,6 +631,7 @@ struct Engine {
             if (!g_draft_vocab.empty()) {
                 auto pick = [&](int c) {   // own threads: both() needs card 1's worker, which starts after the constructor
                     CK(cudaSetDevice(cards[c].dev));
+                    vt[c] = "risar-slovar";
                     cards[c].D.dvout = q8_pick(cards[c], "output.weight", dvmap[c]);
                 };
                 std::thread tp(pick, 1);
@@ -606,6 +645,11 @@ struct Engine {
             CK(cudaHostAlloc((void**) &h_prev_pinned, NC * 4, cudaHostAllocPortable));
             ds_on = true;
         }
+        if (getenv("INK2_VRAM_LOG"))
+            for (auto& [k, v] : vtag[0]) std::fprintf(stderr, "ink2_v1: VRAM %-20s %8.1f / %8.1f MiB\n", k.c_str(), v / 1048576.0, vtag[1][k] / 1048576.0);
+        if (kv8)
+            std::fprintf(stderr, "ink2_v1: KV polnih plasti int8 od vrstice %d (rot %d, del %d), S %s, Kf/Vf/RB/PV %s\n", std::min(kv8_f16, ctx),
+                         kv8_rot, kv8_part, cards[0].P.S == cards[0].part ? "v K.part" : "svoj", cards[0].P.shared ? "v Xg/EY/GU" : "svoji");
         std::fprintf(stderr, "ink2_v1: naloženo v %.1f s, VRAM %.2f / %.2f GiB, ctx %d, kos branja %d\n", now_s() - t0,
                      cards[0].vram / 1073741824.0, cards[1].vram / 1073741824.0, ctx, pf_min < (1 << 30) ? pfc : 0);
         w1 = std::thread([this]() {
@@ -854,13 +898,13 @@ struct Engine {
             k_post_qkvT<<<dim3(2 * NH_C + 2 * NKV_C, T), 128, 0, K.st>>>(
                 K.q, K.r, K.k, K.v, L.full ? K.dk : nullptr, L.full ? K.dv : nullptr, K.sk[slot], K.sv[slot], L.k_conv, L.v_conv, L.q_clip,
                 L.rel_clip, c * NH_C, qk_clip, rel_clip_thr, L.full ? K.tau : nullptr, eps, kconv, K.pos, !L.full, K.kc[slot], K.vc[slot], hk,
-                hk ? hk + (size_t) MAXT * KVC : nullptr);
+                hk ? hk + (size_t) MAXT * KVC : nullptr, K.q8[slot]);
             k_post_state<<<(2 * KVC + 255) / 256, 256, 0, K.st>>>(K.k, K.v, K.sk[slot], K.sv[slot], T);
         } else if (fz) {
             k_post_qkv<<<2 * NH_C + 2 * NKV_C, 128, 0, K.st>>>(K.q, K.r, K.k, K.v, L.full ? K.dk : nullptr, L.full ? K.dv : nullptr, K.sk[slot],
                                                                K.sv[slot], L.k_conv, L.v_conv, L.q_clip, L.rel_clip, c * NH_C, qk_clip,
                                                                rel_clip_thr, L.full ? K.tau : nullptr, eps, kconv, K.pos, !L.full,
-                                                               K.kc[slot], K.vc[slot]);
+                                                               K.kc[slot], K.vc[slot], K.q8[slot]);
         } else {
         if (K.keep_hist)
             CK(cudaMemcpyAsync(K.hist + (size_t) slot * HISTS + 0, K.k, (size_t) T * KVC * 4, cudaMemcpyDeviceToDevice, K.st));
@@ -873,16 +917,36 @@ struct Engine {
         k_headnorm<<<(T * NKV_C + 7) / 8, 256, 0, K.st>>>(K.kcv, NKV_C, HD, nullptr, 0, qk_clip, nullptr, 0, eps, T);
         k_headnorm<<<(T * NKV_C + 7) / 8, 256, 0, K.st>>>(K.vcv, NKV_C, HD, nullptr, 0, 0.0f, nullptr, 1, eps, T);
         k_headnorm<<<(T * NH_C + 7) / 8, 256, 0, K.st>>>(K.r, NH_C, NREL, L.rel_clip, c * NH_C, rel_clip_thr, tau, 0, eps, T);
-        k_kv_store<<<(T * KVC + 255) / 256, 256, 0, K.st>>>(K.kcv, K.vcv, K.pos, !L.full, K.kc[slot], K.vc[slot], T);
+        if (K.q8[slot].rot) k_rot<<<dim3(NH_C, T), 128, 0, K.st>>>(K.q, QC);   // p18
+        if (K.q8[slot].rot)
+            k_kv_store_rot<<<dim3(NKV_C, T, 2), 128, 0, K.st>>>(K.kcv, K.vcv, K.pos, K.kc[slot], K.vc[slot], K.q8[slot]);
+        else
+            k_kv_store<<<(T * KVC + 255) / 256, 256, 0, K.st>>>(K.kcv, K.vcv, K.pos, !L.full, K.kc[slot], K.vc[slot], T, K.q8[slot]);
         }
         if (!attn_old && !stare) {   // p4f: by KV head, 64 keys a block, the 3 query heads together (p5a: any T, grid z)
-            const int np = L.full ? 2 * nparts : std::min(2 * nparts, (SWA + MAXT + KC2 - 1) / KC2 + 1);
-            k_attn_dec<<<dim3(np, NKV_C, T), 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np);
-            k_attn_comb<<<dim3(NH_C, T), 128, 0, K.st>>>(K.part, np, K.gate, K.ao);
+            const KV8 q8 = K.q8[slot];
+            const bool q8k = kv8 && L.full, big = q8k && 2 * nparts > K.nparts_max;   // p18: K.part holds nparts_max parts a head: then 128 keys a part
+            const int np = big ? nparts : L.full ? 2 * nparts : std::min(2 * nparts, (SWA + MAXT + KC2 - 1) / KC2 + 1);
+            // p18: the parts wholly below f0 (f16 rows) by the f16 kernel, as in the 256k profile; the int8 one only from there
+            const int kcb = big ? 128 : KC2, npf = !q8k ? np : (q8.k || q8.v) ? std::min(np, q8.f0 / kcb) : np;
+            const dim3 g16(npf, NKV_C, T), g8(np - npf, NKV_C, T);
+            if (npf > 0) {
+                if (big)
+                    k_attn_dec<128, false><<<g16, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, 0);
+                else
+                    k_attn_dec<64, false><<<g16, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, 0);
+            }
+            if (np > npf) {
+                if (big)
+                    k_attn_dec<128, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf);
+                else
+                    k_attn_dec<64, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf);
+            }
+            k_attn_comb<<<dim3(NH_C, T), 128, 0, K.st>>>(K.part, np, K.gate, K.ao, q8k && q8.rot);
         } else {
             const int np = L.full ? nparts : std::min(nparts, (SWA + KC - 1) / KC + 1);
             k_attn_part<<<dim3(np, NH_C, T), 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np);
-            k_attn_comb<<<dim3(NH_C, T), 128, 0, K.st>>>(K.part, np, K.gate, K.ao);
+            k_attn_comb<<<dim3(NH_C, T), 128, 0, K.st>>>(K.part, np, K.gate, K.ao, 0);
         }
         if (T == 1 && !stare) gemv8_t1(K, L.wo, K.ao, segs({{N, K.ab}}));
         else if (fzT) gemv8_t1T(K, L.wo, K.ao, QC, segs1(N, K.ab), T);   // p6c
@@ -1010,6 +1074,7 @@ struct Engine {
     }
     void ds_load(Card& K) {
         CK(cudaSetDevice(K.dev));
+        vt[K.c] = "risar";
         DSW& D = K.D;
         GgufMin* G = dsg;
         for (int il = 0; il < DSL; ++il) {
@@ -1181,7 +1246,7 @@ struct Engine {
         std::vector<int> d;
         if (!ds_on || k <= 0 || n_past + DBLK > ctx) return d;
         k = std::min(k, DBLK - 1);
-        embed(0, anchor);
+        (void) embed(0, anchor);
         const int P = n_past;
         static const int rows_env = getenv("INK2_DS_ROWS") ? atoi(getenv("INK2_DS_ROWS")) : 1;   // p10: k + 1 rows (21. 11.: drafter 4.9 -> 3.2 ms a round, same acceptance); 0 = the block of DBLK
         const int R = rows_env > 0 ? std::min(DBLK, std::max(k + 1, rows_env)) : DBLK;
@@ -1207,6 +1272,7 @@ struct Engine {
     // ------------------------------------------------------------------------------------------------ p3: the reading path
     void alloc_pf(Card& K) {
         CK(cudaSetDevice(K.dev));
+        vt[K.c] = "branje";
         PFB& P = K.P;
         const size_t C = pfc, CN = C * N;
         P.C = pfc;
@@ -1259,15 +1325,26 @@ struct Engine {
         P.Egu = dev(K, (size_t) EB * 2 * FF_C * N);
         P.Edn = dev(K, (size_t) EB * N * FF_C);
         const size_t kfr = (size_t) std::max(std::min(ctx, KFB), (int) C + SWA);   // p3f: a window chunk reads from p0 - (SWA - 1); p14: KFB
-        P.Kf = dev(K, kfr * KVC);
-        P.Vf = dev(K, kfr * KVC);
+        // p18 (int8 mode): the attention's scratch (K / V rows in f32, R.B, the P.V pieces) lives in the MoE's (Xg, EY, GU): a
+        // layer's attention and its experts run one after the other on the card's one stream, and every one of these is written
+        // before it is read in its phase. ~274 MiB a card at 512k for the f16 rows below kv8_f16
+        const bool share = kv8 && 2 * kfr * KVC <= CN * TOPK && (size_t) C * NH_C * (EXT + 1) <= CN * TOPK &&
+                           (size_t) 3 * ((ctx + PVK - 1) / PVK) * pf_qs_full * HD <= C * TOPK * 2 * FF_C;
+        P.Kf = share ? P.Xg : dev(K, kfr * KVC);
+        P.Vf = share ? P.Xg + kfr * KVC : dev(K, kfr * KVC);
         const size_t s_full = (size_t) 3 * pf_qs_full * (ctx + pf_qs_full), s_win = (size_t) (C / QS) * NH_C * QS * (QS + SWA - 1),
                      s_tail = (size_t) 3 * QS * (QS + SWA);
         P.S_n = std::max(s_full, std::max(s_win, s_tail));
-        P.S = dev(K, P.S_n);
+        if (kv8 && P.S_n <= K.part_n) {   // p18: K.part is the writing path's scratch, S the reading path's; one stream a card
+            P.S = K.part;
+            P.S_n = K.part_n;
+        } else {
+            P.S = dev(K, P.S_n);
+        }
         P.pv_nsb = (ctx + PVK - 1) / PVK;   // p14b
-        P.PV = dev(K, (size_t) 3 * P.pv_nsb * pf_qs_full * HD);
-        P.RB = dev(K, C * NH_C * (EXT + 1));
+        P.PV = share ? P.GU : dev(K, (size_t) 3 * P.pv_nsb * pf_qs_full * HD);
+        P.RB = share ? P.EY : dev(K, C * NH_C * (EXT + 1));
+        P.shared = share;
         {   // p3f: query block b, head h = g * 3 + a: entry b * NH_C + h; S of a window block QS x (QS + SWA - 1)
             const int nb = (int) C / QS, nk = QS + SWA - 1, n = nb * NH_C;
             if ((size_t) n * QS * nk > P.S_n) throw std::runtime_error("p3f: S premajhen");
@@ -1349,7 +1426,8 @@ struct Engine {
     // attention of a chunk on one slot: positions p0 .. p0 + C - 1 are in the cache already
     void attn_pf(Card& K, const LW& L, int slot, int p0, int C) {
         PFB& P = K.P;
-        const bool win = !L.full;
+        const bool win = !L.full, rot = !win && K.q8[slot].rot;   // p18
+        if (rot) k_rot<<<dim3(NH_C, C), 128, 0, K.st>>>(P.q, QC);
         const float one = 1.0f, zero = 0.0f, scale = 1.0f / sqrtf((float) HD);
         // R.B for d = 0..EXT: RB[(i * NH_C + h)][d]
         if (pf_rb)
@@ -1366,24 +1444,28 @@ struct Engine {
                     const int h0 = g * (NH / NKV);
                     for (int b0 = 0; b0 < nk; b0 += KFB) {
                         const int bn = std::min(KFB, nk - b0);
-                        k_kv_f32g<<<(unsigned) (((size_t) bn * HD + 255) / 256), 256, 0, K.st>>>(K.kc[slot], K.vc[slot], b0, bn, g, P.Kf, P.Vf);
+                        k_kv_f32g<<<(unsigned) (((size_t) bn * HD + 255) / 256), 256, 0, K.st>>>(K.kc[slot], K.vc[slot], b0, bn, g, P.Kf, P.Vf,
+                                                                                                   K.q8[slot]);
                         cublasSgemmStridedBatched(P.cb, CUBLAS_OP_T, CUBLAS_OP_N, bn, qs, HD, &one, P.Kf, HD, 0, P.q + (size_t) i0 * QC + h0 * HD, QC,
                                                   HD, &zero, P.S + b0, nk, (long long) nk * qs, NH / NKV);
                     }
                     k_pf_softmax<<<dim3(qs, NH / NKV), 256, 0, K.st>>>(P.S, nk, 0, P.pos, i0, h0, P.RB, P.sink, 0, scale);
                     for (int b0 = 0; b0 < nk; b0 += KFB) {   // p14b: P.V by key pieces (KFB is a multiple of PVK)
                         const int bn = std::min(KFB, nk - b0);
-                        k_kv_f32g<<<(unsigned) (((size_t) bn * HD + 255) / 256), 256, 0, K.st>>>(K.kc[slot], K.vc[slot], b0, bn, g, nullptr, P.Vf);
+                        k_kv_f32g<<<(unsigned) (((size_t) bn * HD + 255) / 256), 256, 0, K.st>>>(K.kc[slot], K.vc[slot], b0, bn, g, nullptr, P.Vf,
+                                                                                                   K.q8[slot]);
                         pv_parts(K, P.Vf, HD, b0, bn, nk, qs);
                     }
                     const int nsb = (nk + PVK - 1) / PVK;
                     k_pv_sum<<<(unsigned) ((3 * (size_t) qs * HD + 255) / 256), 256, 0, K.st>>>(P.PV, nsb, P.pv_nsb, qs, P.ao, i0, h0);
                 }
             }
+            if (rot) k_rot<<<dim3(NH_C, C), 128, 0, K.st>>>(P.ao, QC);
             k_sigmul<<<(unsigned) (((size_t) C * QC + 255) / 256), 256, 0, K.st>>>(P.ao, P.gate, (size_t) C * QC);
             return;
         }
-        k_kv_f32<<<(unsigned) (((size_t) nkall * KVC + 255) / 256), 256, 0, K.st>>>(K.kc[slot], K.vc[slot], klo, nkall, win, P.Kf, P.Vf);
+        k_kv_f32<<<(unsigned) (((size_t) nkall * KVC + 255) / 256), 256, 0, K.st>>>(K.kc[slot], K.vc[slot], klo, nkall, win, P.Kf, P.Vf,
+                                                                                    K.q8[slot]);
         int ib = 0;
         if (bat && C / QS > 0) {
             const int nb = C / QS, nk = QS + SWA - 1;
@@ -1413,6 +1495,7 @@ struct Engine {
                                           &zero, P.ao + (size_t) i0 * QC + h0 * HD, QC, HD, NH / NKV);
             }
         }
+        if (rot) k_rot<<<dim3(NH_C, C), 128, 0, K.st>>>(P.ao, QC);
         k_sigmul<<<(unsigned) (((size_t) C * QC + 255) / 256), 256, 0, K.st>>>(P.ao, P.gate, (size_t) C * QC);
     }
     // p14b: the P.V of KV head group h0 for keys [b0, b0 + bn) (V rows at vb, row stride ldv) into the parts of pieces b0 / PVK ..
@@ -1539,7 +1622,10 @@ struct Engine {
         k_headnorm<<<(C * NKV_C + 7) / 8, 256, 0, K.st>>>(P.kcv, NKV_C, HD, nullptr, 0, qk_clip, nullptr, 0, eps, C);
         k_headnorm<<<(C * NKV_C + 7) / 8, 256, 0, K.st>>>(P.vcv, NKV_C, HD, nullptr, 0, 0.0f, nullptr, 1, eps, C);
         k_headnorm<<<(C * NH_C + 7) / 8, 256, 0, K.st>>>(P.r, NH_C, NREL, L.rel_clip, K.c * NH_C, rel_clip_thr, tau, 0, eps, C);
-        k_kv_store<<<(C * KVC + 255) / 256, 256, 0, K.st>>>(P.kcv, P.vcv, P.pos, !L.full, K.kc[slot], K.vc[slot], C);
+        if (K.q8[slot].rot)
+            k_kv_store_rot<<<dim3(NKV_C, C, 2), 128, 0, K.st>>>(P.kcv, P.vcv, P.pos, K.kc[slot], K.vc[slot], K.q8[slot]);
+        else
+            k_kv_store<<<(C * KVC + 255) / 256, 256, 0, K.st>>>(P.kcv, P.vcv, P.pos, !L.full, K.kc[slot], K.vc[slot], C, K.q8[slot]);
         attn_pf(K, L, slot, p0, C);
         deq8(K, L.wo, P.Wo);
         sgemm(K, P.Wo, N, QC, P.ao, QC, P.ab, N, C);
@@ -1576,6 +1662,7 @@ struct Engine {
         CK(cudaMemcpyAsync(P.pos, h_pos, C * 4, cudaMemcpyHostToDevice, K.st));
         CK(cudaMemcpyAsync(P.tau, h_tau, C * 4, cudaMemcpyHostToDevice, K.st));
         k_rms<<<C, 256, 0, K.st>>>(P.x0, N, K.tok_norm, P.cur, N, N, eps);
+        raw_rows(K, P.x0, P.cur, C);   // p17
         K.nb = 0;
         const size_t CN = (size_t) C * N;
         for (int p = 0; p < LS; ++p) layer_pf(K, p, p, false, p0, C);
@@ -1641,6 +1728,7 @@ struct Engine {
         CK(cudaMemcpyAsync(K.pos, h_pos, T * 4, cudaMemcpyHostToDevice, K.st));
         CK(cudaMemcpyAsync(K.tau, h_tau, T * 4, cudaMemcpyHostToDevice, K.st));
         rms(K, K.x0, K.tok_norm, K.cur, T, eps);
+        raw_rows(K, K.x0, K.cur, T);   // p17
         K.nb = 0;
         for (int p = 0; p < LS; ++p) layer(K, p, p, false, T, nparts);
         copy(K, K.prel, K.cur, T);
@@ -1672,7 +1760,33 @@ struct Engine {
         CK(cudaMemcpy2DAsync(h_logits + (size_t) c * NV_C, (size_t) NV * 4, K.logits, (size_t) NV_C * 4, (size_t) NV_C * 4, nr,
                              cudaMemcpyDeviceToHost, K.st));
     }
-    void embed(int t, int id) {
+    // p17: pictures. A request's image rows (ink2_vis: mtmd's projector output, n_embd f32 a row) and where they go: token ids
+    // from IMG_BASE name rows (img_map: first id, rows, offset into img_rows); the server makes the ids from the picture's
+    // hash, so the conversation cache never mixes two pictures. Image rows skip token_embd_norm, as in llama.cpp
+    // ("do not normalize raw embeddings input"): h_raw marks them, raw_rows() puts them back after the norm.
+    static constexpr int IMG_BASE = 1 << 28;
+    std::vector<float> img_rows;
+    std::vector<std::array<int, 3>> img_map;
+    std::vector<char> h_raw = std::vector<char>((size_t) 1 << 16, 0);   // rows of a window or a reading chunk
+    void raw_rows(Card& K, const float* x0, float* cur, int T) {
+        for (int t = 0; t < T;) {
+            if (!h_raw[t]) { ++t; continue; }
+            int e = t;
+            while (e < T && h_raw[e]) ++e;
+            CK(cudaMemcpyAsync(cur + (size_t) t * N, x0 + (size_t) t * N, (size_t) (e - t) * N * 4, cudaMemcpyDeviceToDevice, K.st));
+            t = e;
+        }
+    }
+    bool embed(int t, int id) {
+        if (id >= IMG_BASE) {
+            for (const auto& m : img_map)
+                if (id >= m[0] && id < m[0] + m[1]) {
+                    std::memcpy(h_x0 + (size_t) t * N, img_rows.data() + ((size_t) m[2] + (id - m[0])) * N, (size_t) N * 4);
+                    return true;
+                }
+            throw std::runtime_error("image row without data (id " + std::to_string(id) + ")");
+        }
+        if (id < 0 || id >= NV) throw std::runtime_error("token id out of range: " + std::to_string(id));
         const size_t rb = tok->row_bytes();
         const uint8_t* row = tok->data + (size_t) id * rb;
         for (int b = 0; b < N / 32; ++b) {
@@ -1684,6 +1798,7 @@ struct Engine {
             const float d = __half2float(__half(hr));
             for (int j = 0; j < 32; ++j) h_x0[(size_t) t * N + b * 32 + j] = d * (float) (int8_t) blk[2 + j];
         }
+        return false;
     }
     // feeds tokens (windows of MAXT); returns the logits rows of the last window (all its rows when all_rows)
     int feed(const int* ids, int n, bool all_rows) {
@@ -1693,7 +1808,7 @@ struct Engine {
                 T = std::min(pfc, n - i);
                 if (n_past + T > ctx) throw std::runtime_error("context full");
                 for (int t = 0; t < T; ++t) {
-                    embed(t, ids[i + t]);
+                    h_raw[t] = embed(t, ids[i + t]);
                     const int P = n_past + t;
                     h_pos[t] = P;
                     h_tau[t] = logf(fmaxf(((float) P + 1.0f) * (1.0f / log_floor), 1.0f)) * log_alpha + 1.0f;
@@ -1708,7 +1823,7 @@ struct Engine {
             T = std::min(feed_t, n - i);
             if (n_past + T > ctx) throw std::runtime_error("context full");
             for (int t = 0; t < T; ++t) {
-                embed(t, ids[i + t]);
+                h_raw[t] = embed(t, ids[i + t]);
                 const int P = n_past + t;
                 h_pos[t] = P;
                 h_tau[t] = logf(fmaxf(((float) P + 1.0f) * (1.0f / log_floor), 1.0f)) * log_alpha + 1.0f;
@@ -1835,6 +1950,13 @@ static std::vector<long long> json_ints(const std::string& j, const std::string&
     }
     return v;
 }
+static std::string json_str(const std::string& j, const std::string& key) {   // p17: a plain string value (no escapes)
+    const size_t k = j.find("\"" + key + "\"");
+    if (k == std::string::npos) return "";
+    const size_t a = j.find('"', j.find(':', k) + 1);
+    const size_t b = a == std::string::npos ? a : j.find('"', a + 1);
+    return a == std::string::npos || b == std::string::npos ? "" : j.substr(a + 1, b - a - 1);
+}
 static long long json_int(const std::string& j, const std::string& key, long long def) {
     const size_t k = j.find("\"" + key + "\"");
     if (k == std::string::npos) return def;
@@ -1868,7 +1990,7 @@ static std::vector<int> ngram_draft(const std::vector<int>& h, int D, int* len =
     }
     if (best < 3) return d;
     if (len) *len = best;
-    for (int i = at + 1; i < n && (int) d.size() < D; ++i) d.push_back(h[i]);
+    for (int i = at + 1; i < n && (int) d.size() < D && h[i] < NVU; ++i) d.push_back(h[i]);   // p17: not image rows
     return d;
 }
 // p15: on_out(new tokens) after each step when given (the server streams them); false stops the generation (the client left)
@@ -1992,6 +2114,25 @@ static int serve(Engine& e, const std::string& path, int eos) {
             std::vector<int> tok, stop;
             for (long long x : json_ints(req, "tokens")) tok.push_back((int) x);
             for (long long x : json_ints(req, "stop")) stop.push_back((int) x);
+            {   // p17: the pictures' rows of this request
+                const std::vector<long long> im = json_ints(req, "img");
+                e.img_map.clear();
+                e.img_rows.clear();
+                size_t rows = 0;
+                for (size_t i = 0; i + 2 < im.size(); i += 3) {
+                    e.img_map.push_back({(int) im[i], (int) im[i + 1], (int) im[i + 2]});
+                    rows = std::max(rows, (size_t) (im[i + 1] + im[i + 2]));
+                }
+                if (rows) {
+                    const std::string path = json_str(req, "embd");
+                    FILE* f = std::fopen(path.c_str(), "rb");
+                    if (!f) throw std::runtime_error("cannot read the image rows " + path);
+                    e.img_rows.resize(rows * N);
+                    const size_t got = std::fread(e.img_rows.data(), 4, rows * N, f);
+                    std::fclose(f);
+                    if (got != rows * N) throw std::runtime_error("short image rows file " + path);
+                }
+            }
             if (tok.empty()) throw std::runtime_error("no tokens");
             const int max = (int) std::min<long long>(json_int(req, "max", 256), std::max<long long>(1, (long long) e.ctx - (long long) tok.size()));
             // p15: "stream": 1 sends {"t": [ids]} lines as the tokens come; a failed write (the client left) stops the generation

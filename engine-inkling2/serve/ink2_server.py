@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """ink2_server.py --port N [--host H] [--alias A] --sock S --ctx C --model M.gguf --tokenizer llama-tokenize --gguf-py DIR
+                 [--mmproj MMPROJ.gguf --vis ink2_vis]
 
 An OpenAI-compatible HTTP server in front of the engine (ink2_v1 --serve S), also answering the endpoints a llama-server
 client expects: /health, /props, /slots, /tokenize, /apply-template, /metrics, /v1/models and /v1/chat/completions with and
-without "stream". The prompt is Inkling 2's chat template as text (pictures are not supported; tools go in as the template's
-tool_declare and the model's <|content_invoke_tool_json|> calls come back as tool_calls), tokens come from
-llama.cpp's llama-tokenize (vocabulary only), text back from the GGUF vocabulary (GPT-2 byte level). Greedy only: the engine
+without "stream". The prompt is Inkling 2's chat template as text (tools go in as the template's tool_declare and the model's
+<|content_invoke_tool_json|> calls come back as tool_calls), tokens come from llama.cpp's llama-tokenize (vocabulary only), text
+back from the GGUF vocabulary (GPT-2 byte level). Pictures with --mmproj and --vis: an image_url part (a data: URL, an http(s)
+URL or a local path) goes through ink2_vis (llama.cpp's mtmd projector on the CPU, ~20 s for 1600x900 = 920 rows; the rows are
+cached by the picture's SHA-256 in INK2_IMG_DIR, default /tmp/ink2-img) and its rows take the template's picture placeholder. Greedy only: the engine
 has no sampler, so temperature and the like are ignored. Drafts: DSpark (MTP) 3 + prompt lookup 15 unless a request says
 "mtp" / "lookup". The reply's <|content_thinking|> part streams as reasoning_content, its <|content_text|> part as content.
 reasoning_effort (none / minimal / low / medium / high / xhigh) or chat_template_kwargs.reasoning_effort sets the template's
 "Thinking effort level". One generation at a time; the other endpoints answer meanwhile. A client that leaves stops the
 generation. SIGTERM stops the engine too when INK2_ENGINE_PID is set (run.sh does)."""
 import argparse
+import base64
 import codecs
+import hashlib
 import json
 import os
 import socket
@@ -20,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,6 +39,8 @@ ap.add_argument("--ctx", type=int, default=32768)
 ap.add_argument("--model", required=True)
 ap.add_argument("--tokenizer", required=True, help="llama.cpp's llama-tokenize")
 ap.add_argument("--gguf-py", required=True, help="llama.cpp's gguf-py folder (knows NVFP4)")
+ap.add_argument("--mmproj", default="", help="the vision projector GGUF; none = text only")
+ap.add_argument("--vis", default="", help="ink2_vis (build/ink2_vis, the image encoder)")
 A, _ = ap.parse_known_args()
 TOKENIZE = A.tokenizer
 sys.path.insert(0, A.gguf_py)
@@ -65,6 +73,7 @@ T_TEXT = next(i for i, t in SPECIAL.items() if t == "<|content_text|>")
 T_MODEL = next(i for i, t in SPECIAL.items() if t == "<|message_model|>")
 T_TOOL = next(i for i, t in SPECIAL.items() if t == "<|content_invoke_tool_json|>")
 T_END = next(i for i, t in SPECIAL.items() if t == "<|end_message|>")
+T_IMGPH = next(i for i, t in SPECIAL.items() if t == "<|unused_200054|>")
 
 LOCK = threading.Lock()
 STATE = {"busy": False, "n_prompt": 0, "n_decoded": 0, "n_ctx": A.ctx, "t_start": 0.0, "requests": 0, "tokens_out": 0}
@@ -90,12 +99,22 @@ def _args(fn):
     return a if isinstance(a, dict) else {}
 
 
-def render(messages, effort, tools=None):
+IMG_PH = "<|unused_200054|>"   # the template's picture placeholder; the server puts the picture's rows in its place
+IMG_BASE = 1 << 28           # ids of picture rows (the engine's IMG_BASE): IMG_BASE + (16-bit hash << 12) + row
+
+
+def _image_src(part):
+    v = part.get("image_url") or part.get("url") or part.get("image") or ""
+    return v.get("url", "") if isinstance(v, dict) else str(v)
+
+
+def render(messages, effort, tools=None, images=None):
     """The GGUF chat template as text (Inkling 2's own, rendered by hand; tools/template_check.py compares it with the Jinja
     template): tool_declare first when there are tools, "Thinking effort level" before the first non-system message, each
     message as <|message_role|><|content_.|>...<|end_message|>, an assistant's tool calls as
     <|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>, a tool result's header with the
-    tool's name, <|content_model_end_sampling|> after an assistant turn. Pictures are dropped (no image encoder)."""
+    tool's name, <|content_model_end_sampling|> after an assistant turn. A picture is <|content_image|> and the placeholder; its
+    source goes to images (None: pictures are dropped)."""
     num = EFFORT[effort] if isinstance(effort, str) and effort in EFFORT else float(effort if effort is not None else 0.9)
     num = max(0.0, min(0.99, num))
     eff = "0" if num == 0.0 else f"{num}"
@@ -143,6 +162,9 @@ def render(messages, effort, tools=None):
                     s += head + "<|content_text|>" + part + "<|end_message|>"
                 elif part.get("type") in (None, "text", "input_text"):
                     s += head + "<|content_text|>" + (part.get("text") if isinstance(part.get("text"), str) else "") + "<|end_message|>"
+                elif part.get("type") in ("image", "input_image", "image_url") and images is not None:
+                    s += head + "<|content_image|>" + IMG_PH + "<|end_message|>"
+                    images.append(_image_src(part))
         for tc in calls or []:
             fn = tc.get("function") or {}
             args = _args(fn)
@@ -164,6 +186,76 @@ def tokenize(text):
     if not line:
         raise RuntimeError("llama-tokenize: " + p.stderr[-300:])
     return json.loads(line[-1])
+
+
+VIS = {"proc": None, "lock": threading.Lock(), "cache": {}}
+IMG_DIR = Path(os.environ.get("INK2_IMG_DIR", "/tmp/ink2-img"))
+
+
+def _image_bytes(src):
+    if src.startswith("data:"):
+        return base64.b64decode(src.split(",", 1)[1])
+    if src.startswith(("http://", "https://")):
+        with urllib.request.urlopen(src, timeout=60) as r:
+            return r.read()
+    return Path(src).read_bytes()
+
+
+def encode_image(src):
+    """(hash, rows file, rows): the picture's projector rows from ink2_vis, cached by its SHA-256."""
+    data = _image_bytes(src)
+    h = hashlib.sha256(data).hexdigest()
+    hit = VIS["cache"].get(h)
+    if hit and Path(hit[0]).exists():
+        return h, hit[0], hit[1]
+    IMG_DIR.mkdir(parents=True, exist_ok=True)
+    img, rows = IMG_DIR / f"{h}.img", IMG_DIR / f"{h}.f32"
+    img.write_bytes(data)
+    with VIS["lock"]:
+        if VIS["proc"] is None or VIS["proc"].poll() is not None:
+            env = dict(os.environ, CUDA_VISIBLE_DEVICES="")   # the cards are the engine's
+            VIS["proc"] = subprocess.Popen([A.vis, "--mmproj", A.mmproj, "--model", A.model, "--max-tokens", "4096"],
+                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=env)
+            first = VIS["proc"].stdout.readline().split()
+            if not first or first[0] != "ready":
+                raise RuntimeError("ink2_vis did not start")
+        VIS["proc"].stdin.write(f"{img} {rows}\n")
+        VIS["proc"].stdin.flush()
+        ans = VIS["proc"].stdout.readline().split()
+    if not ans or ans[0] != "ok":
+        raise RuntimeError("ink2_vis: " + " ".join(ans))
+    n = int(ans[1])
+    VIS["cache"][h] = (str(rows), n)
+    print(f"ink2_server: picture {h[:12]}: {n} rows in {ans[3]} ms", file=sys.stderr, flush=True)
+    return h, str(rows), n
+
+
+def place_images(ids, images):
+    """ids with every placeholder replaced by its picture's rows, and the engine's image fields."""
+    if not images:
+        return ids, {}
+    ph = [i for i, t in enumerate(ids) if t == T_IMGPH]
+    if len(ph) != len(images):
+        raise RuntimeError(f"{len(images)} pictures, {len(ph)} placeholders")
+    if not A.mmproj or not A.vis:
+        raise RuntimeError("this server reads no pictures (start it with --mmproj and --vis)")
+    enc = [encode_image(src) for src in images]
+    out, table, files, off, last = [], [], [], 0, 0
+    for (h, f, n), at in zip(enc, ph):
+        out += ids[last:at]
+        id0 = IMG_BASE + (int(h[:4], 16) << 12)
+        out += [id0 + r for r in range(n)]
+        table += [id0, n, off]
+        files.append(f)
+        off += n
+        last = at + 1
+    out += ids[last:]
+    comb = IMG_DIR / ("request-" + hashlib.sha256("".join(h for h, _, _ in enc).encode()).hexdigest()[:16] + ".f32")
+    if not comb.exists():
+        with open(comb, "wb") as w:
+            for f in files:
+                w.write(Path(f).read_bytes())
+    return out, {"img": table, "embd": str(comb)}
 
 
 def effort_of(body):
@@ -271,7 +363,7 @@ class H(BaseHTTPRequestHandler):
         if path == "/props":
             return self._send(200, {"default_generation_settings": {"n_ctx": A.ctx, "params": {"temperature": 0.0}}, "total_slots": 1,
                                     "model_path": A.model, "model_alias": A.alias, "chat_template": TEMPLATE, "build_info": "ink2_v1",
-                                    "modalities": {"vision": False, "audio": False}})
+                                    "modalities": {"vision": bool(A.mmproj and A.vis), "audio": False}})
         if path == "/slots":
             st = STATE
             return self._send(200, [{"id": 0, "n_ctx": A.ctx, "is_processing": st["busy"], "n_prompt_tokens": st["n_prompt"],
@@ -306,7 +398,9 @@ class H(BaseHTTPRequestHandler):
         t0 = time.time()
         try:
             tools = body.get("tools") if body.get("tool_choice") != "none" else None
-            ids = tokenize(render(body.get("messages") or [], effort_of(body), tools))
+            images = []
+            ids = tokenize(render(body.get("messages") or [], effort_of(body), tools, images))
+            ids, img_req = place_images(ids, images)
         except Exception as ex:
             return self._send(500, {"error": str(ex)})
         if len(ids) >= A.ctx - 1:
@@ -315,7 +409,7 @@ class H(BaseHTTPRequestHandler):
         mx = max(1, min(mx, A.ctx - len(ids) - 1))
         stream = bool(body.get("stream"))
         req = {"tokens": ids, "max": mx, "stop": [EOS], "mtp": int(body.get("mtp", MTP)), "lookup": int(body.get("lookup", LOOKUP)),
-               "stream": 1 if stream else 0}
+               "stream": 1 if stream else 0, **img_req}
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(t0)
         if not LOCK.acquire(timeout=3600):

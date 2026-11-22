@@ -135,7 +135,7 @@ __global__ void k_moe_comb(const float* ey, const int* slotrow, const int* topi,
     moe[i] = v;
 }
 // K and V rows of positions [j0, j0 + n) of a slot's cache (ring for windows) as f32 rows of KVC
-__global__ void k_kv_f32(const __half* kc, const __half* vc, int j0, int n, int ring, float* kf, float* vf) {
+__global__ void k_kv_f32(const __half* kc, const __half* vc, int j0, int n, int ring, float* kf, float* vf, KV8 q8) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t) n * KVC) return;
     const int j = (int) (i / KVC), c = (int) (i % KVC);
@@ -145,16 +145,17 @@ __global__ void k_kv_f32(const __half* kc, const __half* vc, int j0, int n, int 
         return;
     }
     const size_t row = ring ? (size_t) ((j0 + j) % RING) : (size_t) (j0 + j);
-    kf[i] = __half2float(kc[row * KVC + c]);
-    vf[i] = __half2float(vc[row * KVC + c]);
+    kf[i] = kv_get(q8, true, kc, row, c);   // p18: int8 rows of a full slot by q8
+    vf[i] = kv_get(q8, false, vc, row, c);
 }
 // p14: rows j0..j0+n of KV head g as f32 [n][HD] (V only when kf is null): the long context's key blocks
-__global__ void k_kv_f32g(const __half* kc, const __half* vc, int j0, int n, int g, float* kf, float* vf) {
+__global__ void k_kv_f32g(const __half* kc, const __half* vc, int j0, int n, int g, float* kf, float* vf, KV8 q8) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t) n * HD) return;
     const size_t j = i / HD, c = i % HD, src = (size_t) (j0 + j) * KVC + g * HD + c;
-    if (kf) kf[i] = __half2float(kc[src]);
-    vf[i] = __half2float(vc[src]);
+    (void) src;
+    if (kf) kf[i] = kv_get(q8, true, kc, j0 + j, (int) (g * HD + c));   // p18
+    vf[i] = kv_get(q8, false, vc, j0 + j, (int) (g * HD + c));
 }
 // p14b: P.V split by keys: part[a][sb][i][HD] of key piece sb summed in order sb = 0..nsb-1 into ao (query i0 + i, head h0 + a)
 __global__ void k_pv_sum(const float* part, int nsb, int nsbmax, int qs, float* ao, int i0, int h0) {
