@@ -80,7 +80,12 @@ struct PFB {
     int *pos, *topi, *cnt, *offs, *cursor, *slotrow, *rowtok, *rowexp;
     float* hbuf[2] = {};   // page-locked: this card's part of an exchange, by parity
     cudaEvent_t ev[2];
+    static constexpr int XS_MAX = 4;
+    cudaStream_t sd = nullptr, sh = nullptr;   // p19d: the exchange's copy streams (to RAM, back from RAM)
+    cudaEvent_t evp[XS_MAX], evd[2][XS_MAX], evh;   // p19d: slice made, slice in RAM (by parity), the other card's slices back
     std::vector<int> h_cnt, h_offs;
+    FTile* tiles = nullptr;   // p19b: k_fp4_gemm5's tile list
+    std::vector<FTile> h_tiles;
     unsigned seq = 1;
 };
 
@@ -137,6 +142,8 @@ struct Engine {
     bool fuse = getenv("INK2_FUSE_OFF") == nullptr;   // p4e: fused writing kernels at T = 1
     bool ilv = getenv("INK2_FP4_ILV") != nullptr;   // p4d off: NVFP4 experts interleaved as in the file (the older kernels need it)
     bool rows2 = getenv("INK2_ROWS2") != nullptr;   // p4b off: p4a's NVFP4 writing kernel
+    bool gemm5 = getenv("INK2_GEMM5") ? atoi(getenv("INK2_GEMM5")) != 0 : true;
+    int xsplit = getenv("INK2_XSPLIT") ? std::max(1, std::min(PFB::XS_MAX, atoi(getenv("INK2_XSPLIT")))) : 4;   // p19d: slices of an exchange (1: xch_pf; 22. 11.: 2 / 3 / 4 = 14k 876 / 896 / 914)   // p19b: one block a tile of 64 / 32 / 16 tokens (0: k_fp4_gemm)
     bool pf_deq = getenv("INK2_PF_DEQ") != nullptr;  // p3c: NVFP4 experts of the reading path dequantized to f32 + cuBLAS (p3b)
     float eps, qk_clip, rel_clip_thr, log_alpha, log_floor, situ_b, situ_lb, wscale, softcap;
     // host side of a step
@@ -155,6 +162,10 @@ struct Engine {
     bool pf_attb = getenv("INK2_PF_ATTB") ? atoi(getenv("INK2_PF_ATTB")) != 0 : true;   // p3f: window layers' attention in one batched call
     bool pf_rb = getenv("INK2_PF_RB") ? atoi(getenv("INK2_PF_RB")) != 0 : false;        // p3f: R.B by k_rb instead of cuBLAS (no gain, off)
     int pf_qs_full = getenv("INK2_PF_QSF") ? atoi(getenv("INK2_PF_QSF")) : 1024;
+    bool qsf_fixed = getenv("INK2_PF_QSF") != nullptr;   // p19a: a fixed block (else qsf() sizes it by the chunk's keys)
+    int qsf_max = getenv("INK2_PF_QSF_MAX") ? atoi(getenv("INK2_PF_QSF_MAX")) : 2048;
+    size_t pv_cap = 0;   // p19c: the P.V pieces' room in floats
+    bool share_on = getenv("INK2_SHARE") ? atoi(getenv("INK2_SHARE")) != 0 : true;   // p19c: the shared scratch in every mode (0: only int8)
     static constexpr int KFB = 32768;   // p14: full layers' keys converted to f32 at most this many at a time (longer: in blocks)
     static constexpr int PVK = 1024;    // p14b: the full layers' P.V in pieces of this many keys (one batched call, then k_pv_sum)
     bool pv_split = getenv("INK2_PV_SPLIT") ? atoi(getenv("INK2_PV_SPLIT")) != 0 : true;
@@ -1328,14 +1339,14 @@ struct Engine {
         // p18 (int8 mode): the attention's scratch (K / V rows in f32, R.B, the P.V pieces) lives in the MoE's (Xg, EY, GU): a
         // layer's attention and its experts run one after the other on the card's one stream, and every one of these is written
         // before it is read in its phase. ~274 MiB a card at 512k for the f16 rows below kv8_f16
-        const bool share = kv8 && 2 * kfr * KVC <= CN * TOPK && (size_t) C * NH_C * (EXT + 1) <= CN * TOPK &&
+        const bool share = (kv8 || share_on) && 2 * kfr * KVC <= CN * TOPK && (size_t) C * NH_C * (EXT + 1) <= CN * TOPK &&   // p19c: every mode
                            (size_t) 3 * ((ctx + PVK - 1) / PVK) * pf_qs_full * HD <= C * TOPK * 2 * FF_C;
         P.Kf = share ? P.Xg : dev(K, kfr * KVC);
         P.Vf = share ? P.Xg + kfr * KVC : dev(K, kfr * KVC);
         const size_t s_full = (size_t) 3 * pf_qs_full * (ctx + pf_qs_full), s_win = (size_t) (C / QS) * NH_C * QS * (QS + SWA - 1),
                      s_tail = (size_t) 3 * QS * (QS + SWA);
         P.S_n = std::max(s_full, std::max(s_win, s_tail));
-        if (kv8 && P.S_n <= K.part_n) {   // p18: K.part is the writing path's scratch, S the reading path's; one stream a card
+        if ((kv8 || share_on) && P.S_n <= K.part_n) {   // p18: K.part is the writing path's scratch, S the reading path's; one stream a card (p19c: every mode)
             P.S = K.part;
             P.S_n = K.part_n;
         } else {
@@ -1343,6 +1354,7 @@ struct Engine {
         }
         P.pv_nsb = (ctx + PVK - 1) / PVK;   // p14b
         P.PV = share ? P.GU : dev(K, (size_t) 3 * P.pv_nsb * pf_qs_full * HD);
+        pv_cap = share ? (size_t) C * TOPK * 2 * FF_C : (size_t) 3 * P.pv_nsb * pf_qs_full * HD;   // p19c
         P.RB = share ? P.EY : dev(K, C * NH_C * (EXT + 1));
         P.shared = share;
         {   // p3f: query block b, head h = g * 3 + a: entry b * NH_C + h; S of a window block QS x (QS + SWA - 1)
@@ -1369,6 +1381,8 @@ struct Engine {
         P.topi = (int*) alloc(K, C * TOPK * 4);
         P.cnt = (int*) alloc(K, NE * 4);
         P.offs = (int*) alloc(K, (NE + 1) * 4);
+        P.h_tiles.resize((size_t) C * TOPK / 16 + 3 * NE);   // p19b: every tile holds >= 16 rows but an expert's last one (3 sizes)
+        P.tiles = (FTile*) alloc(K, P.h_tiles.size() * sizeof(FTile));
         P.cursor = (int*) alloc(K, NE * 4);
         P.slotrow = (int*) alloc(K, C * TOPK * 4);
         P.rowtok = (int*) alloc(K, C * TOPK * 4);
@@ -1376,7 +1390,12 @@ struct Engine {
         for (int i = 0; i < 2; ++i) {
             CK(cudaHostAlloc((void**) &P.hbuf[i], CN * 4, cudaHostAllocPortable));
             CK(cudaEventCreateWithFlags(&P.ev[i], cudaEventDisableTiming));
+            for (int j = 0; j < PFB::XS_MAX; ++j) CK(cudaEventCreateWithFlags(&P.evd[i][j], cudaEventDisableTiming));
         }
+        for (int j = 0; j < PFB::XS_MAX; ++j) CK(cudaEventCreateWithFlags(&P.evp[j], cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&P.evh, cudaEventDisableTiming));
+        CK(cudaStreamCreateWithFlags(&P.sd, cudaStreamNonBlocking));   // p19d
+        CK(cudaStreamCreateWithFlags(&P.sh, cudaStreamNonBlocking));
         P.h_cnt.resize(NE);
         P.h_offs.resize(NE + 1);
     }
@@ -1403,6 +1422,49 @@ struct Engine {
         CK(cudaMemcpyAsync(P.tmp, O.hbuf[par], n * 4, cudaMemcpyHostToDevice, K.st));
         k_add_ord<<<(unsigned) ((n + 255) / 256), 256, 0, K.st>>>(y, P.tmp, n, c);
     }
+    // p19d: an exchange whose C rows are made in xsplit slices by make(r0, r1) on K.st: each slice goes to RAM on the copy stream
+    // sd as soon as it is made while the next one is made, the other card's slices come back on sh as soon as they are there. The
+    // sum is xch_pf's (card 0's part first on both). Order: sd waits for each slice, sh for the other card's slices and for this
+    // exchange's first slice (so tmp is free: K.st has added the last exchange by then); the other card overwrites the RAM buffer
+    // of this parity only after it has added what it read from it (its K.st waits for its sh), as with xch_pf
+    template <class F> void xch_pf2(Card& K, float* y, int C, F make) {
+        PFB& P = K.P;
+        const int c = K.c, ns = xsplit;
+        const unsigned sq = P.seq++;
+        const int par = sq & 1;
+        for (int s = 0, r0 = 0; s < ns; ++s) {
+            const int r1 = C * (s + 1) / ns;
+            if (r1 > r0) make(r0, r1);
+            CK(cudaEventRecord(P.evp[s], K.st));
+            CK(cudaStreamWaitEvent(P.sd, P.evp[s], 0));
+            if (r1 > r0)
+                CK(cudaMemcpyAsync(P.hbuf[par] + (size_t) r0 * N, y + (size_t) r0 * N, (size_t) (r1 - r0) * N * 4, cudaMemcpyDeviceToHost, P.sd));
+            CK(cudaEventRecord(P.evd[par][s], P.sd));
+            r0 = r1;
+        }
+        pf_rec[c].store(sq, std::memory_order_release);
+        while (pf_rec[1 - c].load(std::memory_order_acquire) < sq) std::this_thread::yield();
+        PFB& O = cards[1 - c].P;
+        CK(cudaStreamWaitEvent(P.sh, P.evp[0], 0));
+        for (int s = 0, r0 = 0; s < ns; ++s) {
+            const int r1 = C * (s + 1) / ns;
+            CK(cudaStreamWaitEvent(P.sh, O.evd[par][s], 0));
+            if (r1 > r0)
+                CK(cudaMemcpyAsync(P.tmp + (size_t) r0 * N, O.hbuf[par] + (size_t) r0 * N, (size_t) (r1 - r0) * N * 4, cudaMemcpyHostToDevice, P.sh));
+            r0 = r1;
+        }
+        CK(cudaEventRecord(P.evh, P.sh));
+        CK(cudaStreamWaitEvent(K.st, P.evh, 0));
+        CK(cudaStreamWaitEvent(K.st, P.evd[par][ns - 1], 0));   // our own slices are out before the sum overwrites y
+        const size_t n = (size_t) C * N;
+        k_add_ord<<<(unsigned) ((n + 255) / 256), 256, 0, K.st>>>(y, P.tmp, n, c);
+    }
+    void moe_comb(Card& K, const LW& L, int r0, int r1) {   // p19d: rows r0 .. r1 - 1 of k_moe_comb
+        PFB& P = K.P;
+        const size_t o = (size_t) r0 * TOPK;
+        k_moe_comb<<<(unsigned) (((size_t) (r1 - r0) * N + 255) / 256), 256, 0, K.st>>>(P.EY, P.slotrow + o, P.topi + o, P.topw + o,
+                                                                                         L.fp4 ? L.dn_s : nullptr, P.MO + (size_t) r0 * N, r1 - r0);
+    }
     void conv_pf(Card& K, const float* x, int Cc, float* st, const float* w, const float* dyn, int hs, float k, float* y, int T) {
         const size_t n = (size_t) T * Cc;
         k_conv_par<<<(unsigned) ((n + 255) / 256), 256, 0, K.st>>>(x, Cc, st, w, dyn, hs, k, y, T);
@@ -1423,6 +1485,19 @@ struct Engine {
         S.n = K.nb + 1;
         return S;
     }
+    // p19a: the full layers' query block for a chunk whose keys end at nk: as big as S and the P.V pieces allow for nk keys
+    // (pf_qs_full is the block that fits the whole context; at 262144 that is 64, and a 37.6k prompt ran its P.V in calls of a
+    // few CUDA blocks), at most qsf_max (2048 = a chunk). INK2_PF_QSF fixes the block as before. p19c: S at most 3 x 2^25 floats
+    // (402 MB): the 256k and the 512k modes both hold that in K.part, so they choose the same blocks and stay bit for bit the same
+    // below the int8 rows
+    int qsf(const PFB& P, int nk) const {
+        if (qsf_fixed) return pf_qs_full;
+        const size_t s_cap = std::min(P.S_n, (size_t) 3 << 25);
+        const size_t nsb = (size_t) (nk + PVK - 1) / PVK;
+        int q = pf_qs_full;
+        while (2 * q <= qsf_max && (size_t) 3 * (2 * q) * nk <= s_cap && 3 * nsb * (2 * q) * HD <= pv_cap) q *= 2;
+        return q;
+    }
     // attention of a chunk on one slot: positions p0 .. p0 + C - 1 are in the cache already
     void attn_pf(Card& K, const LW& L, int slot, int p0, int C) {
         PFB& P = K.P;
@@ -1437,9 +1512,10 @@ struct Engine {
         const bool bat = win && pf_attb;   // p3f: keys from p0 - (SWA - 1) even below 0 (zero rows, masked), so every block has the same shape
         const int klo = bat ? p0 - (SWA - 1) : win ? std::max(0, p0 - (SWA - 1)) : 0, khi = p0 + C;
         const int nkall = khi - klo;
+        const int QF = win ? QS : qsf(P, khi), nsbm = (khi + PVK - 1) / PVK;   // p19a: the block and the P.V pieces' stride
         if (!win && nkall > KFB) {   // p14: long context: per query block and KV head, Q.K^T by key blocks into S, softmax, P.V by blocks
-            for (int i0 = 0; i0 < C; i0 += pf_qs_full) {
-                const int qs = std::min(pf_qs_full, C - i0), nk = p0 + i0 + qs;
+            for (int i0 = 0; i0 < C; i0 += QF) {
+                const int qs = std::min(QF, C - i0), nk = p0 + i0 + qs;
                 for (int g = 0; g < NKV_C; ++g) {
                     const int h0 = g * (NH / NKV);
                     for (int b0 = 0; b0 < nk; b0 += KFB) {
@@ -1454,10 +1530,10 @@ struct Engine {
                         const int bn = std::min(KFB, nk - b0);
                         k_kv_f32g<<<(unsigned) (((size_t) bn * HD + 255) / 256), 256, 0, K.st>>>(K.kc[slot], K.vc[slot], b0, bn, g, nullptr, P.Vf,
                                                                                                    K.q8[slot]);
-                        pv_parts(K, P.Vf, HD, b0, bn, nk, qs);
+                        pv_parts(K, P.Vf, HD, b0, bn, nk, qs, nsbm);
                     }
                     const int nsb = (nk + PVK - 1) / PVK;
-                    k_pv_sum<<<(unsigned) ((3 * (size_t) qs * HD + 255) / 256), 256, 0, K.st>>>(P.PV, nsb, P.pv_nsb, qs, P.ao, i0, h0);
+                    k_pv_sum<<<(unsigned) ((3 * (size_t) qs * HD + 255) / 256), 256, 0, K.st>>>(P.PV, nsb, nsbm, qs, P.ao, i0, h0);
                 }
             }
             if (rot) k_rot<<<dim3(NH_C, C), 128, 0, K.st>>>(P.ao, QC);
@@ -1476,7 +1552,7 @@ struct Engine {
                                P.pao, QC, nb * NH_C);
             ib = nb * QS;
         }
-        const int QSL = win ? QS : pf_qs_full;   // p3d: bigger query blocks for the full layers (bigger cuBLAS calls)
+        const int QSL = QF;   // p3d: bigger query blocks for the full layers (bigger cuBLAS calls); p19a: by the chunk's keys
         for (int i0 = ib; i0 < C; i0 += QSL) {
             const int qs = std::min(QSL, C - i0);
             const int lo = bat ? p0 + i0 - (SWA - 1) : win ? std::max(0, p0 + i0 - (SWA - 1)) : 0, hi = p0 + i0 + qs, nk = hi - lo;
@@ -1488,8 +1564,8 @@ struct Engine {
                                           P.q + (size_t) i0 * QC + h0 * HD, QC, HD, &zero, P.S, nk, (long long) nk * qs, NH / NKV);
                 k_pf_softmax<<<dim3(qs, NH / NKV), 256, 0, K.st>>>(P.S, nk, lo, P.pos, i0, h0, P.RB, P.sink, win, scale);
                 if (!win && pv_split && nk > 4 * PVK) {   // p14b: many keys, few output tiles: P.V by key pieces
-                    pv_parts(K, vf + g * HD, KVC, 0, nk, nk, qs);
-                    k_pv_sum<<<(unsigned) ((3 * (size_t) qs * HD + 255) / 256), 256, 0, K.st>>>(P.PV, (nk + PVK - 1) / PVK, P.pv_nsb, qs, P.ao, i0, h0);
+                    pv_parts(K, vf + g * HD, KVC, 0, nk, nk, qs, nsbm);
+                    k_pv_sum<<<(unsigned) ((3 * (size_t) qs * HD + 255) / 256), 256, 0, K.st>>>(P.PV, (nk + PVK - 1) / PVK, nsbm, qs, P.ao, i0, h0);
                 } else
                 cublasSgemmStridedBatched(P.cb, CUBLAS_OP_N, CUBLAS_OP_N, HD, qs, nk, &one, vf + g * HD, KVC, 0, P.S, nk, (long long) nk * qs,
                                           &zero, P.ao + (size_t) i0 * QC + h0 * HD, QC, HD, NH / NKV);
@@ -1499,13 +1575,13 @@ struct Engine {
         k_sigmul<<<(unsigned) (((size_t) C * QC + 255) / 256), 256, 0, K.st>>>(P.ao, P.gate, (size_t) C * QC);
     }
     // p14b: the P.V of KV head group h0 for keys [b0, b0 + bn) (V rows at vb, row stride ldv) into the parts of pieces b0 / PVK ..
-    void pv_parts(Card& K, const float* vb, int ldv, int b0, int bn, int nk, int qs) {
+    void pv_parts(Card& K, const float* vb, int ldv, int b0, int bn, int nk, int qs, int nsbm) {   // p19a: nsbm = the parts' stride
         PFB& P = K.P;
         const float one = 1.0f, zero = 0.0f;
         const int sb0 = b0 / PVK, nfull = bn / PVK, tail = bn % PVK;
         for (int a = 0; a < 3; ++a) {
             const float* Sa = P.S + (size_t) a * nk * qs + b0;
-            float* Pa = P.PV + ((size_t) a * P.pv_nsb + sb0) * qs * HD;
+            float* Pa = P.PV + ((size_t) a * nsbm + sb0) * qs * HD;
             if (nfull)
                 cublasSgemmStridedBatched(P.cb, CUBLAS_OP_N, CUBLAS_OP_N, HD, qs, PVK, &one, vb, ldv, (long long) PVK * ldv, Sa, nk, PVK, &zero,
                                           Pa, HD, (long long) qs * HD, nfull);
@@ -1514,7 +1590,7 @@ struct Engine {
                             &zero, Pa + (size_t) nfull * qs * HD, HD);
         }
     }
-    void experts_pf(Card& K, const LW& L, int C) {
+    void experts_pf(Card& K, const LW& L, int C, bool comb = true) {   // p19d: comb false = without the last k_moe_comb (xch_pf2 makes it)
         PFB& P = K.P;
         const int n = C * TOPK;
         const float one = 1.0f, zero = 0.0f;
@@ -1529,12 +1605,21 @@ struct Engine {
         k_exp_fill<<<(n + 255) / 256, 256, 0, K.st>>>(P.topi, n, P.offs, P.cursor, P.slotrow, P.rowtok, P.rowexp);
         k_gather_rows<<<(unsigned) (((size_t) n * (N / 4) + 255) / 256), 256, 0, K.st>>>(P.FN, P.rowtok, n, P.Xg);
         const size_t gu_rows = 2 * FF_C, gu_e = gu_rows * N, dn_e = (size_t) N * FF_C;
+        if (L.fp4 && !pf_deq && gemm5 && !ilv && !gemm2) {   // p19b: the tile list from the counts the host has already
+            const int nt = fp4_tiles(P.h_offs.data(), P.h_tiles.data());
+            CK(cudaMemcpyAsync(P.tiles, P.h_tiles.data(), (size_t) nt * sizeof(FTile), cudaMemcpyHostToDevice, K.st));
+            k_fp4_gemm5<<<dim3(gu_rows / F4M, nt), 256, 0, K.st>>>(L.gu, gu_rows * (N / 64) * 36, (int) gu_rows, N, P.tiles, P.Xg, N, P.GU, (int) gu_rows);
+            k_situ_s<<<(n * FF_C + 255) / 256, 256, 0, K.st>>>(P.GU, P.HH, n, P.rowexp, L.gu_s, situ_b, situ_lb);
+            k_fp4_gemm5<<<dim3(N / F4M, nt), 256, 0, K.st>>>(L.dn, (size_t) N * (FF_C / 64) * 36, N, FF_C, P.tiles, P.HH, FF_C, P.EY, N);
+            if (comb) moe_comb(K, L, 0, C);
+            return;
+        }
         if (L.fp4 && !pf_deq) {   // p3c: the NVFP4 tiles straight from the weights (p4d: planar unless INK2_FP4_ILV)
             auto gemm = ilv ? k_fp4_gemm<false> : (gemm2 ? k_fp4_gemm2<true> : k_fp4_gemm<true>);   // p3e: INK2_GEMM2 = 128 x 128 tiles
             gemm<<<dim3(gu_rows / F4M, NE), 256, 0, K.st>>>(L.gu, gu_rows * (N / 64) * 36, (int) gu_rows, N, P.offs, P.Xg, N, P.GU, (int) gu_rows);
             k_situ_s<<<(n * FF_C + 255) / 256, 256, 0, K.st>>>(P.GU, P.HH, n, P.rowexp, L.gu_s, situ_b, situ_lb);
             gemm<<<dim3(N / F4M, NE), 256, 0, K.st>>>(L.dn, (size_t) N * (FF_C / 64) * 36, N, FF_C, P.offs, P.HH, FF_C, P.EY, N);
-            k_moe_comb<<<(unsigned) (((size_t) C * N + 255) / 256), 256, 0, K.st>>>(P.EY, P.slotrow, P.topi, P.topw, L.dn_s, P.MO, C);
+            if (comb) moe_comb(K, L, 0, C);
             return;
         }
         for (int pass = 0; pass < 2; ++pass) {
@@ -1567,7 +1652,7 @@ struct Engine {
             if (pass == 0)
                 k_situ_s<<<(n * FF_C + 255) / 256, 256, 0, K.st>>>(P.GU, P.HH, n, P.rowexp, L.fp4 ? L.gu_s : nullptr, situ_b, situ_lb);
         }
-        k_moe_comb<<<(unsigned) (((size_t) C * N + 255) / 256), 256, 0, K.st>>>(P.EY, P.slotrow, P.topi, P.topw, L.fp4 ? L.dn_s : nullptr, P.MO, C);
+        if (comb) moe_comb(K, L, 0, C);
     }
     void layer_pf(Card& K, int p, int slot, bool loop, int p0, int C) {
         const LW& L = K.L[p];
@@ -1628,8 +1713,12 @@ struct Engine {
             k_kv_store<<<(C * KVC + 255) / 256, 256, 0, K.st>>>(P.kcv, P.vcv, P.pos, !L.full, K.kc[slot], K.vc[slot], C, K.q8[slot]);
         attn_pf(K, L, slot, p0, C);
         deq8(K, L.wo, P.Wo);
-        sgemm(K, P.Wo, N, QC, P.ao, QC, P.ab, N, C);
-        xch_pf(K, P.ab, CN);
+        if (xsplit > 1) {   // p19d
+            xch_pf2(K, P.ab, C, [&](int r0, int r1) { sgemm(K, P.Wo, N, QC, P.ao + (size_t) r0 * QC, QC, P.ab + (size_t) r0 * N, N, r1 - r0); });
+        } else {
+            sgemm(K, P.Wo, N, QC, P.ao, QC, P.ab, N, C);
+            xch_pf(K, P.ab, CN);
+        }
         conv_pf(K, P.ab, N, K.sa[slot], L.a_pconv, nullptr, 1, 1.0f / sqrtf(NCONV + 1.0f), P.A, C);
         const int ip = slot < NPHYS ? slot : LS + (slot - NPHYS) % NCORE;
         if (ip % BLK == 0) {
@@ -1647,8 +1736,11 @@ struct Engine {
         rmsC(f, L.ffn_norm, P.FN);
         sgemm(K, L.gate_inp, NE, N, P.FN, N, P.lg, NE, C);
         k_route<<<C, NE, 0, K.st>>>(P.lg, L.probs_b, wscale, P.topi, P.topw);
-        experts_pf(K, L, C);
-        xch_pf(K, P.MO, CN);
+        experts_pf(K, L, C, xsplit <= 1);
+        if (xsplit > 1)   // p19d
+            xch_pf2(K, P.MO, C, [&](int r0, int r1) { moe_comb(K, L, r0, r1); });
+        else
+            xch_pf(K, P.MO, CN);
         conv_pf(K, P.MO, N, K.sf[slot], L.f_pconv, nullptr, 1, 1.0f / sqrtf(NCONV + 1.0f), P.F2, C);
         k_add<<<(unsigned) ((CN + 255) / 256), 256, 0, K.st>>>(P.cur, P.cur, P.F2, CN);
         if (ds_on && ds_feat_slot(slot) >= 0) ds_feat(K, K.D.pfeat, P.cur, ds_feat_slot(slot), C);   // p6

@@ -2,7 +2,8 @@
 
 An engine of its own for Thinking Machines' Inkling 2 Mini (26.4B looped MoE, NVFP4 experts) on two Tesla P100 16 GB: both
 cards on every layer at once, the whole model in VRAM, DSpark (MTP) and prompt-lookup drafts, an OpenAI-compatible server
-with tool calls and pictures. Fresh writing 56.6 tok/s (78.8 with drafts), edits ~100-127, reading 794 tok/s at 4k; context
+with tool calls and pictures. Fresh writing 56.6 tok/s (78.8 with drafts), edits ~100-127, reading ~940 tok/s at 4k and
+790 at 37.6k; context
 **256k** (KV f16) or **512k** (KV int8 past 32k, the first 32k bit for bit as 256k, same speed); llama.cpp on the same cards:
 13.0 / 143. The full write-up: [docs/INKLING2.md](../docs/INKLING2.md).
 

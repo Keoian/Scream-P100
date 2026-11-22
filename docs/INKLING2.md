@@ -4,7 +4,8 @@
 > 21-22 Nov 2026. Nobody else has run it yet. Reports are welcome.
 
 **Options:** a context of **256k** (the KV cache all in f16) or **512k** (the long part of the KV cache in int8, the first 32k
-tokens exactly as at 256k, the same speed), and **pictures** (the model's vision projector on the CPU) in both.
+tokens exactly as at 256k, the same speed), and **pictures** (the model's vision projector on the CPU) in both. **Reading
+30-37 % faster since 22 Nov** (p19, [below](#reading-faster-p19)): 790 tok/s on a 37.6k prompt at 256k or 512k, was 578.
 
 Thinking Machines' **Inkling 2 Mini** (26.4B MoE: 24 layers, layers 6-17 run three times for 48 passes, 128 experts of which 8
 per token, a 1,024-token window on most layers, one full-attention layer in six, NVFP4 experts) on the same two P100s as
@@ -22,7 +23,7 @@ Same two P100 16 GB, temperature 0, everything exact (f32 sums, only their order
 | Fresh writing, no drafts | 13.0 tok/s | **56.6** |
 | Fresh writing, DSpark (MTP) 3 + prompt lookup | — | **78.8** (code, 256 tokens) |
 | Edits (the model repeats a file with a change) | — | **100.7** (700 tokens) |
-| Reading a 4,096 / 14,336 / 30,000-token prompt | 143 / 119 / — | **794 / 757 / 709** |
+| Reading a 4,096 / 14,336 / 40,960-token prompt | 143 / 119 / — | **~940 / 887 / 776** (at CTX 256k or 512k) |
 | VRAM a card | 14.0-14.5 GB | 8.9 GB writing only, 11.8 GB with the drafter at 32k |
 | Context | 32k measured | **262,144** (KV f16) or **524,288** (KV int8 past 32k), 15.2 GiB a card with the drafter |
 | Pictures | mmproj (on a card) | mmproj on the CPU, ~20 s for a 1600×900 picture (920 rows), then read at ~640 tok/s |
@@ -32,20 +33,19 @@ Scream P100's Flash-Next UD-Q4_K_XL on the same machine (22 Nov, at the context 
 
 | Test | **ink2, 256k (exact)** | **ink2, 512k** | Flash-Next Q4_K_XL, exact | Flash-Next Q4_K_XL, fast (lossy) |
 |---|---|---|---|---|
-| Fresh writing (12 prompts, thinking low) | 67.4 | 67.2 | 59.3 | 68.9 |
-| Edits, Python / Markdown | 115.5 / **127.8** | 115.5 / **127.8** ¹ | 100.9 / 92.2 | 124.3 / 125.6 |
-| Reading 37.6k / writing after it | 578 / 57.2 | 581 / 54.2 | 802 / 61.8 | 987 / 51.3 |
+| Fresh writing (12 prompts, thinking low) | 67.3 | 67.2 | 59.3 | 68.9 |
+| Edits, Python / Markdown ¹ | 75.3 / 114.3 | 75.3 / 114.4 | 100.9 / 92.2 | 124.3 / 125.6 |
+| Koda's 26 edit tasks (tool calls, hidden tests) | **97.4** tok/s, 24/26 right | — | — | — |
+| Reading 37.6k / writing after it | **790** / 53.2 | **790** / 56.7 | 802 / 61.8 | 987 / 51.3 |
 
-¹ The edit prompts stay under 32k tokens, where the 512k mode is the 256k mode bit for bit (an earlier 512k build that read
-those rows with the int8 kernel too: 114.9 / 127.2).
-
-The reading path's blocks get smaller as the context grows (the KV cache takes their room): at CTX 65,536 the same 37.6k read
-runs at 646 tok/s (21 Nov: 66.3 / 114.3 / 126.8 / 646 / 55.4). Writing after the read is lower at 512k only because the int8
-rows past 32k change the answer a little and with it the drafts taken: with f16 up to 40,960 it is 57.18, the 256k number.
-
-Inkling thinks before it answers even at effort 0; in the Python edit (a file without the variable it is asked to rename) it
-reasons for over 1,600 tokens, so that number measures writing its reasoning, not copying. Long reads are bound by f32
-arithmetic: the P100 has no tensor cores, and Flash-Next's fast numbers use f16 there.
+¹ Inkling thinks before it answers even at effort 0, and both of these prompts are 1,600 tokens of reasoning (in the Python
+one the file has no variable of the name it is asked to rename), so they time its reasoning, not copying, and follow the
+text: with p19's reading path the sums of the prompt come out in another order, the greedy reasoning takes another turn,
+and the two numbers went from 115.5 / 127.8 to 75.3 / 114.3, while the same build with every p19 switch off gives the old
+numbers exactly (`INK2_PF_QSF=64 INK2_SHARE=0 INK2_GEMM5=0 INK2_XSPLIT=1`: 115.2 / 127.4). On Koda's 26 edit tasks the
+speed is the same before and after (97.3 / 97.4 tok/s). Writing after the long read differs between 256k and 512k for the
+same reason (the int8 rows past 32k change the answer a little). Long reads are bound by f32 arithmetic: the P100 has no
+tensor cores, and Flash-Next's fast numbers use f16 there.
 
 **Long context:** a word hidden in the first line of a **239,114-token** prompt was found at 256k (read in 876 s, 273 tok/s on
 average, writing after it at 42.2 tok/s with the drafter), and of a **496,073-token** prompt at 512k (read in 3,041 s, 163
@@ -53,7 +53,7 @@ tok/s on average, writing after it at 24.2). The f16 KV cache costs 16 KB a toke
 in f16 with the drafter; see [256k or 512k](#256k-or-512k) for how 512k fits. 1M tokens (the model's limit) cannot fit even
 in int8 (8.5 GiB of KV a card).
 
-**Quality:** greedy outputs of 32 tokens on English, Slovenian and code prompts are the same as llama.cpp's; KL of the last
+**Quality** (21 Nov, before p19; p19 in [Reading faster](#reading-faster-p19)): greedy outputs of 32 tokens on English, Slovenian and code prompts are the same as llama.cpp's; KL of the last
 row 0.0001 / 0.025 / 0.00001; on a 4k prompt the first token is the same in 13 of the last 16 rows (in the other three the
 top two swap places, KL 0.0000-0.040, 0.014 on average; llama.cpp quantizes its own inputs to q8_1). On the task sets of our
 Flash-Next builds, through the server with its defaults: **44 of 45** functions with hidden tests (Flash-Next UD-Q4_K_XL 45),
@@ -107,6 +107,27 @@ coding agent's write / bash tools worked on our machine. **Pictures**: `image_ur
 local path; checked with one picture a message). Limits: **greedy only** (no sampler yet), one request at a time. A follow-up turn of a
 conversation reads only the new part (the engine keeps a snapshot of its state before the last prompt token).
 
+## Reading faster (p19)
+
+22 Nov. A profile of a 40k read at 256k showed the time going to the NVFP4 experts (40 %), the full layers' attention (18 %),
+the dense matrices (19 %, already ~7.4 TFLOPS in cuBLAS) and the two cards' exchanges (13 %). Four changes, all in f32:
+
+| Build | What | 4k / 14k / 40k at CTX 256k, tok/s | Output |
+|---|---|---|---|
+| p18e | before | 717 / 655 / 571 | |
+| p19a | the full layers' query blocks sized by the chunk's keys, not by the longest context (at 256k they were 64 queries even for a 4k prompt, and P·V ran in calls of a few CUDA blocks), up to 2,048 | 794 / 760 / 664 | KL 1.5·10⁻⁶ against p18e |
+| p19c | the shared scratch of the 512k mode in every mode: 0.43 GiB less VRAM at 256k, room for bigger blocks | 792 / 755 / 667 | 256k = 512k bit for bit below 32k |
+| p19b | experts by a tile list: one CUDA block a tile of 64, 32 or 16 tokens (the smallest that holds an expert's last tokens), so a big expert's tiles run side by side instead of one after another in one block | 884 / 839 / 745 | the same bits as p19c |
+| p19e | the exchanges in 4 slices: each slice goes to RAM on a copy stream as soon as it is made, while the next one is made, and comes back on another | **~940 / 887 / 776** | KL 1.9·10⁻⁶ against 2 slices |
+
+On the expert GEMM alone (`k_fp4_gemm5`, a chunk's routing): gate_up 18.2 → 14.2 ms, down 8.4 → 7.5 ms, the same bits.
+Quality of p19e at 256k, against p18e on the same sets and server: English questions 16/16 (16/16), Slovenian 12/15 with the
+same three missed (12/15), 32 greedy tokens on English / Slovenian / code = llama.cpp, the last row of a 4k prompt KL 0.0107
+against llama.cpp with the same first token (the reading path of 21 Nov: 0.0108, its top two swapped). Functions 43/45 (44/45)
+and Koda's edits 24/26 (25/26): two tasks flipped, both to a wrong answer of an ordinary kind (`flatten({})` gave `{'': {}}`; a
+rename done as one replace-all that also renamed `ZNIZAN_DDV`). The change of the sums is as big as the one p18e itself
+makes between two contexts (dolg40k's last row: p18e at 64k against 256k KL 1.5·10⁻⁶, p19e against p18e 3-6·10⁻⁶). Koda's edits: the same 26 tasks at CTX 65536 gave p19e 24/26 and p18e 24/26 (both miss konstanta_en there), functions 43/45 and 44/45: the one task that stays apart is flatten.
+
 ## 256k or 512k
 
 At 256k a card holds the experts (7.5 GiB), the full layers' KV cache in f16 (4.1 GiB), the reading path's buffers (1.8 GiB),
@@ -147,8 +168,10 @@ word for word (the 960-token prompt read in 1.5 s, the answer written at 85.5 to
   post-convolution + residual, the K/V convolutions + clips + cache write, the router + job list; attention by KV head with
   the three query heads together.
 - **Reading path:** chunks of 2,048 tokens; dense matrices as Q8 → f32 + cuBLAS; the experts sorted by expert and run by a
-  tile GEMM that decodes NVFP4 in shared memory (~4.7 TFLOPS); window attention for all query blocks and heads in one
-  batched call; full-attention layers with keys in 32k blocks and P·V split by 1,024-key pieces at long context.
+  tile GEMM that decodes NVFP4 in shared memory, one CUDA block a tile of 64 / 32 / 16 tokens from a list (~6 TFLOPS); window
+  attention for all query blocks and heads in one batched call; full-attention layers with query blocks sized by the
+  chunk's keys, keys in 32k blocks and P·V split by 1,024-key pieces at long context; the cards' sums in 4 slices that
+  travel while the next slice is made.
 - **Drafts:** the DSpark drafter (3 layers, a Markov head) on both cards, run with k + 1 block rows, a reduced 32k draft
   vocabulary (`data/draft_vocab_32768.bin`, `tools/draft_vocab.py`) and a probability gate (0.7, like Flash-Next's
   `FNX_DRAFT_MIN_P`); prompt lookup takes the longest earlier match of the last tokens (3-16) and wins over the drafter at
@@ -165,10 +188,16 @@ Defaults in brackets. Presence switches (on when set at all): `INK2_STARE` (the 
 `INK2_T1TT` (1), `INK2_WIN_SEG` (0), `INK2_PERM` (0), `INK2_FEED_T` (16), `INK2_PF_MIN` (17), `INK2_PF_CHUNK` (2048),
 `INK2_PF_QSF` (1024, smaller on its own past 96k), `INK2_PF_SMB` (MB for the score matrix), `INK2_PF_ATTB` (1),
 `INK2_PF_RB` (0), `INK2_PV_SPLIT` (1), `INK2_DS_T1` (1), `INK2_DS_ROWS` (1 = k + 1 rows, 0 = all 8), `INK2_DS_PMIN` (0.7),
-`INK2_DS_RING` (on past 64k), `INK2_NG_MIN` (6), `INK2_SNAP` (1). Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
+`INK2_DS_RING` (on past 64k), `INK2_NG_MIN` (6), `INK2_SNAP` (1), `INK2_PF_QSF_MAX` (2048, the largest query block; a
+set `INK2_PF_QSF` fixes it), `INK2_SHARE` (1, the shared scratch in every mode), `INK2_GEMM5` (1, the tile-list expert
+GEMM), `INK2_XSPLIT` (4, slices of an exchange; 1 = one copy), `INK2_KV8` / `INK2_KV8_F16` / `INK2_KV8_PART` / `INK2_KV8_ROT`
+(the 512k mode), `INK2_VRAM_LOG`. Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
 `--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--logits-all F] [--dump DIR]` for tests (`--logits-all`: every row of the last window).
 
 ## What did not help
 
 A CUDA graph per token (no gain), reading an expert once per draft window (slower), 128×128 expert tiles on the reading path
-(slower), a custom R·B kernel (same as cuBLAS), job order by expert in a window (same speed).
+(slower), a custom R·B kernel (same as cuBLAS), job order by expert in a window (same speed). For p19: 8 × 8 values a
+thread in the expert GEMM, with 128 threads or with 128-token tiles (both slower than 8 × 4 with 64-token tiles); an
+expert's tiles in one block with 32 / 16-token remainders (worse on skewed routing than one block a tile); query blocks
+above 256 at 40k (no gain); the exchange buffers placed by NUMA node (2.99 instead of up to 3.40 ms an exchange, ~1 %).
