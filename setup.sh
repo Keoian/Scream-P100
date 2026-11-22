@@ -36,7 +36,9 @@
 #   --cpu-experts    FNX_CPU_EXPERTS=1 in the profile (--model q4_k_xl, the default 96 GB mode; docs/GUIDE.md, "Missing experts
 #                    on the CPU"): a decode window's experts that are not in VRAM are computed on the CPU from their RAM
 #                    copies while the cards compute the ones that are. Faster writing on cards that hold a small part of
-#                    the experts; needs AVX2 and free cores (16 threads a card by default)
+#                    the experts; needs AVX2 and free cores (16 threads a card by default). NOT BIT-EXACT: the CPU sums
+#                    in fp32 where the cards sum in fp16, so the answers are not the same bits as without it, and two
+#                    runs with it are not the same bits as each other. Without this option the profile is the exact one
 #   --route-prior X  FNX_ROUTE_PRIOR in the profile: 0 (default) is exact; 0.15 is our production setting, faster, lossy
 #   --ram 64         the 64 GB mode in the profile; default 96. IQ3_S: 262,144 positions, the lookup table from the disk.
 #                    UD-Q4_K_XL (exact, not with --fast; docs/GUIDE.md, "UD-Q4_K_XL on 64 GB"): 524,288 positions, no expert
