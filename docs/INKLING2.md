@@ -6,6 +6,10 @@
 **Options:** a context of **256k** (the KV cache all in f16) or **512k** (the long part of the KV cache in int8, the first 32k
 tokens exactly as at 256k, the same speed), and **pictures** (the model's vision projector on the CPU) in both. **Reading
 30-37 % faster since 22 Nov** (p19, [below](#reading-faster-p19)): 790 tok/s on a 37.6k prompt at 256k or 512k, was 578.
+**A conversation keeps its place** (22 Nov evening, p21-p23, [below](#conversations-keep-their-place-p21-p23)): a chat's next
+turn reads only its new messages (first byte after 0.76 s instead of ~20 s on a 16k conversation), a conversation that
+another one pushed off the cards comes back from RAM in under a second, writing is 10 % faster without drafts and 2 % with
+them, and code in a prompt is tokenized as written.
 
 Thinking Machines' **Inkling 2 Mini** (26.4B MoE: 24 layers, layers 6-17 run three times for 48 passes, 128 experts of which 8
 per token, a 1,024-token window on most layers, one full-attention layer in six, NVFP4 experts) on the same two P100s as
@@ -66,7 +70,7 @@ words. Inkling reasons before it answers even at the lowest effort, and once spe
 
 ```bash
 git clone -b inkling2 https://github.com/Megla123/Scream-P100.git && cd Scream-P100
-bash engine-inkling2/build.sh                 # ink2_v1 (nvcc), ink2_vis + llama.cpp's llama-tokenize on the CPU
+bash engine-inkling2/build.sh                 # ink2_v1 (nvcc); ink2_vis, ink2_tok + llama.cpp's llama-tokenize on the CPU
 bash engine-inkling2/setup.sh /data/inkling2  # the model (17.6 GB), the DSpark drafter (0.4 GB), the projector (0.64 GB), a venv
 bash engine-inkling2/run.sh /data/inkling2 256k   # or 512k; OpenAI-compatible API on http://127.0.0.1:8080/v1
 ```
@@ -74,7 +78,9 @@ bash engine-inkling2/run.sh /data/inkling2 256k   # or 512k; OpenAI-compatible A
 `run.sh DATA [CTX] [PORT]`: CTX `256k` (= 262144), `512k` (= 524288) or any number up to 524288 (default 32768); pictures are
 on when DATA holds the projector (`setup.sh DATA --no-pictures` leaves it out, `INK2_PICTURES=0` turns them off).
 `python3 engine-inkling2/tools/bench.py` measures fresh writing, an edit and a long read through the API,
-`python3 engine-inkling2/tools/picture_check.py` sends a picture (by default this branch's card picture) and asks for its title.
+`python3 engine-inkling2/tools/picture_check.py` sends a picture (by default this branch's card picture) and asks for its title,
+`python3 engine-inkling2/tools/conversation_check.py` runs a chat with a long system message and a tool the way a chat app
+sends it and says how many tokens each request read.
 Checked from a clean clone of this branch on our machine (22 Nov, CUDA 12.4, `HOST_CXX=g++-13`): `build.sh` in 3.5 min
 (llama.cpp downloaded and built anew), `setup.sh`, then for each option `run.sh`, `tools/picture_check.py` and `tools/bench.py`;
 in the morning with the pictures and the 512k option, at noon again with p19's faster reading (the same clone, `build.sh`
@@ -107,7 +113,105 @@ as the template's `tool_declare`, the model's calls come back as `tool_calls` (s
 the prompt equals the GGUF template's to the character (`tools/template_check.py`), and a web search tool in a chat app and a
 coding agent's write / bash tools worked on our machine. **Pictures**: `image_url` parts (a data URL, an http(s) URL or a
 local path; checked with one picture a message). Limits: **greedy only** (no sampler yet), one request at a time. A follow-up turn of a
-conversation reads only the new part (the engine keeps a snapshot of its state before the last prompt token).
+conversation reads only the new part, and so does a prompt that parts from the conversation earlier or comes back after
+another one ([checkpoints and parked conversations](#conversations-keep-their-place-p21-p23)).
+
+## Conversations keep their place (p21-p23)
+
+22 Nov, evening. The kernels were not where a chat lost its time. The engine kept one snapshot, at the end of the last
+prompt, and a request read its whole prompt again from token 0 in four everyday cases:
+
+| What happened | Measured before | Why |
+|---|---|---|
+| Every turn of a chat in our app | first byte after 9.2 s; all ~7,200 tokens read each turn | the app moves a note about the environment from the previous user message to the new one, so the prompt parts from the conversation 13 tokens **before** the old prompt's end, where the snapshot stood |
+| A client shortened its history | 54 s for 40.8k tokens | the same: it parted before the snapshot |
+| Any answer over 3,056 tokens | 83 s for a 58k conversation, at every request after it | the snapshot was good only while the windows' ring (4,096 rows) had not been written over |
+| Another conversation in between | everything read again | the cards hold one conversation |
+
+And every request waited 0.9 s before reading at all: `llama-tokenize` started anew and read the vocabulary.
+
+**Checkpoints in RAM.** A checkpoint is what it takes to go back to a place in the conversation: the convolutions' states,
+the last 1,024 rows of every window slot's ring and the drafter's rings (278 MiB for both cards, page-locked RAM; the full
+layers' rows stay where they are, they are kept by position). The server tells the engine where the prompt's messages
+start; the engine takes a checkpoint at the last of them, at earlier ones 4,096 tokens apart, every 16,384 tokens of a long
+read and before the prompt's last token. A request goes back to the latest checkpoint its prompt still shares. Taking one
+costs 15-30 ms (~150 ms the first time a buffer is page-locked), going back 30 ms.
+
+**Parked conversations.** When a request shares less than half of the conversation on the cards, that conversation's full
+layers' rows (32.8 KB a token for both cards, its int8 rows and scales in the 512k mode) go to RAM with its tokens and its
+first and last three checkpoints. A later request that shares more with a parked conversation than with the one on the
+cards gets its rows copied back: the whole conversation when the prompt goes on from its end, a copy up to a checkpoint
+when it parts earlier (a new chat with the same system prompt and tools). RAM is taken as it is needed, up to
+`INK2_CKPT_MB` (24576) for checkpoints and `INK2_PARK_MB` (32768) for parked conversations, the least recently used out
+first: **set them lower on a machine with less RAM** (ours has 99 GiB).
+
+**A tokenizer that stays up.** `build/ink2_tok` is llama.cpp's tokenizer with the same flags as `llama-tokenize --no-escape`,
+as a process the server starts once. The prompt is cut where its messages' parts start (special tokens, so each piece
+tokenizes by itself as in the whole) and the pieces' tokens are cached by their text: ~10 ms a request instead of ~900.
+**And the text is now tokenized as written:** the server ran `llama-tokenize` without `--no-escape`, which turns a written
+`\n`, `\t` or `\\` (two characters, as in source code) into the character itself, so code in a prompt reached the model with
+broken string literals.
+
+Through the server, a chat with a 16.2k-token system message and a tool, the note moving each turn
+(`tools/conversation_check.py` does the same with a 13k one):
+
+| Request | Read before | Read now | First byte now |
+|---|---|---|---|
+| The first turn | 16,226 tokens | 16,226 | 20.7 s |
+| The tool's round | 16,654 | 429 | 1.6 s |
+| The second turn | 16,281 | 106 | 0.76 s |
+| The third turn | 16,347 | 184 | 0.86 s |
+| The turn after a 1,340-token answer | 17,505 | 1,342 (that answer and the new message) | 2.2 s |
+
+The answer before a turn is still read again: its user message changed (the note left it), and what was written after it is
+no longer true to the prompt. A client that leaves its history as it was sends only its new message.
+
+On the engine's socket (`--ctx 262144` and `524288`), each against the same prompt read from token 0 with the same hints.
+The logits after the prompt (a hash of all of them), the tokens written and the drafts taken were **the same in every case**:
+
+| Case | From token 0 | Now |
+|---|---|---|
+| The same 13.2k prompt after 3,500 written tokens | 15.7 s | 0.03 s |
+| A prompt that parts 13 tokens before its end | 16.2 s | 1.0 s |
+| A 38k prompt shortened to 31k with a new tail | 40.5 s | 2.2 s (drafts taken after it: 202 of 310, the same) |
+| A 13.2k conversation back after another one | 15.6 s | 0.76 s |
+| A 20k conversation back | 24.5 s | 0.46 s |
+| A new chat that shares its first 13k tokens | 15.9 s | 1.9 s |
+| A 38k conversation parked and back (int8 rows at 512k) | 51.5 s | 0.79 s (drafts 98 of 148, the same) |
+
+**Writing: fewer launches, the same bits.** A token is 48 passes of 16 to 29 small kernel launches. `src/ink2_fuse.cuh` runs the
+three loop controllers' down projections in one launch, their gains and forgets in another, the three inputs' norms in one
+and their Q8 matrices in one; every block does what it did before. Against the launches before (`INK2_FUSE2=0`), on 14
+requests with a hash over the logits of every step: all 14 the same bit for bit, single tokens +9.6 to +10.2 %, draft
+windows +1.0 to +4.2 %. A launch saved is the same ~1.6 ms a step either way: a step of one token takes ~17.7 ms, a draft
+window of three or four rows ~30 ms (its experts ~45 % of the time, and their kernels are not touched) for ~2.7 tokens.
+
+**Short pieces.** A piece of a prompt on the reading path costs ~250 ms whatever its length (a 128-token piece: 57 % of it in
+the experts, whose smallest tile is 16 tokens wide for ~8 tokens an expert), and a piece of up to 16 tokens went as one
+window of 16 rows: 239 ms, while a window of 8 rows takes 56 ms. Pieces of up to 40 tokens now go in windows of 8 rows: 16
+tokens 120 ms, 17 tokens 124 ms (was 244), 32 tokens 224 ms (was 283). A draft window stays one window of up to 16 rows.
+
+**Against the 22 Nov morning build** (p19e with its server; the same prompts, temperature 0):
+
+| | p19e (morning) | **now** |
+|---|---|---|
+| Writing, no drafts (14 requests of the writing test, the same text) | 56.4 tok/s | **62.2** (+10 %) |
+| Writing with drafts (the same 14 requests) | 82.1 | **83.9** (+2 %) |
+| Fresh writing, the test set's 12 prompts (drafts on, as the server sends them) | 67.2 | **71.2** (+6 %) |
+| Edits, Python / Markdown ¹ | 75.2 / 114.3 | **94.2 / 121.2** |
+| Reading a cold 37.6k prompt / writing after it | 775.5 / 53.1 | 761.0 / **57.2** ² |
+| Koda's 26 edit tasks / 45 functions with hidden tests / English 16 / Slovenian 15 | 24/26 · 43/45 · 16/16 · 12/15 | **24/26 · 45/45 · 16/16 · 12/15** |
+
+¹ The Python file has a written `\n` in two lines, which the morning's server turned into newlines: the prompt now carries the
+file as written. ² The four checkpoints of a cold read cost ~1 s of its 49 s (`INK2_CKPT=0`: 779 tok/s), most of it page-locking
+their buffers the first time.
+
+Checked from a clean clone of this branch (22 Nov, 18:09-18:19, the clone of the checks above, `build.sh` again in 61 s with
+`build/ink2_tok`): `run.sh` 256k and 512k came up in 62 / 48 s at 14.76 / 15.24 GiB a card, `tools/picture_check.py` read
+the title, and `tools/conversation_check.py` passed at both (a 13k chat: the tool's round read 342 tokens, the second turn 56
+in 0.42 s, the turn after an answer 117 in 0.65 s). That clone was one line older: a draft window of more than 8 rows was cut
+in two, so longer drafts were never taken. The line is fixed, and the fixed engine went through every test of this section
+in our tree, the comparison with the morning build included.
 
 ## Reading faster (p19)
 
@@ -205,13 +309,17 @@ model. Answers themselves are not watched, since a long table or matrix can repe
 
 Defaults in brackets. Presence switches (on when set at all): `INK2_STARE` (the first kernels), `INK2_FUSE_OFF`,
 `INK2_ATTN_OLD`, `INK2_MT`, `INK2_GRAF`, `INK2_ROWS2`, `INK2_FP4_ILV`, `INK2_PF_OFF` (no reading path). Value switches:
-`INK2_T1TT` (1), `INK2_WIN_SEG` (0), `INK2_PERM` (0), `INK2_FEED_T` (16), `INK2_PF_MIN` (17), `INK2_PF_CHUNK` (2048),
+`INK2_T1TT` (1), `INK2_WIN_SEG` (0), `INK2_PERM` (0), `INK2_FEED_T` (8, rows of a window when a short piece is read; 16 before p23), `INK2_PF_MIN` (41, the shortest piece on the
+reading path; 17 before p23), `INK2_PF_CHUNK` (2048),
 `INK2_PF_QSF` (1024, smaller on its own past 96k), `INK2_PF_SMB` (MB for the score matrix), `INK2_PF_ATTB` (1),
 `INK2_PF_RB` (0), `INK2_PV_SPLIT` (1), `INK2_DS_T1` (1), `INK2_DS_ROWS` (1 = k + 1 rows, 0 = all 8), `INK2_DS_PMIN` (0.7),
 `INK2_DS_RING` (on past 64k), `INK2_NG_MIN` (6), `INK2_SNAP` (1), `INK2_PF_QSF_MAX` (2048, the largest query block; a
 set `INK2_PF_QSF` fixes it), `INK2_SHARE` (1, the shared scratch in every mode), `INK2_GEMM5` (1, the tile-list expert
 GEMM), `INK2_XSPLIT` (4, slices of an exchange; 1 = one copy), `INK2_KV8` / `INK2_KV8_F16` / `INK2_KV8_PART` / `INK2_KV8_ROT`
-(the 512k mode), `INK2_VRAM_LOG`. Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
+(the 512k mode), `INK2_VRAM_LOG`, `INK2_CKPT` (1, checkpoints; 0 = the one snapshot of before), `INK2_CKPT_MB` (24576,
+RAM for them), `INK2_CKPT_GAP` (4096) / `INK2_CKPT_EVERY` (16384), `INK2_PARK_MB` (32768, RAM for parked conversations; 0 =
+off), `INK2_PARK_MIN` (1024, shorter conversations are read again), `INK2_FUSE2` (6, a mask of the merged launches: 2 the
+controllers, 4 the norms and matrices; 1 the depth mixes and 8 the routing measured no gain). Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
 `--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--logits-all F] [--dump DIR]` for tests (`--logits-all`: every row of the last window).
 
 ## What did not help
@@ -221,3 +329,9 @@ A CUDA graph per token (no gain), reading an expert once per draft window (slowe
 thread in the expert GEMM, with 128 threads or with 128-token tiles (both slower than 8 × 4 with 64-token tiles); an
 expert's tiles in one block with 32 / 16-token remainders (worse on skewed routing than one block a tile); query blocks
 above 256 at 40k (no gain); the exchange buffers placed by NUMA node (2.99 instead of up to 3.40 ms an exchange, ~1 %).
+
+For p22 (writing, all with the same bits as before): the rms norms computed inside every block of the matrices' launch
+instead of a launch of their own (single tokens +1.5 %, draft windows -8 to -13 %: the blocks are bound by their
+instructions, not by the launch); the routing done by the router's last block (windows -1.8 to -2.7 %); the two depth mixes
+in one launch (+0.1 %); the experts' rows with a lane on several rows at once and the input in registers instead of shared
+memory (20-80 % slower than `k_fp4_rows7` / `k_fp4_rows6`, which reach 369 / 366 GB/s on a window's 32 jobs).
