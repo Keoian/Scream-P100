@@ -394,7 +394,7 @@ class Tuner:
         a = self.a
         groups = [g for g in a.only.split(",") if g] if a.only else list(GROUPS)
         self.log(f"tune.py: {a.config}, tests {','.join(self.tests)}, groups {','.join(groups)}, work {self.work}")
-        info = check.inspect(argparse.Namespace(data=a.data, models=None, seconds=3, no_copy=a.no_copy, force_copy=False, no_disk=False),
+        info = check.inspect(argparse.Namespace(data=a.data, models=None, seconds=3, no_copy=a.no_copy, force_copy=False, no_disk=False, gpu=None),
                              log=lambda *x: self.log(" ", *x))
         (self.work / "check.md").write_text(info["report"] + "\n")
         for line in info["report"].split("### Verdict", 1)[-1].strip().splitlines():
