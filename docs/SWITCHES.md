@@ -158,7 +158,7 @@ Off, or at the value the engine picks, unless you set them. None is needed to re
 | `FNX_MOE_X`, `FNX_MOE_XD` | off | IQ3_S decode expert kernels with the xmad dot product (same bits, no gain: those kernels are memory-bound) |
 | `FNX_PF_REFILL`, `FNX_PF_REFILL_BATCH` | off, 4 | refill the lent expert slots after a read (no gain) |
 | `FNX_PF_SP_MIN` | 3584 | with `FNX_PF_SP=1`: the rows a pass's second chunk needs for it; shorter passes run as before (their exchange would wait) |
-| `FNX_NUMA_EXPERTS` | off | 1: each card's RAM copy of the experts on the memory of the CPU the card hangs from (same bits; IQ3_S and Q4 in the noise) |
+| `FNX_NUMA_EXPERTS` | off (on with `FNX_CPU_EXPERTS=1`) | 1: each card's RAM copy of the experts on the memory of the CPU the card hangs from (same bits; IQ3_S and Q4 in the noise without the CPU path, and what makes it fast with it: [below](#missing-experts-on-the-cpu-fnx_cpu_experts)) |
 | `FNX_PLE_WARM` | off | 1, with `FNX_PLE_RAM=0`: a thread reads the lookup table once after the load (Q4: writing −20 %, it pushes hot rows out of the page cache) |
 | `FNX_PF_DRAFT_WINDOW` | off | run the draft layer over a prompt's last N rows only |
 | `FNX_LAT_F32` | off | 1, with `FNX_LATENT`: the prompt path's D and U products accumulate in FP32 instead of FP16 (our Slovenian test gave the same score either way, 18 of 30 answers off-language: the model's own weakness, not the arithmetic) |
@@ -178,6 +178,20 @@ settings, rounds `mv-w1`, `mv-w3`).
 | `FNX_VRAM_ELASTIC` (sfnx's `--vram-elastic`, which Strata's server adds for `"vram_elastic": true`) | 0 | ours | each card's arena allocation (the K/V pool's own pages, then the arena pool's slots) from CUDA's virtual memory API in chunks instead of one `cudaMalloc`; between requests `VRAM <mib>` lends the K/V pool's next pages from the coldest slots as a long context would, keeps them out of the pool and gives their chunks to the driver, so every card has `<mib>` free for another process (Strata's picture encoder); `VRAM 0` takes them back, zeroed, and the slots are filled again hottest first | none (first-token logits of 27 bench requests and 8 greedy answers byte-identical, 3 rounds) | `VRAM 1623`: 1,186 of 7,778 slots lent, 1,536 MiB of each card given back, 114-122 ms; `VRAM 0`: 459-480 ms; 14 MiB less VRAM free after the load (whole chunks); benchmark within the spread of the build before |
 | `FNX_VRAM_CHUNK_MIB` (`--vram-segment-mib`, from `"vram_segment_mib"`) | 32 | ours | the chunk size, rounded up to the card's allocation granularity (2 MiB on the P100); a lend loses at most a chunk at each end to the slots beside it | none | |
 | `FNX_VRAM_CHURN` | off | ours | a test, with `--vram-elastic`: MIB given to the driver and taken back before every window, so the lend, the give-back and the refill run beside every kind of window | none (686 lends and give-backs in 8 greedy answers: every answer and first-token logit byte-identical) | about 0.16 s a window at 600 MiB |
+
+## Missing experts on the CPU (`FNX_CPU_EXPERTS`)
+
+Off unless the profile's `"env"` has `FNX_CPU_EXPERTS=1` (`setup.sh --model q4_k_xl --cpu-experts` writes it;
+[GUIDE.md](GUIDE.md#missing-experts-on-the-cpu)). Measured on our server on 22 Nov 2026 (two P100 at 150 W, card 0 at x8,
+2 x Xeon E5-2696 v3; bitlamas' Q4_K_XL-IQ4NL with the tuned UD-Q4_K_XL settings, and Unsloth's UD-Q4_K_XL with this
+repository's profile).
+
+| Switch | Unset | Origin | What it does | Output effect | Measured |
+|---|---|---|---|---|---|
+| `FNX_CPU_EXPERTS` | 0 | ours | 1: a decode window's routed experts that are not in VRAM are computed on the CPU from their RAM copies while the card's row kernels compute the ones that are, instead of copied into slots first (`FNX_P100_DMA`) and computed in a second phase. The plan lists the layer's misses without giving them slots; a host thread of each card and a pool on the card's own socket compute that card's half of each (fp32 sums, the file's blocks), and one small copy brings the rows back. Needs `FNX_P100_DMA=1`, the P100 row kernels, every routed expert's copy in RAM, and expert types it decodes (AVX2 kernels for Q4_K and Q5_K gate\|up and IQ4_NL, Q5_1 and Q8_0 down; Q6_K, Q5_0 and Q4_0 through a slower decode); otherwise it says why it stays off. Turns `FNX_NUMA_EXPERTS` on unless that is set to 0 | rounding (the CPU sums in fp32 where the cards' kernels sum in fp16; which experts are in VRAM at a window depends on timing, so two runs are not bit for bit the same) | see GUIDE.md |
+| `FNX_CPU_THREADS` | 16, or the card's share of its socket's cores less two | ours | the pool's threads a card (the card's host thread is one of them), each pinned to a core of the socket the card hangs from; cards on one socket share its cores | none | the socket's memory bandwidth is the bound: 14 experts' halves in 0.5 ms on 16 threads, 1.1 ms on 8 |
+| `FNX_CPU_MIN_T`, `FNX_CPU_MAX_T` | 1, 16 | ours | the window sizes (rows) the CPU path is used for; other windows copy their misses as before | | |
+| `FNX_CPU_CHECK` | off | ours | a test, with `FNX_CPU_EXPERTS=1`: the copy engine and the second phase run as without the switch (the same bits as without it) and the CPU's rows are only compared with the cards' own; the log gets the largest difference a request | none | 1.56 million rows within 0.008 of the cards' own (their fp16 sums) at values up to 15 with bitlamas' file; 2.16 million within 0.02 with UD-Q4_K_XL |
 
 ## Strata's switches
 
