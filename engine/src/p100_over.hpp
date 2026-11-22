@@ -49,6 +49,21 @@ void* p100_dma_start(int dev);
 void p100_dma_stop(void* h);
 void p100_dma_publish(void* h, int layer, const ExpertCache& ec, const int* list, size_t gu_stride, size_t dn_stride, void* st);
 void p100_dma_wait(void* h, void* st);
+// FNX_CPU_EXPERTS=1 (p100_cpu.cuh): a window's experts that are not in VRAM computed on the CPU from their host copies, by a host thread
+// of the card's and its pool (cpu_experts.cpp), while the row kernels compute the ones in VRAM. publish: the plan's list, the window's
+// picks and rows to the thread (mark: the listed experts' jobs marked as p100_jobs_split marks them); take: wait for its rows and put
+// them into part (check: compare them with what is there). FNX_CPU_CHECK=1: the copy engine and phase 2 as ever, the CPU's rows compared
+bool p100_cpu_on();
+bool p100_cpu_check();
+bool p100_cpu_type_ok(uint32_t gu_type, uint32_t dn_type, int ffs);
+int p100_cpu_node(int dev);   // the card's NUMA node (sysfs), -1 unknown
+void* p100_cpu_start(int dev, int rank, int share, const char* const* host_gu, const char* const* host_dn, const uint32_t* gu_type, const uint32_t* dn_type, int ffs);
+void p100_cpu_stop(void* h);
+void p100_cpu_publish(void* h, Job* gu, Job* dn, const int* njobs, int layer, const int* list, const int* topi, int T, const uint16_t* xh, bool mark, void* st);
+void* p100_cpu_dev(void* h);   // for RouteTail::cpu_dev: the router's last block numbers the list and marks its jobs
+void p100_cpu_post(void* h, int layer, const int* list, const int* topi, int T, const uint16_t* xh, void* st);
+void p100_cpu_take(void* h, float* part, int T, bool check, void* st);
+void p100_cpu_report(void* h, bool check);
 // FNX_PF_REFILL=1: the copier also fills the prompt path's slots after a read, between its lists: an entry an expert, done its pool's count
 // once it has landed (Engine::pf_refill_start, pf_refill_tick)
 struct DmaFill {

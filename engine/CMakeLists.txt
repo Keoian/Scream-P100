@@ -65,6 +65,9 @@ set(_sp ${CMAKE_CURRENT_SOURCE_DIR})
 set(_sp_engine
     ${_sp}/src/gguf.cpp ${_sp}/src/model.cpp ${_sp}/src/store.cpp ${_sp}/src/elastic.cpp ${_sp}/src/moe_mma.cu ${_sp}/src/p100_moe.cu ${_sp}/src/engine.cu
     ${_sp}/src/engine_common.cu ${_sp}/src/prefill.cu ${_sp}/src/session.cpp ${_sp}/src/batch.cpp ${_sp}/tools/sfnx.cpp)
+# the CPU expert path's decoders and pool (FNX_CPU_EXPERTS, src/p100_cpu.cuh): plain C++, the host compiler's (its AVX2 kernels are
+# target-attributed functions chosen at run time)
+list(APPEND _sp_engine ${_sp}/src/cpu_experts.cpp)
 if(_fnx_hip)
   list(APPEND _sp_engine ${_sp}/src/selftest.cu)   # the kernel self-test of a card Strata has not run the split on (hip/selftest_policy.hpp)
 endif()
@@ -135,6 +138,13 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(split_${_tt} PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
     add_test(NAME split_${_tt} COMMAND split_${_tt})
   endforeach()
+  # the CPU expert path's decoders, products and pool (FNX_CPU_EXPERTS; src/cpu_experts.cpp): plain C++, no GPU
+  add_executable(split_cpu_experts_test ${_sp}/tools/cpu_experts_test.cpp ${_sp}/src/cpu_experts.cpp)
+  target_include_directories(split_cpu_experts_test PRIVATE ${_sp}/src)
+  target_compile_features(split_cpu_experts_test PRIVATE cxx_std_17)
+  set_target_properties(split_cpu_experts_test PROPERTIES CUDA_ARCHITECTURES OFF)
+  target_link_libraries(split_cpu_experts_test PRIVATE Threads::Threads)
+  add_test(NAME split_cpu_experts_test COMMAND split_cpu_experts_test)
   # the load-time conversion's oracle tool (tests/split/convert_check.py compares its output with gguf-py on a real file; not a ctest)
   add_executable(split_convert_dump ${_sp}/tools/convert_dump.cpp ${_sp}/src/gguf.cpp)
   target_include_directories(split_convert_dump PRIVATE ${_sp}/src ${_sp}/tools)

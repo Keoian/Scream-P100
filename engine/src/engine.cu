@@ -284,6 +284,34 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             b->xh16 = dalloc<uint16_t>((size_t) MAXT * N);
             b->h16 = dalloc<uint16_t>((size_t) (P + MAXT) * ffs);
         }
+        // FNX_CPU_EXPERTS (p100_cpu.cuh): on the copy engine's path (the overlap and the row kernels), with host copies its decoders read
+        if (p100_cpu_on()) {
+            const char* why = nullptr;
+            uint32_t gt[NL], dt[NL];
+            for (int l = 0; l < NL; ++l) gt[l] = w.L[(size_t) l].gu_e.type, dt[l] = w.L[(size_t) l].down_e.type;
+            if (!b->dma || !b->xh16) why = "it needs FNX_P100_DMA=1 and the P100 row kernels";
+            else if (!w.ec.n_slots || w.ec_host_gu.empty()) why = "every routed expert is in VRAM";
+            else if (std::getenv("FNX_LATENT")) why = "not with the latent experts";
+            else if (env_int("FNX_SSD_EXPERTS", 0) != 0) why = "not with FNX_SSD_EXPERTS (the experts' host copies are not all in RAM)";
+            else {
+                for (int l = 0; l < NL && !why; ++l)
+                    if (!p100_cpu_type_ok(gt[l], dt[l], ffs)) why = "a layer's experts are of a type the CPU path has no decoder for";
+                // an expert that can be missing needs its host copy (the permanent ones of FNX_EXPERT_DYN_GIB have none and never leave VRAM)
+                for (size_t i = 0; i < w.ec_host_gu.size() && !why; ++i)
+                    if ((!w.ec_host_gu[i] || !w.ec_host_dn[i]) && (w.perm_gu.empty() || !w.perm_gu[i])) why = "an expert that can leave VRAM has no host copy";
+            }
+            if (why) std::fprintf(stderr, "fnx: FNX_CPU_EXPERTS: off on card %d: %s\n", b->dev, why);
+            else {   // cards that hang from one socket share its cores
+                const int node = p100_cpu_node(b->dev);
+                int rank = 0, share = 0;
+                for (int k = 0; k < NCARD; ++k)
+                    if (p100_cpu_node(m.cards[(size_t) k].dev) == node) {
+                        if (m.cards[(size_t) k].dev < b->dev) ++rank;
+                        ++share;
+                    }
+                b->cpux = p100_cpu_start(b->dev, rank, share, w.ec_host_gu.data(), w.ec_host_dn.data(), gt, dt, ffs);
+            }
+        }
         if (std::getenv("FNX_LATENT")) {   // edge0_patch.py
             b->lxl = dalloc<float>((size_t) MAXT * LAT_W);
             b->lxl16 = dalloc<uint16_t>((size_t) MAXT * LAT_W);
@@ -1737,9 +1765,16 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         if (f) std::fprintf(stderr, "fnx: FNX_FOLD %d: a window's small launches folded into their neighbours\n", f);
         return f;
     }();
+    // FNX_CPU_EXPERTS (p100_cpu.cuh): the window's missing experts computed on the CPU while the card computes the ones in VRAM, in
+    // windows of FNX_CPU_MIN_T .. FNX_CPU_MAX_T rows (1 .. 16). FNX_CPU_CHECK: everything as without it, and the CPU's rows compared
+    static const int cpu_min_t = (int) env_int("FNX_CPU_MIN_T", 1), cpu_max_t = (int) env_int("FNX_CPU_MAX_T", MAXT);
+    static const bool cpu_check = p100_cpu_check();
+    const bool cpu_any = over && dma && b.cpux && !lat && T >= cpu_min_t && T <= cpu_max_t;
+    const bool cpu = cpu_any && !cpu_check, cpu_chk = cpu_any && cpu_check;
     RouteTail rt;
     if (b.ekeep && lyr >= 0 && lyr < NL) rt.keep = b.ekeep + (size_t) lyr * (NEXP / 32);   // FNX_EXPERT_MASK (maska_patch.py)
-    if (over && dma && (fold & 1)) rt.box = p100_dma_box(b.dma), rt.dev = p100_dma_dev(b.dma), rt.gu_bytes = L.gu_e_stride, rt.dn_bytes = L.down_e_stride;
+    if (cpu) rt.cpu = 1, rt.cpu_dev = p100_cpu_dev(b.cpux);
+    else if (over && dma && (fold & 1)) rt.box = p100_dma_box(b.dma), rt.dev = p100_dma_dev(b.dma), rt.gu_bytes = L.gu_e_stride, rt.dn_bytes = L.down_e_stride;
     if (over && (fold & 2) && !lat) rt.xh = b.xh16;
     prof_mark(b, PK_ROUTER);
     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &w.ec : nullptr,
@@ -1763,7 +1798,14 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         }
         prof_mark(b, PK_CACHE);
         // the planned experts copied into their slots before the MoE kernels read the layer's tables
-        if (live && over && rt.box) {   // FNX_FOLD 1: the router's last block did both
+        if (live && cpu) {   // the rows, the list and the picks to the card's host thread, on the third stream (the router's last block
+            // numbered the list and marked its jobs): the card's own experts start at once
+            if (!rt.xh) p100_f32_f16(b.mixed, (size_t) T * N, b.xh16, b.st);
+            ck(cudaEventRecord(b.fork2, b.st), "fork2");
+            ck(cudaStreamWaitEvent(b.st3, b.fork2, 0), "fork2 wait");
+            p100_cpu_post(b.cpux, l, b.cache_list, b.topi, T, b.xh16, b.st3);
+            ck(cudaEventRecord(b.join2, b.st3), "join2");
+        } else if (live && over && rt.box) {   // FNX_FOLD 1: the router's last block did both
         } else if (live && over) {
             p100_jobs_split(b.jobs_gu, b.jobs_dn, b.njobs, l, b.cache_list, b.st);
             if (dma) p100_dma_publish(b.dma, l, w.ec, b.cache_list, L.gu_e_stride, L.down_e_stride, b.st);
@@ -1779,7 +1821,8 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     if (over) {
         // first the experts that stayed in VRAM, while the copy runs; then wait for it, and the copied ones
         if (lat) lat_in();
-        else if (!rt.xh) p100_f32_f16(b.mixed, (size_t) T * N, b.xh16, b.st);
+        else if (!rt.xh && !cpu) p100_f32_f16(b.mixed, (size_t) T * N, b.xh16, b.st);
+        if (cpu_chk) p100_cpu_publish(b.cpux, b.jobs_gu, b.jobs_dn, b.njobs, lyr, b.cache_list, b.topi, T, b.xh16, false, b.st);
         // FNX_NOC_FILE split (IDEJE 31): the copier sends gate|up parts first, so gate|up waits for those only and down for the rest
         const bool split = dma && noc_mode().split;
         const bool split2 = dma && noc_mode().split == 2;   // perexp_patch.py: phase 2's blocks wait for their own expert's part
@@ -1792,6 +1835,10 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         if (pf_wait && split) p100_dma_wait2(b.dma, b.st);
         p100_moe_rows_phase(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, T, b.h16, b.part, 1, b.st);
         prof_mark(b, PK_CACHE);
+        if (cpu) {   // the CPU's rows instead of a copy and a second phase (the third stream's post joins here: the rows cannot come before it)
+            ck(cudaStreamWaitEvent(b.st, b.join2, 0), "join2 wait");
+            p100_cpu_take(b.cpux, b.part, T, false, b.st);
+        } else {
         if (split2) {
         } else if (dma) (split ? p100_dma_wait_gu : p100_dma_wait)(b.dma, b.st);
         else ck(cudaStreamWaitEvent(b.st, b.join2, 0), "join2 wait");
@@ -1812,6 +1859,8 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
             p100_moe_rows_phase_w(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, T, b.h16, b.part, 2, b.st, p100_dma_done(b.dma, 1),
                                   p100_dma_want_ptr(b.dma), b.cache_list, lyr, p100_dma_err_ptr(b.dma));
         else p100_moe_rows_phase(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, T, b.h16, b.part, 2, b.st);
+        if (cpu_chk) p100_cpu_take(b.cpux, b.part, T, true, b.st);
+        }
     } else if (sh_in) moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
     else if (b.xh16) {
         if (lat) lat_in();
@@ -2328,6 +2377,8 @@ void Engine::memo_tags(int pos, const int* tokens, int n) {
 }
 
 void Engine::noc_report() {
+    for (int c = 0; c < NCARD; ++c)   // FNX_CPU_EXPERTS: the request's lists, a line a card
+        if (cb_[(size_t) c]->cpux) p100_cpu_report(cb_[(size_t) c]->cpux, p100_cpu_check());
     if (!memo_stat_) return;
     unsigned long long s[8];
     std::memcpy(s, (const void*) memo_stat_, sizeof s);
