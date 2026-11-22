@@ -184,7 +184,9 @@ settings, rounds `mv-w1`, `mv-w3`).
 Off unless the profile's `"env"` has `FNX_CPU_EXPERTS=1` (`setup.sh --model q4_k_xl --cpu-experts` writes it;
 [GUIDE.md](GUIDE.md#missing-experts-on-the-cpu)). Measured on our server on 22 Nov 2026 (two P100 at 150 W, card 0 at x8,
 2 x Xeon E5-2696 v3; bitlamas' Q4_K_XL-IQ4NL with the tuned UD-Q4_K_XL settings, and Unsloth's UD-Q4_K_XL with this
-repository's profile).
+repository's profile). Not bit-exact, and with the prefetch not repeatable from run to run: `FNX_PREFETCH=0` beside it makes
+its runs repeat, at most of the gain's cost. `tune/check.py` names the machines it is for; `tune/tune.py
+--allow-cpu-experts` measures it.
 
 | Switch | Unset | Origin | What it does | Output effect | Measured |
 |---|---|---|---|---|---|
