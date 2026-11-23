@@ -9,7 +9,9 @@ tokens exactly as at 256k, the same speed), and **pictures** (the model's vision
 **A conversation keeps its place** (22 Nov evening, p21-p23, [below](#conversations-keep-their-place-p21-p23)): a chat's next
 turn reads only its new messages (first byte after 0.76 s instead of ~20 s on a 16k conversation), a conversation that
 another one pushed off the cards comes back from RAM in under a second, writing is 10 % faster without drafts and 2 % with
-them, and code in a prompt is tokenized as written.
+them, and code in a prompt is tokenized as written. **Short pieces 18-22 % faster** (23 Nov, p25-p27,
+[below](#short-pieces-read-faster-p25-p27)): a chat turn's 64 or 128 new tokens are read in 251 / 336 ms instead of 322 /
+409, the experts of the last 4 layers no longer go through f32 copies.
 
 Thinking Machines' **Inkling 2 Mini** (26.4B MoE: 24 layers, layers 6-17 run three times for 48 passes, 128 experts of which 8
 per token, a 1,024-token window on most layers, one full-attention layer in six, NVFP4 experts) on the same two P100s as
@@ -27,7 +29,7 @@ Same two P100 16 GB, temperature 0, everything exact (f32 sums, only their order
 | Fresh writing, no drafts | 13.0 tok/s | **56.6** |
 | Fresh writing, DSpark (MTP) 3 + prompt lookup | — | **78.8** (code, 256 tokens) |
 | Edits (the model repeats a file with a change) | — | **100.7** (700 tokens) |
-| Reading a 4,096 / 14,336 / 40,960-token prompt | 143 / 119 / — | **~940 / 887 / 776** (at CTX 256k or 512k) |
+| Reading a 4,096 / 14,336 / 40,960-token prompt | 143 / 119 / — | **~965 / 917 / 798** (at CTX 256k or 512k; ~940 / 887 / 776 before p25) |
 | VRAM a card | 14.0-14.5 GB | 8.9 GB writing only, 11.8 GB with the drafter at 32k |
 | Context | 32k measured | **262,144** (KV f16) or **524,288** (KV int8 past 32k), 15.2 GiB a card with the drafter |
 | Pictures | mmproj (on a card) | mmproj on the CPU, ~20 s for a 1600×900 picture (920 rows), then read at ~640 tok/s |
@@ -213,6 +215,43 @@ in 0.42 s, the turn after an answer 117 in 0.65 s). That clone was one line olde
 in two, so longer drafts were never taken. The line is fixed, and the fixed engine went through every test of this section
 in our tree, the comparison with the morning build included.
 
+## Short pieces read faster (p25-p27)
+
+23 Nov. Since p21 most requests of a conversation read a few dozen to a few hundred new tokens, and such a piece had a fixed
+cost of ~270 ms whatever its length. A profile of 40 pieces of 128 tokens showed where most of it went: the last 4 layers
+keep their experts in Q8_0 (the release's MXFP8, converted), and on the reading path they still went the oldest way, 16
+experts at a time copied to f32 and then one cuBLAS call an expert with ~8 tokens. That was ~113 ms of a 407 ms piece on each
+card for 4 of the 48 passes, while a pass of NVFP4 experts took ~5 ms.
+
+| Build | What | Output |
+|---|---|---|
+| p25 | the Q8 experts by the tiles of the NVFP4 expert GEMM, straight from the int8 rows and their half scales (`k_q8_gemm5`): the weights are the same floats as before, each sum one FMA chain | last row against p23b: KL 6·10⁻¹¹ / 5·10⁻¹² / 4·10⁻¹³ (4k / 14k / 40k), the same 16 tokens written after each |
+| p26 | expert tiles of 8 and 4 tokens, NVFP4 and Q8 (an expert's last few tokens took a 16-token tile, half of it empty) | the same bits as p25 |
+| p27 | the reading path from 31 tokens on (was 41): it now beats the writing path's 8-row windows from ~30 tokens | the same bits as p26 above 40 tokens and in writing |
+
+A piece after a 16k conversation (back to a checkpoint, a piece of N tokens, then its last token), the same day:
+
+| Piece | p23b (22 Nov) | **p27** |
+|---|---|---|
+| 32 tokens | 224 ms | **214 ms** |
+| 40 tokens | 290 ms | **237 ms** |
+| 64 tokens | 322 ms | **251 ms** |
+| 128 tokens | 409 ms | **336 ms** |
+| 256 tokens | 562 ms | **484 ms** |
+| 512 tokens | 837 ms | **762 ms** |
+| 2,048 tokens | 805 tok/s | **829 tok/s** |
+
+A prompt read from token 0 at 256k: 4k 924 → 965, 14k 894 → 917, 40k 783 → 798 tok/s; the shared 37.6k read through the
+server 751 → 785. Writing is the same: the same tokens and drafts as p23b on 14 requests (77.3 tok/s against 77.5). Quality
+(p26, the same bits as p27 there): functions 45/45, English 16/16, Slovenian 12/15 (the same three), 0 of 18 answers not in
+Slovenian, 0 of 6 with foreign words, Koda's edits 24/26 at 102 tok/s; the checkpoints and parked conversations at 256k and
+512k give the same logits and tokens as reading from token 0.
+
+Checked from a clean clone of this branch (23 Nov, 10:04-10:13, commit 1190bfc in the clone of the checks above): `build.sh`
+in 61 s, `run.sh` 256k and 512k up in 54 / 46 s at 14.76 / 15.24 GiB a card, `tools/picture_check.py` read the title, and
+`tools/conversation_check.py` passed at both (a 13k chat: the second turn read 56 tokens in 0.41 s, the turn after a long
+answer 117 in 0.55 s, was 0.65); `tools/bench.py`: fresh 73.4 tok/s, the edit 88.1, a 34.7k read at 792 (256k) / 792 (512k).
+
 ## Reading faster (p19)
 
 22 Nov. A profile of a 40k read at 256k showed the time going to the NVFP4 experts (40 %), the full layers' attention (18 %),
@@ -309,8 +348,8 @@ model. Answers themselves are not watched, since a long table or matrix can repe
 
 Defaults in brackets. Presence switches (on when set at all): `INK2_STARE` (the first kernels), `INK2_FUSE_OFF`,
 `INK2_ATTN_OLD`, `INK2_MT`, `INK2_GRAF`, `INK2_ROWS2`, `INK2_FP4_ILV`, `INK2_PF_OFF` (no reading path). Value switches:
-`INK2_T1TT` (1), `INK2_WIN_SEG` (0), `INK2_PERM` (0), `INK2_FEED_T` (8, rows of a window when a short piece is read; 16 before p23), `INK2_PF_MIN` (41, the shortest piece on the
-reading path; 17 before p23), `INK2_PF_CHUNK` (2048),
+`INK2_T1TT` (1), `INK2_WIN_SEG` (0), `INK2_PERM` (0), `INK2_FEED_T` (8, rows of a window when a short piece is read; 16 before p23), `INK2_PF_MIN` (31, the shortest piece on the
+reading path; 41 before p27, 17 before p23), `INK2_PF_CHUNK` (2048),
 `INK2_PF_QSF` (1024, smaller on its own past 96k), `INK2_PF_SMB` (MB for the score matrix), `INK2_PF_ATTB` (1),
 `INK2_PF_RB` (0), `INK2_PV_SPLIT` (1), `INK2_DS_T1` (1), `INK2_DS_ROWS` (1 = k + 1 rows, 0 = all 8), `INK2_DS_PMIN` (0.7),
 `INK2_DS_RING` (on past 64k), `INK2_NG_MIN` (6), `INK2_SNAP` (1), `INK2_PF_QSF_MAX` (2048, the largest query block; a
@@ -319,7 +358,9 @@ GEMM), `INK2_XSPLIT` (4, slices of an exchange; 1 = one copy), `INK2_KV8` / `INK
 (the 512k mode), `INK2_VRAM_LOG`, `INK2_CKPT` (1, checkpoints; 0 = the one snapshot of before), `INK2_CKPT_MB` (24576,
 RAM for them), `INK2_CKPT_GAP` (4096) / `INK2_CKPT_EVERY` (16384), `INK2_PARK_MB` (32768, RAM for parked conversations; 0 =
 off), `INK2_PARK_MIN` (1024, shorter conversations are read again), `INK2_FUSE2` (6, a mask of the merged launches: 2 the
-controllers, 4 the norms and matrices; 1 the depth mixes and 8 the routing measured no gain). Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
+controllers, 4 the norms and matrices; 1 the depth mixes and 8 the routing measured no gain), `INK2_Q8G` (1, the Q8 experts
+of the reading path by `k_q8_gemm5`; 0 = f32 copies and cuBLAS), `INK2_TILE_S` (1, expert tiles of 8 and 4 tokens),
+`INK2_CATM` (0, see below). Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
 `--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--logits-all F] [--dump DIR]` for tests (`--logits-all`: every row of the last window).
 
 ## What did not help
@@ -335,3 +376,11 @@ instead of a launch of their own (single tokens +1.5 %, draft windows -8 to -13 
 instructions, not by the launch); the routing done by the router's last block (windows -1.8 to -2.7 %); the two depth mixes
 in one launch (+0.1 %); the experts' rows with a lane on several rows at once and the input in registers instead of shared
 memory (20-80 % slower than `k_fp4_rows7` / `k_fp4_rows6`, which reach 369 / 366 GB/s on a window's 32 jobs).
+
+For p25-p27: one cuBLAS call for each group of the attention's input projections that read the same input (q, gate, r and
+sink; k with dk; v with dv), into a scratch and from there to each part's buffer: 128-token pieces 322 → 320 ms only, and
+the changed bits in every layer move the routing's near ties (a 4k prompt got another first token, KL 4·10⁻³), so it stays
+off (`INK2_CATM=1` turns it on). The small expert tiles in a kernel of their own with a smaller input buffer, 3 blocks an SM
+instead of 2 (the same bits, 322 → 324 ms). One exchange instead of 4 slices on short pieces (329 against 322 ms). Our own
+GEMM for the dense Q8 matrices (an idea from `iammrduncan/tensorless`): not built, the profile leaves it little, 3 % for
+their f32 copies on a 128-token piece and cuBLAS at ~6.6 TFLOPS on the products.
