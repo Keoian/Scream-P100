@@ -36,8 +36,9 @@ struct Expert {
     const uint8_t* dn = nullptr;   // [N] rows of ffs values
     int n = 0;                     // its tokens
     int rows[16] = {};             // each one's row of x
-    float* h = nullptr;            // scratch: [n][ffs]
+    float* h = nullptr;            // scratch: [n][ffs] (exact: the card's SwiGLU of gu_out, as floats)
     float* out = nullptr;          // [n][N], row k at out + k * out_stride
+    float* gu_out = nullptr;       // exact only: [n][2 * ffs], the gate rows' sums then the up rows'
 };
 struct Work {
     uint32_t gu_type = 0, dn_type = 0;
@@ -46,7 +47,27 @@ struct Work {
     size_t x_stride = 0, out_stride = 0;
     Expert* ex = nullptr;
     int m = 0;
+    bool exact = false;            // FNX_CPU_EXACT: the card's arithmetic (below); gate|up then writes gu_out, not h
+    int gu_lanes = 2;              // exact: the card's lanes a gate|up row (FNX_ROW_G, p100_moe_rows.cuh); 1, 2, 4 or 8
 };
+
+// FNX_CPU_EXACT=1: the card's own arithmetic, so a row comes out bit for bit as the card's row kernels (p100_moe_rows.cuh) give it.
+// The card rounds each weight to fp16 (Q4_K/Q5_K: fp16(q * fp16(d sc) + fp16(-dmin m)) in one rounding; IQ4_NL, Q8_0: fp16(v * d);
+// Q5_1: fp16(q * d + m)), sums each 32-value run in two fp16 FMA chains (the even values, the odd ones; 16 steps each from +0),
+// adds the run into fp32 as s + (lo + hi), and a gate|up row's `gu_lanes` parts (equal shares of its 256-value groups) at the end,
+// as the warp's xor shuffles do. A product of two fp16 values is exact in fp32; each fp16 FMA is the fp32 sum rounded to odd and
+// then to fp16, which is the correctly rounded result (24 bits >= 11 + 2). The SwiGLU between gate|up and down is not done here:
+// the card's (__expf and the division under --use_fast_math) cannot be reproduced on a CPU, so the card computes it (p100_cpu.cuh).
+bool exact_ok(uint32_t gu_type, uint32_t dn_type);   // gate|up Q4_K or Q5_K, down IQ4_NL, Q5_1 or Q8_0
+// the oracle, on the integers (no floating point): IEEE binary16 fma and round-from-fp32, to nearest, ties to even
+uint16_t f16_fma_ref(uint16_t a, uint16_t b, uint16_t c);
+uint16_t f16_from_f32_ref(float f);
+float f16_to_f32(uint16_t h);
+// the card's sum of one row with the oracle's steps: gate|up (Q4_K/Q5_K, n values, `lanes` parts) times x; down times h (fp16 values)
+float gu_row_card_ref(uint32_t type, const uint8_t* row, int n, const uint16_t* x, int lanes);
+float dn_row_card_ref(uint32_t type, const uint8_t* row, int n, const uint16_t* h);
+// the AVX2 fp16 FMA of the exact kernels on 8 values (w * x exact in fp32): for the test; false without AVX2
+bool fma16_x8(const float* w, const float* x, const float* c, float* out);
 // gate|up rows [j0, j1) of the card's ffs: h[k][j] for the expert's tokens; then down rows [i0, i1): out[k][i]
 void gu_chunk(const Work& w, const Expert& e, int j0, int j1);
 void down_chunk(const Work& w, const Expert& e, int i0, int i1);
@@ -71,6 +92,9 @@ public:
     // workers that came to a finished round while the next was being set up, since the last call (they are turned away)
     unsigned long long late();
     void run(Work& w, const Rows* rows = nullptr);
+    // the two halves of run() alone (FNX_CPU_EXACT: the card's SwiGLU comes between them)
+    void run_gu(Work& w, const Rows* rows = nullptr);
+    void run_down(Work& w);
     int threads() const;
 private:
     struct Impl;
