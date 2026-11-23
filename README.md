@@ -4,6 +4,8 @@
 
 **Big MoE models on two retired Tesla P100s. Loud fans, fast tokens.**
 
+[![Inkling 2 Mini on two Tesla P100: 84 tok/s writing, 965 tok/s reading, an engine of its own](docs/inkling2-banner.jpg)](#-inkling-2-mini-an-engine-of-its-own)
+
 Qwen3.8-Flash-Next and Edge0-145B with a 512k context on a pair of 2016 server cards,<br>
 and Thinking Machines' **Inkling 2 Mini** on an engine of its own, `ink2`.<br>
 Built and measured for exactly **two Tesla P100 16 GB, each on its own PCIe 3.0 x16 link**.<br>
@@ -17,7 +19,7 @@ Inkling 2 Mini (`ink2`, exact): **~84 tok/s writing · ~100 tok/s Koda edits · 
 ![Context 512k](https://img.shields.io/badge/context-524%2C288%20tokens-orange)
 ![API: OpenAI-compatible](https://img.shields.io/badge/API-OpenAI--compatible-412991)
 
-[Quick start](#-quick-start) · [Speed](#-speed) · [Models](#-models) · [Inkling 2 engine](#-inkling-2-mini-an-engine-of-its-own) · [2× M40 test build](#-test-build-two-tesla-m40-24-gb) · [Hy4 test build](#-test-build-tencent-hy4-flash) · [How it works](#-how-it-works) · [Full guide](docs/GUIDE.md)
+[🦑 **Inkling 2 engine**](#-inkling-2-mini-an-engine-of-its-own) · [Quick start](#-quick-start) · [Speed](#-speed) · [Models](#-models) · [2× M40 test build](#-test-build-two-tesla-m40-24-gb) · [Hy4 test build](#-test-build-tencent-hy4-flash) · [How it works](#-how-it-works) · [Full guide](docs/GUIDE.md)
 
 </div>
 
@@ -46,6 +48,9 @@ and reads at about **1,000**.
 
 ## ✨ Highlights
 
+- 🦑 **Inkling 2 Mini on an engine of its own (`ink2`):** the whole model in VRAM, every sum exact, **83.9 tok/s writing,
+  965 tok/s reading, ~100 tok/s on code edits**, 256k or 512k context, pictures, and a chat's next turn in 0.76 s. llama.cpp
+  does 13.0 / 143 on the same two cards. [Numbers](#inkling-2-mini-ink2-on-the-same-two-cards) · [what it is](#-inkling-2-mini-an-engine-of-its-own).
 - 🧠 **Big MoE on old iron:** Qwen3.8-Flash-Next (IQ3_S or UD-Q4_K_XL) and Edge0-145B (6.6B active) on two 16 GB cards.
 - ⚡ **Fast drafting:** the MTP draft layer plus prompt lookup of up to 15 tokens. On IQ3_S with 96 GB of RAM, code and
   text edits run at over 100 tok/s.
@@ -130,6 +135,27 @@ our 96 GB server, the model files on our SAS array: the same first-token logits 
 memory. Writing code with reasoning: 73.6 / 54.0 tok/s, edits through an `edit` tool 69.2 / 42.4. A new 6,000-character
 prompt right after the long read took 8.9 s (96 GB: 3.1 s): it reads from the disk. See
 [32 GB of RAM](docs/GUIDE.md#32-gb-of-ram).
+
+### 🦑 Inkling 2 Mini (`ink2`) on the same two cards
+
+Thinking Machines' Inkling 2 Mini on `ink2`, an engine of its own (branch [`inkling2`](https://github.com/Megla123/Scream-P100/tree/inkling2)),
+**everything exact**, temperature 0, the same machine, the figures of the branch's [guide](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#speed) from 22-23 Nov 2026 (reading: the build of 23 Nov). llama.cpp is `690b87d` with a layer split
+across the same two cards, its greedy outputs match ours:
+
+| | llama.cpp (same cards) | **ink2** |
+|---|---:|---:|
+| ✍️ Fresh writing, no drafts | 13.0 tok/s | **62.2 tok/s** |
+| ✍️ Fresh writing, DSpark drafts + prompt lookup | not available | **83.9 tok/s** |
+| ✏️ Code edits (a file repeated with a change / Koda's 26 edit tasks) | not measured | **100.7 / 97.4 tok/s** |
+| 📖 Reading a 4k / 14k / 40k-token prompt | 143 / 119 / not measured | **965 / 917 / 798 tok/s** |
+| 💬 A chat's next turn (a 16k-token chat, first byte) | not measured | **0.76 s** (~20 s without checkpoints) |
+| Context | 32k measured | **256k or 512k** (needle found at 239k / 496k) |
+| VRAM a card | 14.0-14.5 GB | 8.9 GB writing only, 15.2 GiB with the drafter at 256k or 512k |
+
+Reading is 6.7x and writing 4.8x (6.5x with drafts) llama.cpp's speed on the same cards, because the whole model sits in VRAM
+and both cards work on every layer at once. On the test set of our Flash-Next builds it writes fresh answers at 71.2 tok/s
+(Flash-Next UD-Q4_K_XL: 59.3 exact, 68.9 lossy) and reads a 37.6k prompt at about 790 tok/s (802 / 987). One machine only:
+[how it was measured, the quality checks and the traps](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#speed).
 
 <details>
 <summary><b>Our machine</b></summary>
