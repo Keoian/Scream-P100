@@ -1176,14 +1176,20 @@ the segments); KL is lower with the switch on by 0.0005 (−0.0013 to +0.0003); 
 with it on, 29 less often, 8 equally (p = 0.58). So the gap of the small set shrinks to a twentieth of a point on the
 large one, no test separates it, and a loss above about 0.2 points of top-1 is excluded at 95 %.
 
-HumanEval on UD-Q4_K_XL (the 512k profile): the build before passes 158 of 164, the switch on 156 in each of two runs
-(the build before's six failures and 93 and 113 in one, 93 and 127 in the other; exact McNemar p = 0.50 each), at a
-median 70.6-70.8 tok/s against 31.2. A control, the build before with another rounding of the cards alone
-(`FNX_ONEHOP=2`), changes as many answers (29 of 164 against 29-34) and passes 158 again, with one problem gained and
-one lost. So three runs with the switch on, on two files, are each two problems under the card-only runs and never
-above them. No single comparison is significant, and the answers that fail are the long ones in which the model
-reasons its way to the code in comments and lands on a different variant, not broken text; but three of three in one
-direction is not nothing. Read it as a possible loss of about one problem in a hundred on this benchmark.
+HumanEval (164 problems, thinking off, temperature 0) does not separate the switch from the card-only build. On our
+file, eight full runs: the build before 158; the build before with one rounding-only switch changed (`FNX_ONEHOP=1`,
+`FNX_P100_ATTN_DEC=0`, `FNX_PF_F16ACC=0`) 157, 156, 156; the switch on 156, 157, 155, 158 (means 156.75 and 156.5; a
+permutation test gives p = 1.0). On UD-Q4_K_XL: 158 and 158 (`FNX_ONEHOP=2`) against 156 and 156. Two of the card-only
+controls lose exactly the problems the switch's first run lost. Over the twelve runs 161 of the 164 problems pass at
+least once and three fail every time, so a count of 158 is one draw from a scatter of two or three problems that any
+change of rounding moves.
+
+Where the answers part ways (`diverge.py` in our records: 16 places over six problems, each scored by llama.cpp, the
+cards, two card-only rounding variants and the switch twice): every one is a fork between the two leading candidates,
+under llama.cpp too. There the switch's log-odds are nearer llama.cpp's (RMS distance 0.15-0.18) than the cards' (0.26)
+or the card-only variants' (0.27-0.28); over all 8,505 positions its shift against the cards is what one rounding
+switch gives (0.106 against 0.087-0.107). So it claims no gain in passed problems and concedes no loss: the counts
+carry neither.
 
 **Pictures** with `--vram-elastic` (the profile of "Pictures on a card", two sequences an arm): the chart in 12.2-12.5 s
 against 13.2-15.1 s (5/5 both), the 4K report in 11.7-11.8 s against 13.1-13.2 s (11/12 items both, 2-3 of 3 circles
@@ -1218,7 +1224,8 @@ values up to 16. A 2-row window's list (4.5 experts) takes the CPU 256 µs, a 16
 **Not bit for bit, and not repeatable.** A CPU-computed expert is the same arithmetic in fp32 where the cards' row
 kernels sum in fp16, so its rows differ from the cards' in the last bits (`FNX_CPU_CHECK=1` runs both and compares: 1.56
 million rows within 0.008 at values up to 15). Which experts are in VRAM at a given window therefore matters for those
-bits, and with the prefetch that is a race: a guessed copy has landed when its layer plans, or it has not. Two runs of
+bits, and with the prefetch that differs from run to run (a layer waits for its prefetched copies, so it is not a race
+over a copy; which experts the prefetch has put on the cards is what differs). Two runs of
 the same requests with the switch on are not bit for bit the same: of the 27 benchmark requests' first-token logits 1
 is identical between two runs (on either file), the top token is the same in all, KL against the build before 0.0007 to
 0.0045; eight greedy answers share their first 100-600 characters with the build before's and then go their own way.
