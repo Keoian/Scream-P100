@@ -322,6 +322,11 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
 
 ## 📰 News
 
+- **23 Nov 2026 (late evening):** 🦑 **Inkling 2 Mini: reasoning effort low by default** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#reasoning-effort-low-by-default-23-nov).
+  A request that names no effort (Open WebUI sends none) now gets low (0.2) instead of 0.9: on our quality sets low gave
+  45/45 functions in 29.6k tokens, medium (0.7) 42/45 in 52.0k with 3 empty answers. Effort none without tools answers
+  without reasoning, and a tool call written without its comma before `args` is read as a call. Sampling at temperature 1.0
+  over the whole vocabulary was tried and left out (7/45 functions).
 - **23 Nov 2026 (evening):** 🦑 **Inkling 2 Mini on one P100** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#one-p100-ink2_1c-23-nov): `ink2_1c`,
   the same engine for one card. The whole model does not fit (experts 15.4 GiB), so the experts used most stay in VRAM by a
   plan from routing traces and the others wait in page-locked RAM; after each layer's routing the card copies the picked RAM
