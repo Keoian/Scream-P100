@@ -1,5 +1,6 @@
 #!/bin/bash
-# engine-inkling2/build.sh: builds the Inkling 2 Mini engine (build/ink2_v1, one CUDA program for two Tesla P100, sm_60) and,
+# engine-inkling2/build.sh: builds the Inkling 2 Mini engine (build/ink2_v1, one CUDA program for two Tesla P100, sm_60), its
+# one-card build (build/ink2_1c from src-1c/: one P100, the experts that do not fit in VRAM in RAM; run.sh INK2_CARDS=1) and,
 # from llama.cpp at commit 690b87d on the CPU (no CUDA in that build): llama-tokenize and gguf-py for the server's tokenizer,
 # libmtmd for build/ink2_vis, the picture encoder (the vision projector runs on the CPU; the cards are full of the engine),
 # and build/ink2_tok, the same tokenizer as a process that stays up (llama-tokenize takes 0.9 s to start for every request).
@@ -12,6 +13,9 @@ H=$(pwd); B=$H/build; mkdir -p "$B"
 HOST_CXX=${HOST_CXX:-g++}
 echo "== ink2_v1 (nvcc, host compiler $HOST_CXX)"
 (cd src && nvcc -O2 -std=c++17 -arch=sm_60 -ccbin "$HOST_CXX" -o "$B/ink2_v1" ink2_v1.cu gguf_min.cpp -lcublas)
+echo "== ink2_1c (one P100, nvcc, host compiler $HOST_CXX)"
+(cd src-1c && nvcc -O2 -std=c++17 -arch=sm_60 -ccbin "$HOST_CXX" -DINK2_NC=1 -DINK2_RING=2048 -I../src -o "$B/ink2_1c" ink2_v1.cu \
+  ../src/gguf_min.cpp -lcublas)
 LC=690b87d; LB=$B/llama.cpp
 if [ ! -f "$LB/CMakeLists.txt" ]; then
   echo "== llama.cpp $LC: sources"
@@ -29,4 +33,4 @@ echo "== ink2_vis (pictures, $HOST_CXX)"
 echo "== ink2_tok (the tokenizer that stays up, $HOST_CXX)"
 "$HOST_CXX" -O2 -std=c++17 -I"$LB/include" -I"$LB/ggml/include" -o "$B/ink2_tok" src/ink2_tok.cpp \
   -L"$LB/build/bin" -lllama -lggml -lggml-base -Wl,-rpath,"$LB/build/bin"
-echo "done: $B/ink2_v1, $B/ink2_vis, $B/ink2_tok, $LB/build/bin/llama-tokenize"
+echo "done: $B/ink2_v1, $B/ink2_1c, $B/ink2_vis, $B/ink2_tok, $LB/build/bin/llama-tokenize"

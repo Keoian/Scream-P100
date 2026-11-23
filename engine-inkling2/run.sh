@@ -12,6 +12,11 @@
 # characters) and its progress line while a request runs (60 s). The engine keeps conversations' checkpoints and parked
 # conversations in RAM (up to INK2_CKPT_MB = 24576 and INK2_PARK_MB = 32768 MiB, taken as they are needed; set them lower on
 # a machine with less RAM).
+# One P100 (docs/INKLING2.md "One P100"): INK2_CARDS=1 runs build/ink2_1c on CUDA_VISIBLE_DEVICES (default 0) without the drafter:
+# the experts that fit stay in VRAM in data/plan_1c.txt's order, the rest in RAM (~5 GiB at 32k; checkpoints up to 2048 MiB, no
+# parked conversations), with an on-card cache of RAM experts (INK2_1C_CACHE_MB, 1536). INK2_LOSSY=1 (one card only) requantizes
+# the last 4 layers' Q8 experts to NVFP4 at load: ~18 % faster writing and ~2 GiB less RAM, but the output changes (see the docs).
+# The context costs the card's room for experts: 32768 is the default, 65536 still runs well; above that writing slows.
 set -euo pipefail
 H=$(cd "$(dirname "$0")" && pwd); B=$H/build
 D=${1:?usage: run.sh DATA [CTX|256k|512k] [PORT]}; CTX=${2:-32768}; PORT=${3:-8080}
@@ -26,13 +31,20 @@ if [ "$LOG" != 0 ] && touch "$LOG" 2>/dev/null; then
 elif [ "$LOG" != 0 ]; then
   echo "run.sh: cannot write $LOG, the log goes to the terminal only" >&2
 fi
+ENG=$B/ink2_v1; DRAFT=(--mtp "$D/dspark-Inkling-2-Mini-Q8_0.gguf" --draft-vocab "$H/data/draft_vocab_32768.bin"); MODE="both cards"
+if [ "${INK2_CARDS:-2}" = 1 ]; then   # one P100: build/ink2_1c, no drafter (on one card its rejected drafts cost PCIe transfers too)
+  ENG=$B/ink2_1c; DRAFT=(); MODE="one card"
+  export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} INK2_1C_PLAN=${INK2_1C_PLAN:-$H/data/plan_1c.txt} \
+    INK2_1C_CACHE_MB=${INK2_1C_CACHE_MB:-1536} INK2_1C_MARGIN_MB=${INK2_1C_MARGIN_MB:-150}
+  if [ "${INK2_LOSSY:-0}" = 1 ]; then export INK2_1C_Q8_FP4=1; MODE="one card, lossy (last 4 layers NVFP4)"; fi
+  [ -x "$ENG" ] || { echo "no $ENG: run build.sh again" >&2; exit 1; }
+fi
 MMPROJ=$D/mmproj-Inkling-2-Mini-BF16.gguf; VIS=()
 if [ "${INK2_PICTURES:-1}" != 0 ] && [ -f "$MMPROJ" ] && [ -x "$B/ink2_vis" ]; then VIS=(--mmproj "$MMPROJ" --vis "$B/ink2_vis"); fi
-echo "run.sh: context $CTX ($([ "$CTX" -gt 262144 ] && echo "KV int8 from row 32768" || echo "KV f16")), pictures $([ ${#VIS[@]} -gt 0 ] && echo on || echo off), port $PORT, commit $(git -C "$H" log -1 --format=%h 2>/dev/null || echo ?)" >&2
+echo "run.sh: $MODE, context $CTX ($([ "$CTX" -gt 262144 ] && echo "KV int8 from row 32768" || echo "KV f16")), pictures $([ ${#VIS[@]} -gt 0 ] && echo on || echo off), port $PORT, commit $(git -C "$H" log -1 --format=%h 2>/dev/null || echo ?)" >&2
 SOCK=$D/ink2-$PORT.sock
 rm -f "$SOCK"
-"$B/ink2_v1" --model "$D/Inkling-2-Mini-NVFP4-Q8_0.gguf" --mtp "$D/dspark-Inkling-2-Mini-Q8_0.gguf" \
-  --draft-vocab "$H/data/draft_vocab_32768.bin" --serve "$SOCK" --ctx "$CTX" &
+"$ENG" --model "$D/Inkling-2-Mini-NVFP4-Q8_0.gguf" ${DRAFT[@]+"${DRAFT[@]}"} --serve "$SOCK" --ctx "$CTX" &
 EP=$!
 trap 'kill $EP 2>/dev/null' EXIT
 for i in $(seq 180); do [ -S "$SOCK" ] && break; kill -0 $EP 2>/dev/null || { echo "the engine ended while loading" >&2; exit 1; }; sleep 1; done
