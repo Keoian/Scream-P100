@@ -68,6 +68,8 @@ public:
         int T = 0;
         float* xf = nullptr;
     };
+    // workers that came to a finished round while the next was being set up, since the last call (they are turned away)
+    unsigned long long late();
     void run(Work& w, const Rows* rows = nullptr);
     int threads() const;
 private:

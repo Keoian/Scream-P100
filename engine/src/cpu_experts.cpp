@@ -554,12 +554,19 @@ struct Pool::Impl {
     std::vector<std::thread> th;
     std::atomic<bool> stop{false};
     // a round: its number in the ticket's high half, the next chunk in its low half. A round's fields below are written before its
-    // ticket and stay until every chunk of it is done, so whoever takes a chunk with the ticket reads that round's fields
-    std::atomic<uint64_t> ticket{0};
+    // ticket and stay until every chunk of it is done, so whoever takes a chunk with the ticket reads that round's fields.
+    // limit: the round's number and its count of chunks in ONE word, written before the ticket. The count was a word of its own at
+    // first: a worker that had just finished a round's last chunk (or came late to it) then read the old round's spent ticket, and
+    // after it the NEXT round's larger count, which the host thread had stored in between; if its compare-and-swap also came before
+    // the new ticket, it took a chunk beyond the old round, computed that chunk of the new round and counted it done there, and the
+    // new round ended one chunk early: its rows read while a worker was still writing them. The rows' round (a short chunk a row,
+    // windows of more than 4 rows) before the gate|up round is where it happened: about one such list in six thousand on one card of
+    // the two here, none on the other
+    std::atomic<uint64_t> ticket{0}, limit{0};
     std::atomic<int> done{0};
+    std::atomic<unsigned long long> late{0};   // workers that met a spent ticket and the next round's count: turned away
     const Work* w = nullptr;
     const Pool::Rows* rows = nullptr;
-    std::atomic<int> total{0};
     int phase = 0, per = 0;   // phase 0: the window's rows; 1: gate|up chunks; 2: down chunks
     uint32_t round = 0;
     std::atomic<int> asleep{0};
@@ -582,8 +589,13 @@ struct Pool::Impl {
         uint64_t t = ticket.load(std::memory_order_acquire);
         for (;;) {
             if ((uint32_t) (t >> 32) != r) return any;
+            const uint64_t lim = limit.load(std::memory_order_acquire);
             const int i = (int) (uint32_t) t;
-            if (i >= total.load(std::memory_order_acquire)) return any;
+            if ((uint32_t) (lim >> 32) != r) {   // round r is over, the next one is being set up
+                if (i < (int) (uint32_t) lim) late.fetch_add(1, std::memory_order_relaxed);
+                return any;
+            }
+            if (i >= (int) (uint32_t) lim) return any;
             if (!ticket.compare_exchange_weak(t, t + 1, std::memory_order_acq_rel, std::memory_order_acquire)) continue;
             chunk(i);
             done.fetch_add(1, std::memory_order_release);
@@ -630,9 +642,9 @@ struct Pool::Impl {
         per = ph == 1 ? (work.ffs + GU_CHUNK - 1) / GU_CHUNK : ph == 2 ? (work.N + DN_CHUNK - 1) / DN_CHUNK : 1;
         const int n = ph == 0 ? r->T : work.m * per;
         if (n <= 0) return;
-        total.store(n, std::memory_order_release);
         done.store(0, std::memory_order_release);
         ++round;
+        limit.store((uint64_t) round << 32 | (uint32_t) n, std::memory_order_release);
         ticket.store((uint64_t) round << 32, std::memory_order_release);
         if (asleep.load(std::memory_order_acquire) > 0) {
             std::lock_guard<std::mutex> g(mu);
@@ -655,6 +667,7 @@ Pool::~Pool() {
     for (auto& t : p_->th) t.join();
 }
 int Pool::threads() const { return (int) p_->th.size(); }
+unsigned long long Pool::late() { return p_->late.exchange(0, std::memory_order_relaxed); }
 void Pool::run(Work& w, const Rows* rows) {
     if (w.m <= 0) return;
     if (rows && rows->x16) {

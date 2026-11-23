@@ -34,6 +34,7 @@ struct CpuDev {   // VRAM
 static_assert(offsetof(CpuDev, seq) == 0 && offsetof(CpuDev, want) == sizeof(unsigned), "the router's last block writes CpuDev's seq and want as words 0 and 1 (moe.cuh)");
 struct CpuStat {
     std::atomic<unsigned long long> lists{0}, experts{0}, rows{0}, ns_work{0}, ns_send{0}, by_t[MAXT + 1], ex_t[MAXT + 1], ns_t[MAXT + 1], worst_ns{0};
+    std::atomic<unsigned long long> pool_late{0};   // cpux::Pool::late
 };
 struct CpuCard {
     int dev = 0, node = -1;
@@ -237,6 +238,7 @@ void cpu_loop(CpuCard* c) {
         st.ex_t[T].fetch_add((unsigned long long) m, std::memory_order_relaxed);
         st.ns_t[T].fetch_add(nw, std::memory_order_relaxed);
         if (nw > st.worst_ns.load(std::memory_order_relaxed)) st.worst_ns.store(nw, std::memory_order_relaxed);
+        if (const unsigned long long pl = pool.late()) st.pool_late.fetch_add(pl, std::memory_order_relaxed);
         last = s;
         idle_since = std::chrono::steady_clock::now();
     }
@@ -355,6 +357,8 @@ void p100_cpu_report(void* h, bool check) {
     }
     std::fprintf(stderr, "fnx: cpu experts, card %d: %llu lists, %.2f experts and %.2f rows a list, %.0f us a list on the CPU (worst %.0f), %.0f us to send;%s\n",
                  c->dev, lists, (double) ex / lists, (double) rows / lists, nw / 1e3 / lists, worst / 1e3, ns / 1e3 / lists, by.c_str());
+    if (const unsigned long long pl = s.pool_late.exchange(0); pl || check)
+        std::fprintf(stderr, "fnx: cpu experts, card %d: %llu workers came to a finished round of the pool as the next was set up (turned away)\n", c->dev, pl);
     if (check) {
         CpuDev d;
         cudaSetDevice(c->dev);
