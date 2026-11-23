@@ -69,6 +69,8 @@ void p100_cpu_report(void* h, bool check);
 bool p100_cpu_exact_on(void* h);
 void p100_cpu_swiglu(void* h, void* st);
 void p100_cpu_swiglu_probe(const float* gu, int nr, int ffs, uint16_t* h, void* st);   // tools/cpu_exact_gpu_test.cu
+// FNX_CPU_CHECK with FNX_CPU_EXACT, after the take: the CPU's gate|up sums and the SwiGLU of them against the card's own, counted
+void p100_cpu_check_stages(void* h, const float* gu, const uint16_t* h16, void* st);
 // FNX_PF_REFILL=1: the copier also fills the prompt path's slots after a read, between its lists: an entry an expert, done its pool's count
 // once it has landed (Engine::pf_refill_start, pf_refill_tick)
 struct DmaFill {
