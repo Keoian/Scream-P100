@@ -30,6 +30,9 @@
 #   --models DIR     the model files somewhere else (for example already downloaded); missing ones are downloaded there
 #   --strata DIR     an existing Strata checkout at v0.2.9 instead of DATA/strata-v0.2.9
 #   --no-pictures    no projector download, no encoder build, a profile without pictures
+#   --pictures-gpu   the picture encoder on the first of the two cards only while pictures come (the engine's --vram-elastic;
+#                    docs/GUIDE.md, "Pictures on a card"): a 4K picture in seconds instead of on the CPU, each card lends
+#                    1.6 GiB of expert slots while the encoder runs. The default 96 GB mode only
 #   --route-prior X  FNX_ROUTE_PRIOR in the profile: 0 (default) is exact; 0.15 is our production setting, faster, lossy
 #   --ram 64         the 64 GB mode in the profile; default 96. IQ3_S: 262,144 positions, the lookup table from the disk.
 #                    UD-Q4_K_XL (exact, not with --fast; docs/GUIDE.md, "UD-Q4_K_XL on 64 GB"): 524,288 positions, no expert
@@ -82,16 +85,17 @@ declare -A SHA=([${IQ3_S[0]}]=4c1eb2ceb4915e1192f4f386021897bde56a97f40a0bb78bb8
                 [${EDGE0_FILES[3]}]=ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06
                 [$MMPROJ]=b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0)
 
-[ $# -ge 1 ] && [ "${1#-}" = "$1" ] || die "usage: bash setup.sh DATA [--model iq3_s|q4_k_xl|edge0] [--models DIR] [--strata DIR] [--no-pictures] [--route-prior X] [--ram 96|64|32] [--coder] [--fast] [--gpu A,B] [--check]"
+[ $# -ge 1 ] && [ "${1#-}" = "$1" ] || die "usage: bash setup.sh DATA [--model iq3_s|q4_k_xl|edge0] [--models DIR] [--strata DIR] [--no-pictures] [--pictures-gpu] [--route-prior X] [--ram 96|64|32] [--coder] [--fast] [--gpu A,B] [--check]"
 DATA=$1
 shift
-MODEL=iq3_s MODELS='' STRATA='' PICTURES=1 PRIOR=0 RAM=96 CODER=0 FAST=0 CHECK=0 GPU=''
+MODEL=iq3_s MODELS='' STRATA='' PICTURES=1 PICTURES_GPU=0 PRIOR=0 RAM=96 CODER=0 FAST=0 CHECK=0 GPU=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) MODEL=${2:?--model iq3_s, q4_k_xl or edge0}; case "$MODEL" in iq3_s|q4_k_xl|edge0) ;; *) die "--model: iq3_s, q4_k_xl or edge0" ;; esac; shift 2 ;;
     --models) MODELS=${2:?--models DIR}; shift 2 ;;
     --strata) STRATA=${2:?--strata DIR}; shift 2 ;;
     --no-pictures) PICTURES=0; shift ;;
+    --pictures-gpu) PICTURES_GPU=1; shift ;;
     --route-prior) PRIOR=${2:?--route-prior X}; shift 2 ;;
     --ram) RAM=${2:?--ram 96, 64 or 32}; [ "$RAM" = 96 ] || [ "$RAM" = 64 ] || [ "$RAM" = 32 ] || die "--ram: 96, 64 or 32"; shift 2 ;;
     --coder) CODER=1; shift ;;
@@ -107,6 +111,8 @@ done
 [ "$RAM" != 32 ] || { [ "$MODEL" = q4_k_xl ] && [ "$CODER$FAST" != 00 ]; } ||
   die "--ram 32: only with --model q4_k_xl and --coder or --fast (docs/GUIDE.md, \"32 GB of RAM\")"
 [ "$CODER" = 0 ] || [ "$MODEL" != edge0 ] || die "--coder: not with --model edge0 (the Coder's list names Flash-Next's experts, not Edge0's)"
+[ "$PICTURES_GPU" = 0 ] || [ "$PICTURES" = 1 ] || die "--pictures-gpu: not with --no-pictures"
+[ "$PICTURES_GPU" = 0 ] || [ "$RAM" = 96 ] || die "--pictures-gpu: the default 96 GB mode only (docs/GUIDE.md, \"Pictures on a card\")"
 [ "$FAST" = 0 ] || [ "$MODEL" = q4_k_xl ] || die "--fast: only with --model q4_k_xl (the settings were measured on UD-Q4_K_XL only)"
 [ "$FAST" = 0 ] || [ "$PRIOR" = 0 ] || die "--fast sets FNX_ROUTE_PRIOR=1.0 itself: leave --route-prior out"
 abspath() { case "$1" in /*) echo "$1" ;; *) echo "$PWD/$1" ;; esac; }
@@ -357,6 +363,7 @@ else
   mkdir -p "$DATA/logs"
   vis=()
   [ "$PICTURES" = 1 ] && vis=(--vision-exe "$VISION")
+  [ "$PICTURES_GPU" = 1 ] && vis+=(--pictures-gpu)
   coder=()
   [ "$CODER" = 1 ] && coder=(--coder)
   [ "$FAST" = 1 ] && coder+=(--fast)

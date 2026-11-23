@@ -98,6 +98,17 @@ Args parse_args(int argc, char** argv) {
             ::setenv("FNX_ROPE_SCALE", s.c_str(), 1);
         }
         else if (k == "--vision") a.vision = true;
+        else if (k == "--vram-elastic") {   // Strata's server adds it for "vram_elastic": true; the engine reads FNX_VRAM_ELASTIC
+            if (const char* e = std::getenv("FNX_VRAM_ELASTIC"); e && std::strcmp(e, "1"))
+                throw std::runtime_error(std::string("--vram-elastic and FNX_VRAM_ELASTIC=") + e + " disagree");
+            ::setenv("FNX_VRAM_ELASTIC", "1", 1);
+        }
+        else if (k == "--vram-segment-mib") {   // Strata's server adds it for "vram_segment_mib": the chunk size (FNX_VRAM_CHUNK_MIB)
+            const std::string v = val();
+            if (const char* e = std::getenv("FNX_VRAM_CHUNK_MIB"); e && v != e)
+                throw std::runtime_error("--vram-segment-mib " + v + " and FNX_VRAM_CHUNK_MIB=" + e + " disagree");
+            ::setenv("FNX_VRAM_CHUNK_MIB", v.c_str(), 1);
+        }
         else throw std::runtime_error("unknown argument " + k);
     }
     if (!serve) throw std::runtime_error("sfnx runs as --serve");
@@ -449,7 +460,7 @@ struct Server {
         last_upkeep = now;
         bool lent = false;
         for (int v : e.arena_lent()) lent = lent || v > 0;
-        if (!lent) return;
+        if (!lent || !e.kv_lent_beyond_hold()) return;   // slots held for --vram-elastic come back with VRAM 0, not by parking
         const int was = e.lane();
         for (int i = 0; i < (int) slots.size(); ++i) {
             Slot& s = slots[(size_t) i];
@@ -1006,6 +1017,31 @@ struct Server {
                      st.prompt_tokens, st.reused, st.prompt_tokens - st.reused, st.prompt_ms, busy);
     }
 
+    // VRAM [mib] [key=value ...] (Strata's #533, its server's elastic picture reader): between requests, with --vram-elastic.
+    // Every card lends the same slots (each expert is split across the cards), so a gpu=N is not needed and ignored
+    void vram(const std::string& line) {
+        long mib = 0;
+        std::istringstream is(line.substr(4));
+        for (std::string t; is >> t;)
+            if (t.find('=') == std::string::npos) {
+                try {
+                    mib = std::stol(t);
+                } catch (const std::exception&) {
+                    say("ERR VRAM: '" + t + "' is not a number of MiB");
+                    return;
+                }
+            }
+        if (any_decoding()) {
+            say("ERR VRAM: slots are decoding (--batch); it runs between requests");
+            return;
+        }
+        try {
+            say(e.vram(mib));
+        } catch (const std::exception& ex) {
+            say(std::string("ERR ") + ex.what());
+        }
+    }
+
     void run() {
         std::string line;
         long seq = 0;
@@ -1020,6 +1056,10 @@ struct Server {
             if (line.empty()) continue;
             const std::string cmd = line.substr(0, line.find(' '));
             if (cmd == "QUIT") return;
+            if (cmd == "VRAM") {
+                vram(line);
+                continue;
+            }
             if (cmd != "GEN" && cmd != "BGEN" && cmd != "GENI" && cmd != "BGENI") {
                 say("ERR " + cmd + ": not supported by sfnx");
                 continue;

@@ -166,6 +166,19 @@ Off, or at the value the engine picks, unless you set them. None is needed to re
 | `FNX_LAT_DUMP`, `FNX_LAT_DUMP_L` | off, 20 | with `FNX_LATENT`: the first prompt chunk to reach layer `FNX_LAT_DUMP_L` writes each card's input rows, picks, weights and U output into the folder `FNX_LAT_DUMP` (we recomputed the layer from them in NumPy in FP64) |
 | `FNX_RR_TIMES`, `FNX_PA_CHECK`, `FNX_QSA_DUMP`, `FNX_QSA_DUMP_EVERY`, `FNX_QSA_DUMP_MAX`, `FNX_NVPROF_PASS`, `FNX_NVPROF_WIN`, `FNX_NVPROF_WINS` | off | diagnostics: router timings, kernel cross-checks, score dumps, `nvprof` capture of one prompt pass or a run of windows |
 
+## Pictures on a card (`--vram-elastic`)
+
+Off unless the profile has `"vram_elastic": true` (`setup.sh --pictures-gpu` writes it, with the vision block's
+`"gpu"`, `"elastic"`, `"elastic_mib"` and `"elastic_idle_s"`; [GUIDE.md](GUIDE.md#pictures-on-a-card-only-while-they-come)).
+Measured on our server on 21 Nov 2026 (two P100 at 150 W, card 0 at x8; bitlamas' Q4_K_XL-IQ4NL with the tuned UD-Q4_K_XL
+settings, rounds `mv-w1`, `mv-w3`).
+
+| Switch | Unset | Origin | What it does | Output effect | Measured |
+|---|---|---|---|---|---|
+| `FNX_VRAM_ELASTIC` (sfnx's `--vram-elastic`, which Strata's server adds for `"vram_elastic": true`) | 0 | ours | each card's arena allocation (the K/V pool's own pages, then the arena pool's slots) from CUDA's virtual memory API in chunks instead of one `cudaMalloc`; between requests `VRAM <mib>` lends the K/V pool's next pages from the coldest slots as a long context would, keeps them out of the pool and gives their chunks to the driver, so every card has `<mib>` free for another process (Strata's picture encoder); `VRAM 0` takes them back, zeroed, and the slots are filled again hottest first | none (first-token logits of 27 bench requests and 8 greedy answers byte-identical, 3 rounds) | `VRAM 1623`: 1,186 of 7,778 slots lent, 1,536 MiB of each card given back, 114-122 ms; `VRAM 0`: 459-480 ms; 14 MiB less VRAM free after the load (whole chunks); benchmark within the spread of the build before |
+| `FNX_VRAM_CHUNK_MIB` (`--vram-segment-mib`, from `"vram_segment_mib"`) | 32 | ours | the chunk size, rounded up to the card's allocation granularity (2 MiB on the P100); a lend loses at most a chunk at each end to the slots beside it | none | |
+| `FNX_VRAM_CHURN` | off | ours | a test, with `--vram-elastic`: MIB given to the driver and taken back before every window, so the lend, the give-back and the refill run beside every kind of window | none (686 lends and give-backs in 8 greedy answers: every answer and first-token logit byte-identical) | about 0.16 s a window at 600 MiB |
+
 ## Strata's switches
 
 The engine keeps every switch of Strata v0.2.10's split engine. The ones not covered above are listed here; see

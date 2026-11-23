@@ -14,6 +14,12 @@
 --mtp        the MTP draft layer's runtime folder (dense.bin, dense.txt, experts.bin; README, "The MTP draft layer")
 --tokenizer  the tokenizer folder (vocab.json, merges.txt, chat_template.jinja ...; README, "The tokenizer folder")
 --vision-exe Strata's strata-vision; leave it out to run without pictures (the "vision" block and --vision go)
+--pictures-gpu the picture encoder on the first card of --gpu (vision.cuda_device), only while pictures come: the engine's --vram-elastic
+             ("vram_elastic": true) and the vision block's "gpu", "elastic", "elastic_mib" 1623 (the encoder's 1,367 MiB
+             peak with ISTA-DASLab's BF16 projector at 1,024 picture tokens, plus 256) and "elastic_idle_s" 120. The first
+             picture lends that much of each card's expert slots to the driver and starts the encoder (a few seconds); 120 s
+             after the last one the encoder stops and the slots come back (docs/GUIDE.md, "Pictures on a card"). Needs
+             --vision-exe, the default 96 GB mode
 --route-prior FNX_ROUTE_PRIOR: 0 (default) is exact; 0.15 is our production setting, faster and lossy (README)
 --draft-vocab another draft vocabulary than engine/data/draft_vocab_sl.bin, e.g. engine/data/draft_vocab_en.bin
 --exe        the engine, if build.sh was run with another build directory (default build/split/strata-split-2; with
@@ -67,6 +73,9 @@ def main():
     ap.add_argument("--mtp", required=True)
     ap.add_argument("--tokenizer", required=True)
     ap.add_argument("--vision-exe")
+    ap.add_argument("--pictures-gpu", action="store_true",
+                    help="the picture encoder on the first card of --gpu only while pictures come (--vram-elastic; docs/GUIDE.md, "
+                         "\"Pictures on a card\")")
     ap.add_argument("--logs", default="/var/tmp")
     ap.add_argument("--route-prior", default="0")
     ap.add_argument("--draft-vocab", help="another draft vocabulary (default engine/data/draft_vocab_sl.bin)")
@@ -137,6 +146,17 @@ def main():
     if not a.vision_exe:
         cfg.pop("vision")
         cfg["args"].remove("--vision")
+    if a.pictures_gpu:
+        if not a.vision_exe:
+            sys.exit("--pictures-gpu needs --vision-exe")
+        if a.ram != "96":
+            sys.exit("--pictures-gpu: measured with the 96 GB mode only (README, docs/GUIDE.md \"Pictures on a card\")")
+        # 21 Nov 2026 (docs/GUIDE.md, "Pictures on a card"): the encoder on the first of the engine's cards while pictures come;
+        # the engine lends each card's coldest expert slots to the driver for it (--vram-elastic), and takes them back 120 s
+        # after the last picture. cuda_device is numbered as nvidia-smi numbers the cards, as "gpu" is
+        cfg["vram_elastic"] = True
+        cfg["vision"].update({"gpu": True, "cuda_device": int(cards[0]), "elastic": True, "elastic_mib": 1623,
+                              "elastic_idle_s": 120})
     if a.ram == "64" and a.model == "q4_k_xl":
         # the exact UD-Q4_K_XL's 64 GB mode of 19 Nov 2026 (docs/GUIDE.md, "UD-Q4_K_XL on 64 GB"): the profile's own settings
         # (lambda 0, 524,288 positions) on the low-RAM engine; no expert pinned in RAM, the experts the cards do not hold (52.1 GiB)
@@ -191,7 +211,7 @@ def main():
     if missing:
         sys.exit("missing, nothing written:\n  " + "\n  ".join(missing))
     Path(a.out).write_text(json.dumps(cfg, indent=1) + "\n", encoding="utf-8")
-    print(f"wrote {a.out} ({a.model}, FNX_ROUTE_PRIOR={cfg['env']['FNX_ROUTE_PRIOR']}, pictures {'on' if 'vision' in cfg else 'off'}, "
+    print(f"wrote {a.out} ({a.model}, FNX_ROUTE_PRIOR={cfg['env']['FNX_ROUTE_PRIOR']}, pictures {('on card ' + str(cfg['vision'].get('cuda_device', 0)) + ' while they come' if cfg['vision'].get('elastic') else 'on') if 'vision' in cfg else 'off'}, "
           f"{a.ram} GB of RAM{f' (a RAM tier of at most {a.ssd_ram_gib:g} GiB a card)' if low else ''}"
           f"{', the Coder experts' if a.coder and not a.fast else ''}"
           f"{', FAST (lossy: Coder mask, λ 1.0, FNX_ONEHOP=2)' if a.fast else ''})")

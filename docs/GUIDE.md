@@ -961,6 +961,92 @@ while writing). The UD-Q4_K_XL profiles differ in ten of them ([docs/SWITCHES.md
 To stay within the trained 262,144 positions, edit the written JSON: `--max-context 262144`, and remove `FNX_ROPE_SCALE`
 and `FNX_YARN_ORIG_CTX`.
 
+## Pictures on a card, only while they come
+
+By default the picture encoder runs on the CPU. `setup.sh ... --pictures-gpu` (or `fill_profile.py --pictures-gpu`)
+puts it on the first of the engine's two cards instead (card 0, or the first of `--gpu A,B`), but only while pictures come: Strata's server starts the encoder with the first picture and
+stops it 120 s after the last one. While it runs, each card lends about 1.4-1.5 GiB of its coldest expert slots to the
+driver for it; when it stops, the slots come back and are filled again, hottest first. Text requests keep working
+throughout, and without a picture nothing is lent.
+
+It is the same encoder binary `setup.sh` builds (a CUDA build the default profile runs on the CPU). The profile keys, if
+you edit an existing `profile.json` by hand:
+
+```json
+"vram_elastic": true,
+"vision": { ..., "gpu": true, "cuda_device": 0, "elastic": true, "elastic_mib": 1623, "elastic_idle_s": 120 }
+```
+
+`"vram_elastic": true` makes Strata's server start the engine with `--vram-elastic`. `cuda_device` is the first card of
+the profile's `"gpu"`, numbered as nvidia-smi numbers it (`fill_profile.py` writes it so). `elastic_mib` is what every card
+keeps free while the encoder runs: its peak of 1,367 MiB with ISTA-DASLab's BF16 projector at the profile's 1,024
+picture tokens, plus 256. With `"max_tokens": 3600` (finer pictures) the encoder peaks at 1,719 MiB: set `elastic_mib`
+to 1975. On the Q4 below that read the 4K report in 22.1-22.4 s with every item and circle right (12/12, 3/3), as long as
+the CPU encoder takes at 1,024 tokens; the encoder then starts in 9.7-11.6 s and each card lends 1,453 slots (1,888 MiB).
+
+**How it works.** With `--vram-elastic` (`FNX_VRAM_ELASTIC=1`) each card's arena allocation (the K/V pool's own pages,
+then the arena pool's slots) comes from CUDA's virtual memory API in 32 MiB chunks instead of one `cudaMalloc`, at the
+same addresses. When the server sends `VRAM <mib>` between requests, the engine lends the K/V pool's next pages from the
+coldest slots exactly as a long context does (the slots' experts are read from RAM, CLOCK skips the slots), keeps those
+pages out of the K/V pool and unmaps their chunks, so the driver has the memory for the encoder process. `VRAM 0` maps
+the chunks again, zeroes them and gives the slots back (`arena_refill`). Each expert is split across both cards, so both
+cards lend the same slots; the encoder uses the first card's. The switches are in [SWITCHES.md](SWITCHES.md#pictures-on-a-card---vram-elastic).
+
+**Measured** (21 Nov 2026, our server: two Tesla P100 16 GB at a 150 W cap, card 0 at PCIe 3.0 x8, 2 x Xeon E5-2696 v3;
+ISTA-DASLab's BF16 projector at 1,024 picture tokens; Strata v0.2.9's server). Two models: ISTA-DASLab's IQ3_S with the
+profile `fill_profile.py` writes (the 512k template; the only change: the draft layer's experts as Q4_0, `FNX_MTP_EXPERTS=q4_0`,
+which changes speed only), and bitlamas' Q4_K_XL-IQ4NL (another Q4 build of Flash-Next, 63.5 GiB of experts) with our tuned
+UD-Q4_K_XL settings at 262,144 positions. Each arm a fresh load, three sequences of: text, a 1024x768 chart, text, a 4K
+report, text, a 17K-token read (every picture a new file, so the server's encode cache never answers):
+
+| | IQ3_S, encoder on the CPU | IQ3_S, `--pictures-gpu` | Q4, encoder on the CPU | Q4, `--pictures-gpu` |
+|---|---:|---:|---:|---:|
+| the chart: time to the answer (with the encoder's start, the first picture after an idle stop) | 14.0-14.2 s | 10.5-12.4 s | 16.6-16.7 s | 13.4-15.3 s |
+| the 4K report: time to the answer | 19.3-19.5 s | 10.1 s | 22.3-22.5 s | 13.3-13.5 s |
+| answers (chart days; report items, circles) | 5/5; 11/12, 0/3 | 5/5; 11/12, 0/3 | 5/5; 11-12/12, 3/3 | 5/5; 11/12, 2-3/3 |
+| writing while the encoder runs | 57.5-57.9 tok/s | 53.8-55.2 | 50.4-52.5 | 46.6-48.0 |
+| writing after it stopped | | 58.5-59.1 | | 51.4-52.7 |
+| a 17K-token read with the encoder up | 834-918 tok/s | 825-957 | 733-841 | 719-877 |
+| slots lent while it runs | 0 | 1,536 of 9,977 | 0 | 1,186 of 7,778 |
+| lend / give back | | 104 ms / 455 ms | | 114-122 ms / 459-480 ms |
+
+Kept on card 0 for good instead (Strata v0.2.9's server does that when a profile asks for an elastic encoder without
+`"vram_elastic"`; upstream main, Q4): the chart in 10.1 s and the report in 13.0-13.1 s (no start), but 1,087 more of the
+coldest experts in RAM from the load on (the engine moved them, VRAM was short), card 1 left with 1,535 MiB it does not use
+(each expert is split across both cards), and writing at 47.0-48.1 tok/s all the time.
+
+The encoder alone: 0.75 s for the chart and 1.2 s for the 4K report on card 0 (3,600 picture tokens: 8.6 s), against 7.6-7.9
+s and 11.2-11.3 s on the CPU; it starts in 2.6-4.6 s.
+
+**Exact.** Without a picture, the engine with `--vram-elastic` gives the same bits as upstream main: the first-token logits of
+every benchmark request and eight greedy answers byte-identical (Q4: three rounds of 35 requests, and without the flag 26
+of 26; IQ3_S: 35 of 35), also with `FNX_VRAM_CHURN=600`, which lends and gives back before every window (Q4: 686 times, IQ3_S:
+658 times; every answer and logit byte-identical). Its speed: within the build before's spread in every benchmark test
+(Q4, three rounds each: fresh 48.3 against 47.5 tok/s without each run's first prompt, edits 53.9 / 54.9 equal, the
+38,862-token read 888.6 against 884.9, the follow-up reads +0.0 to +0.5 %; IQ3_S one round: 60.1 / 60.4, 77.15 / 77.1,
+933 / 935); the cards and the CPUs drew the same power in every test (Q4). Pictures: the encoder on a card writes slightly different picture rows than on the CPU
+(per-token cosine 0.9995 on the chart, 0.994 on the 4K report), so a picture's answer can differ: above, the scores
+moved by at most one report item or one circle count between the two encoders, about as much as between repeats of the
+same one.
+
+**Limits.**
+- The first picture after an idle stop waits for the encoder to start (2.6-4.6 s, in the times above); later ones do not.
+- While the encoder runs, writing is about 7-9 % slower (fewer experts on the cards), and the K/V pool reaches fewer
+  positions: with IQ3_S's 512k profile 333,120 instead of 524,544 (at 262,144 positions, 542,016 stay). A conversation
+  already holding more than that when a picture comes: the engine refuses the VRAM command and the server starts the
+  encoder anyway, which may not fit.
+- A Stop while the encoder starts (the first picture) holds the next request until the start is done (5.7 s in our test);
+  Stops after it, and the follow-ups that read the stopped picture, behave as with the CPU encoder.
+- Strata v0.2.9's server prints "on a layer split the expert cache cannot make room for the image encoder (the engine
+  turns --vram-elastic off)" at start: it counts this engine's two cards as a layer split. The engine splits every layer
+  instead and makes the room, as the next lines of the log show.
+- `--batch` above 1: the engine answers `VRAM` only between requests; while slots decode it refuses, and the server then
+  starts the encoder anyway (it may not fit). Not run.
+- Measured with the 96 GB mode only; `setup.sh` refuses `--pictures-gpu` with `--ram 64` or `--ram 32`. Not built on HIP
+  (the flag refuses there). Not run with Unsloth's UD-Q4_K_XL or Edge0's own files.
+- Measured on two P100 (cards 0 and 1). With more (`--gpu A,B`, or `setup.sh`'s pair from two CPUs) the encoder goes on
+  the first card of the pair; not run on such a machine.
+
 ## Benchmark and compare
 
 With the server running:
@@ -1101,6 +1187,7 @@ python3 tune/tune.py --data /data/flash-next --screen           # 2-3 hours, one
   IQ3_XXS have not been run. Unsloth's other files have not been run.
 - Two P100 16 GB and Linux only.
 - One request at a time is what we tuned for (`--batch 1`).
+- **Pictures on a card** (`--pictures-gpu`): see its section for what was measured and its limits.
 - The engine refuses `logprobs`.
 - Loading takes about 5 minutes; the first answers after a load are slower while the expert cache settles.
 - With a long context and the 4 GB conversation cache, RAM is tight: our server has 6-9 GiB free once loaded. A parked

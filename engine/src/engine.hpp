@@ -11,6 +11,7 @@
 #include <map>
 #include <vector>
 
+#include "elastic.hpp"
 #include "kernels.hpp"
 #include "model.hpp"
 
@@ -155,6 +156,14 @@ public:
     void arena_reclaim(double hold_s = 30.0);
     void arena_churn();   // FNX_ARENA_CHURN=1: a lend and a give-back before every window (a test)
     std::vector<int> arena_lent() const;
+    // --vram-elastic (FNX_VRAM_ELASTIC=1), between requests: `VRAM <mib>` leaves every card at least mib MiB free (the
+    // K/V pool's next pages lent from the experts' slots as a K/V lend would, kept out of the pool, their memory given to
+    // the driver for another program); `VRAM` or `VRAM 0` takes it back (mapped again, zeroed, the slots refilled hottest
+    // first). -> the reply line, Strata's keys (reserve_mib expert_slots ... vram_free_mib); throws Refused with the reason
+    std::string vram(long mib);
+    void vram_churn();   // FNX_VRAM_CHURN=MIB (a test): VRAM MIB, then VRAM 0, before every window
+    // what is lent beyond the pages held for --vram-elastic: the K/V pool's own lend, the one arena_reclaim can give back
+    bool kv_lent_beyond_hold() const { return hold_hi_ <= hold_lo_ || arena_w_ > hold_hi_; }
     int lane_pos(int i) const { return i == cur_ ? pos_ : lanes_[(size_t) i].pos; }
     int lane_pages(int i) const { return (int) lanes_[(size_t) i].pages.size(); }   // its K/V pages (not its block)
     // one window over several lanes (distinct, at most MAXT, one token each): the greedy next token per row, and each
@@ -279,6 +288,11 @@ private:
     // slots (the coldest first), up to arena_cap_ (the pool keeps 2 MAXT TOPK slots on every card); all 0 without one
     int arena_base_ = 0, arena_w_ = 0, arena_cap_ = 0;
     std::chrono::steady_clock::time_point arena_last_lend_{};
+    // --vram-elastic: each card's arena allocation in chunks (elastic.hpp); pages [hold_lo_, hold_hi_) of the K/V pool
+    // lent from the slots and held for another program: not in free_pages_, their chunks given to the driver
+    std::vector<std::shared_ptr<ElasticRegion>> el_;
+    int hold_lo_ = 0, hold_hi_ = 0;
+    void vram_take_back();
     void arena_fill(int c, cudaStream_t st);   // card c's arena pool slots from the experts' host copies, the tables (on st)
     size_t arena_slot_off(int c) const;     // where card c's arena pool slots start in its pool allocation
     void arena_set(int w);                  // the K/V pool's top to w pages: slots lent or given back on every card
