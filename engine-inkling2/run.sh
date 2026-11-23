@@ -7,7 +7,8 @@
 # Any CTX above 262144 takes the int8 mode by itself (INK2_KV8=0/1 forces it). 32768: 11.8 GiB a card. Pictures when DATA holds
 # the vision projector (setup.sh) and build/ink2_vis exists, INK2_PICTURES=0 turns them off. Ready in ~30-70 s. Ctrl-C or
 # SIGTERM stops both. INK2_* switches pass through to the engine (docs/INKLING2.md); INK2_OA_MTP / INK2_OA_LOOKUP set the
-# server's default drafts (3 / 15). The engine keeps conversations' checkpoints and parked conversations in RAM (up to
+# server's default drafts (3 / 15), INK2_LOOP_TEXT / INK2_LOG_EVERY its loop limit for answers and tool calls (16000
+# characters) and its progress line while a request runs (60 s). The engine keeps conversations' checkpoints and parked conversations in RAM (up to
 # INK2_CKPT_MB = 24576 and INK2_PARK_MB = 32768 MiB, taken as they are needed; set them lower on a machine with less RAM).
 set -euo pipefail
 H=$(cd "$(dirname "$0")" && pwd); B=$H/build

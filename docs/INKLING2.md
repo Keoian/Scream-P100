@@ -303,7 +303,7 @@ hash, so a conversation's cached state never mixes two pictures. The engine puts
 placeholder and, as llama.cpp does, skips `token_embd_norm` for them. Checked on this branch's card picture: the title read
 word for word (the 960-token prompt read in 1.5 s, the answer written at 85.5 tok/s).
 
-## Loops in the reasoning
+## Loops in the reasoning, the answer or a tool call
 
 The engine has no sampler: every answer is greedy. On 22 Nov, after ~20 tool calls (web searches and pages, a 15k-token
 prompt), Inkling's reasoning fell into repeating itself word for word: two lines 194 times over, then a list 21 times, 84k
@@ -319,7 +319,28 @@ On that day's job, the guard would have cut after 5,248 characters of the last r
 reasoning and answer texts from our test runs (1.74M characters), it never cut one. With a reasoning that starts by
 repeating the two lines, the engine was cut after 9.3 copies, and the model wrote a short answer from what it had found.
 Plain, streamed and tool-call requests give the same tokens as before. `tools/loop_check.py` checks the guard without the
-model. Answers themselves are not watched, since a long table or matrix can repeat a row legitimately.
+model.
+
+**Answers and tool calls (23 Nov).** A chat of ~170k tokens seemed to stall (a report on 23 Nov): no new line in the
+server's log and no progress in the chat app, while both cards stayed at 94 %. The server printed a request's line only
+when the request ended, and a tool call streams nothing until it is whole, so a reply looping inside a tool call's JSON
+could run on unseen up to the context's end (~87k tokens there, half an hour or more). A client's Stop could not end it
+either: the server noticed a client that left only when it wrote to it. Since then:
+
+- Answers and tool calls are watched too, with a longer limit, since a table or a file can repeat a row legitimately: a
+  block repeated at least 4 times back to back and over 16,000 characters ends the reply (`finish_reason` "stop"; an
+  answer is kept up to the block's first copy, a looping call is dropped). A table of 200 equal rows is not cut.
+  `INK2_LOOP_TEXT` sets the 16,000 (0 = answers and calls not watched).
+- The server looks once a second whether the client has closed its connection (as llama-server does) and then stops the
+  engine, whatever part the reply is in. The log says so: "the client left after N written tokens".
+- While a request runs, the log gets a line every minute: the time, the prompt's tokens, the tokens written so far and
+  the part being written (reasoning, answer, a tool call). `INK2_LOG_EVERY` sets the seconds (0 = none). A request that
+  waits for the one before it says so too. `curl -s 127.0.0.1:8080/slots` shows `n_decoded` growing while the engine writes.
+
+Checked with a fake engine (scripted tokens through the engine's socket, no cards): plain and tool-call replies, streamed
+and not, came back byte for byte as before. A tool call looping in its JSON ended after 2.0 s instead of running to its
+`max_tokens` (30,000 tokens, 9.4 s), and a looping answer after 1.9 s. When a client left, the engine stopped 0.1 s later;
+before, it ran on to `max_tokens`. These switches go to the server, so set them before `run.sh`.
 
 ## How it works
 

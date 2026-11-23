@@ -13,8 +13,10 @@ has no sampler, so temperature and the like are ignored. Drafts: DSpark (MTP) 3 
 "mtp" / "lookup". The reply's <|content_thinking|> part streams as reasoning_content, its <|content_text|> part as content.
 reasoning_effort (none / minimal / low / medium / high / xhigh) or chat_template_kwargs.reasoning_effort sets the template's
 "Thinking effort level". One generation at a time; the other endpoints answer meanwhile. A client that leaves stops the
-generation. SIGTERM stops the engine too when INK2_ENGINE_PID is set (run.sh does). A reasoning that falls into repeating
-itself word for word (greedy decoding can) is cut after its first copy and the model writes its answer (Loop, reply()).
+generation, also in a part that streams nothing (a tool call). SIGTERM stops the engine too when INK2_ENGINE_PID is set
+(run.sh does). A reasoning that falls into repeating itself word for word (greedy decoding can) is cut after its first copy
+and the model writes its answer; an answer or a tool call that does so for over 16,000 characters (INK2_LOOP_TEXT) ends the
+reply (Loop, reply()). While a request runs, the log gets a line every minute (INK2_LOG_EVERY).
 With --tok the tokenizer is build/ink2_tok, started once and kept (llama-tokenize takes 0.9 s to start for every request),
 and a conversation's next request tokenizes only its new pieces (Tokens). The token offsets where the prompt's messages
 start go to the engine with every request: it keeps checkpoints there, so a request that parts from the conversation in
@@ -27,6 +29,7 @@ import hashlib
 import json
 import os
 import re
+import select
 import socket
 import subprocess
 import sys
@@ -84,7 +87,9 @@ T_END = next(i for i, t in SPECIAL.items() if t == "<|end_message|>")
 T_IMGPH = next(i for i, t in SPECIAL.items() if t == "<|unused_200054|>")
 
 LOCK = threading.Lock()
-STATE = {"busy": False, "n_prompt": 0, "n_decoded": 0, "n_ctx": A.ctx, "t_start": 0.0, "requests": 0, "tokens_out": 0}
+STATE = {"busy": False, "n_prompt": 0, "n_decoded": 0, "n_ctx": A.ctx, "t_start": 0.0, "requests": 0, "tokens_out": 0, "part": "",
+         "t_note": 0.0}
+LOG_EVERY = float(os.environ.get("INK2_LOG_EVERY", "60"))
 
 
 def token_bytes(i):
@@ -431,25 +436,31 @@ def periodic_tail(t, min_p, max_p, min_span, min_copies):
 class Loop:
     """The engine has no sampler, and a long greedy reasoning can fall into repeating itself word for word (seen on 22 Nov
     after ~20 tool calls: two lines 194 times over and a list 21 times, 84k characters, no answer). Watches
-    the reply's current reasoning part; step() gives how many of the reply's tokens to keep when its tail repeats one block
-    of 32 to 8,000 characters at least 3 times back to back and over 2,000 characters: the reasoning up to the end of the
-    block's first copy."""
+    the reply's current part; step() gives how many of the reply's tokens to keep when its tail repeats one block
+    of 32 to 8,000 characters at least 3 times back to back and over 2,000 characters in a reasoning, at least 4 times and
+    over TEXT_SPAN characters in an answer or a tool call (a table or a file can repeat a row legitimately; 0: not watched):
+    the part up to the end of the block's first copy. A tool call's text (its name, its JSON) is watched as its bytes."""
     MIN_P, MAX_P, MIN_SPAN, MIN_COPIES, EVERY = 32, 8000, 2000, 3, 128
+    TEXT_SPAN, TEXT_COPIES = 16000, 4
 
     def __init__(self):
         self.mode, self.text, self.ends, self.checked, self.hit = None, "", [], 0, None
 
-    def step(self, mode, evs, n_out):
+    def step(self, mode, evs, n_out, raw=b""):
         if mode != self.mode:
             self.mode, self.text, self.ends, self.checked = mode, "", [(0, n_out - 1)], 0
-        if mode != "r":
+        if mode == "r":
+            span, copies = self.MIN_SPAN, self.MIN_COPIES
+        elif self.TEXT_SPAN > 0:
+            span, copies = self.TEXT_SPAN, self.TEXT_COPIES
+        else:
             return None
-        self.text += "".join(v for k, v in evs if k == "r")
+        self.text += "".join(v for k, v in evs if k == mode) if mode in ("r", "c") else raw.decode("latin-1")
         self.ends.append((len(self.text), n_out))
         if len(self.text) - self.checked < self.EVERY:
             return None
         self.checked = len(self.text)
-        self.hit = periodic_tail(self.text, self.MIN_P, self.MAX_P, self.MIN_SPAN, self.MIN_COPIES)
+        self.hit = periodic_tail(self.text, self.MIN_P, self.MAX_P, span, copies)
         if self.hit is None:
             return None
         upto = self.hit[0] + self.hit[1]
@@ -459,18 +470,24 @@ class Loop:
 # what closes a looping reasoning before the answer is forced (the reasoning is in English)
 NUDGE = "\n\nI am repeating the same lines. I have enough to answer, so I stop thinking here and write the answer now."
 NUDGE_IDS = []
+Loop.TEXT_SPAN = int(os.environ.get("INK2_LOOP_TEXT", Loop.TEXT_SPAN))
+PART = {"r": "the reasoning", "c": "the answer", "tool": "a tool call", "head": "a tool call"}
 
 
-def reply(ids, mx, req, on_part=None, mode="c"):
+def reply(ids, mx, req, on_part=None, mode="c", gone=None):
     """The engine's reply to the prompt ids, at most mx tokens: (tokens, totals, stopped). Each token's parts go to
     on_part(kind, val) as they come ("r" reasoning, "c" content, "tool" a call). A loop in the reasoning (Loop) stops
     the engine; the reasoning is kept up to the end of the block's first copy, closed by NUDGE, and the model writes its
     answer (<|end_message|><|message_model|><|content_text|>): the engine reads the kept part again from the prompt's
-    snapshot (from the start when over ~3,000 tokens were written) and goes on. A second loop ends the reply (stopped).
-    mode: the part the prompt ends in ("r" when it ends inside a reasoning)."""
+    snapshot (from the start when over ~3,000 tokens were written) and goes on. A second loop ends the reply (stopped), and
+    so does a loop in the answer (kept up to its first copy) or in a tool call (the call is dropped).
+    mode: the part the prompt ends in ("r" when it ends inside a reasoning). gone() is asked about once a second while
+    the engine writes; True (the client closed its connection) stops the engine with ConnectionResetError, also while
+    the reply is in a part that streams nothing (a tool call)."""
     parts, guard, out = Parts(), Loop(), []
     parts.mode = mode
     tot = {"cached": None, "read_s": 0.0, "write_s": 0.0, "drafted": 0, "accepted": 0, "cuts": 0}
+    t_gone = time.time()
     while True:
         t_req, t_first, final, keep = time.time(), None, None, None
         lines = engine_lines(dict(req, tokens=ids + out, max=mx - len(out), stream=1))
@@ -486,16 +503,21 @@ def reply(ids, mx, req, on_part=None, mode="c"):
                         if on_part:
                             for kind, val in evs:
                                 on_part(kind, val)
-                        keep = guard.step(parts.mode, evs, len(out))
+                        raw = b"" if parts.mode in ("r", "c") or t in SPECIAL or t >= len(TOKS) else token_bytes(t)
+                        keep = guard.step(parts.mode, evs, len(out), raw)
                         if keep is not None:
                             break
-                    STATE["n_decoded"] = len(out)
+                    STATE["n_decoded"], STATE["part"] = len(out), parts.mode
                     if keep is not None:
                         break
+                    if gone and time.time() - t_gone >= 1.0:
+                        t_gone = time.time()
+                        if gone():
+                            raise ConnectionResetError("the client left")
                 elif "tokens" in msg:
                     final = msg
         finally:
-            lines.close()   # a cut: the engine stops at its next write
+            lines.close()   # a cut or a client that left: the engine stops at its next write
         if final is not None:
             if tot["cached"] is None:
                 tot["cached"] = final.get("cached", 0)
@@ -512,9 +534,11 @@ def reply(ids, mx, req, on_part=None, mode="c"):
             return out, tot, False
         tot["cuts"] += 1
         start, p = guard.hit
-        print(f"ink2_server: a loop in the reasoning (copies x characters, tokens cut / written): {(guard.checked - start) / p:.1f} x {p}, "
+        print(f"ink2_server: a loop in {PART[guard.mode]} (copies x characters, tokens cut / written): {(guard.checked - start) / p:.1f} x {p}, "
               f"{len(out) - keep} / {len(out)}", file=sys.stderr, flush=True)
         out = out[:keep]
+        if guard.mode != "r":
+            return out, tot, True
         if not NUDGE_IDS:
             NUDGE_IDS.extend(i for i in tokenize(NUDGE) if i not in SPECIAL)
         forced = NUDGE_IDS + [T_END, T_MODEL, T_TEXT]
@@ -565,6 +589,15 @@ class H(BaseHTTPRequestHandler):
     def _body(self):
         n = int(self.headers.get("Content-Length", 0) or 0)
         return json.loads(self.rfile.read(n) or b"{}") if n else {}
+
+    def _gone(self):
+        # the request is read, so a connection that reads as ready with nothing in it was closed by the client (as llama-server
+        # checks it); a reply that streams nothing for a while (a tool call, a request without "stream") would not see it otherwise
+        try:
+            ready = select.select([self.connection], [], [], 0)[0]
+            return bool(ready) and not self.connection.recv(1, socket.MSG_PEEK)
+        except (OSError, ValueError):
+            return True
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -623,10 +656,12 @@ class H(BaseHTTPRequestHandler):
                "ckpt": starts[-4096:]}
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(t0)
-        if not LOCK.acquire(timeout=3600):
-            return self._send(503, {"error": "busy"})
+        if not LOCK.acquire(blocking=False):
+            print(f"ink2_server: a request of {len(ids)} prompt tokens waits for the one before it", file=sys.stderr, flush=True)
+            if not LOCK.acquire(timeout=3600):
+                return self._send(503, {"error": "busy"})
         try:
-            STATE.update(busy=True, n_prompt=len(ids), n_decoded=0, t_start=t0)
+            STATE.update(busy=True, n_prompt=len(ids), n_decoded=0, t_start=time.time(), part="", t_note=time.time())
             STATE["requests"] += 1
             calls, on_part = [], None
             if stream:
@@ -655,9 +690,11 @@ class H(BaseHTTPRequestHandler):
                     sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": A.alias,
                          "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
             try:
-                out, tot, stopped = reply(ids, mx, req, on_part)
-            except (BrokenPipeError, ConnectionResetError):
-                return   # the client left: closing the engine's socket stops it at its next write
+                out, tot, stopped = reply(ids, mx, req, on_part, gone=self._gone)
+            except (BrokenPipeError, ConnectionResetError):   # closing the engine's socket stopped it at its next write
+                print(f"ink2_server: request: the client left after {STATE['n_decoded']} written tokens ({len(ids)} prompt tokens); "
+                      f"the engine stopped", file=sys.stderr, flush=True)
+                return
             n = len(out)
             STATE["tokens_out"] += n
             w = tot["write_s"] or 1e-9
@@ -706,6 +743,19 @@ class H(BaseHTTPRequestHandler):
             LOCK.release()
 
 
+def ticker():
+    """A line every LOG_EVERY seconds (INK2_LOG_EVERY, 0: none) while a request runs: a request prints its line only at its
+    end, and a tool call streams nothing until it is whole, so a long read or reply would leave the log silent."""
+    while True:
+        time.sleep(min(5.0, LOG_EVERY))
+        st = STATE
+        if st["busy"] and time.time() - st["t_note"] >= LOG_EVERY:
+            st["t_note"] = time.time()
+            now = f"writing {PART.get(st['part'], 'the reply')}" if st["n_decoded"] else "reading the prompt"
+            print(f"ink2_server: busy for {time.time() - st['t_start']:.0f} s: {st['n_prompt']} prompt tokens, {st['n_decoded']} written, "
+                  f"now {now}", file=sys.stderr, flush=True)
+
+
 def _stop(*_):   # the node stops a profile with SIGTERM to this process: the engine (started by ink2-ovoj.sh) goes with it
     pid = int(os.environ.get("INK2_ENGINE_PID") or 0)
     if pid:
@@ -722,5 +772,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, _stop)
     srv = ThreadingHTTPServer((A.host, A.port), H)
     srv.daemon_threads = True
+    if LOG_EVERY > 0:
+        threading.Thread(target=ticker, daemon=True).start()
     print(f"ink2_server: {A.alias} na {A.host}:{A.port}, ctx {A.ctx}, pogon {A.sock}", file=sys.stderr, flush=True)
     srv.serve_forever()
