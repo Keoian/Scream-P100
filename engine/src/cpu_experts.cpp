@@ -667,15 +667,18 @@ FNX_CPUX_SIMD inline __m256 fma16(__m256 w, __m256 x, __m256 c) {
     const __m256i away = _mm256_or_si256(_mm256_srai_epi32(_mm256_xor_si256(si, _mm256_castps_si256(e)), 31), i1);   // +1 away from 0, else -1
     return rn16(_mm256_castsi256_ps(_mm256_add_epi32(si, _mm256_and_si256(away, _mm256_and_si256(inexact, even)))));
 }
-// the fast form: fp16(fp32(w * x + c)), wrong only where that fp32 sum s was rounded (inexact) onto a point exactly halfway between two
-// fp16 values. `tie` gets every such lane (and a few more), off the chain's dependency path: every fp16 midpoint (normal, subnormal,
-// 65520) has at most 12 significant bits, so its float's low 12 bits are 0; s = p + c is exact when s - p == c and s - c == p (for the
-// larger operand that subtraction is Fast2Sum's, exact). A run with a flagged lane is done again with fma16 (about one in twenty).
-FNX_CPUX_SIMD inline __m256 fma16f(__m256 w, __m256 x, __m256 c, __m256& tie) {
-    const __m256 p = _mm256_mul_ps(w, x), s = _mm256_add_ps(p, c);
-    const __m256 few = _mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_and_si256(_mm256_castps_si256(s), _mm256_set1_epi32(0xfff)), _mm256_setzero_si256()));
-    const __m256 inexact = _mm256_or_ps(_mm256_cmp_ps(_mm256_sub_ps(s, p), c, _CMP_NEQ_OQ), _mm256_cmp_ps(_mm256_sub_ps(s, c), p, _CMP_NEQ_OQ));
-    tie = _mm256_or_ps(tie, _mm256_and_ps(few, inexact));
+// the fast form: fp16(fp32(w * x + c)). The product is exact in fp32, so one FMA is the same one rounding as a multiply and an add.
+// Wrong only where the fp32 sum s was rounded (inexact) onto a point exactly halfway between two fp16 values (or onto 65520). `tie`
+// gets every such lane (and a few more), off the chain's dependency path: every fp16 midpoint (normal, subnormal, 65520) has at most
+// 12 significant bits, so its float's low 12 bits are 0; s = p + c is exact when s - p == c and s - c == p (for the larger operand
+// that subtraction is Fast2Sum's, exact). The sum as one FMA, the subtractions as FMAs with 1.0 and the flags as integers: Haswell
+// adds floats on one port only. A run with a flagged lane is done again with fma16
+FNX_CPUX_SIMD inline __m256 fma16f(__m256 w, __m256 x, __m256 c, __m256i& tie) {
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 p = _mm256_mul_ps(w, x), s = _mm256_fmadd_ps(w, x, c);
+    const __m256i few = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_castps_si256(s), _mm256_set1_epi32(0xfff)), _mm256_setzero_si256());
+    const __m256 inexact = _mm256_or_ps(_mm256_cmp_ps(_mm256_fmsub_ps(s, one, p), c, _CMP_NEQ_OQ), _mm256_cmp_ps(_mm256_fmsub_ps(s, one, c), p, _CMP_NEQ_OQ));
+    tie = _mm256_or_si256(tie, _mm256_and_si256(few, _mm256_castps_si256(inexact)));
     return rn16(s);
 }
 // lanes where q a + b is exact in fp32 for every integer q < 32: a or b zero, or both normal fp16 values whose exponents differ by at
@@ -744,18 +747,23 @@ FNX_CPUX_SIMD inline __m256i bits16(uint32_t qh) {
     return _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(b, bm), bm), _mm256_set1_epi8(16));
 }
 // a run's 32 weights of 16 rows (W[l][half]) times one token's 32 values: the card's chains (even values, odd values, from +0), folded.
-// The fast form first; when any lane met a midpoint, the run again with fma16
+// The first step's sum is the product (+0 added: exact, one rounding, nothing to test); then the fast form, and when any lane met a
+// midpoint, the run again with fma16
 FNX_CPUX_SIMD inline void chain32(const __m256 (*W)[2], const float* x, __m256* acc) {
-    __m256 lo0 = _mm256_setzero_ps(), lo1 = lo0, hi0 = lo0, hi1 = lo0, tie = lo0;
-    for (int t = 0; t < 16; ++t) {
+    const __m256 z = _mm256_setzero_ps();
+    const __m256 xe0 = _mm256_broadcast_ss(x), xo0 = _mm256_broadcast_ss(x + 1);
+    __m256 lo0 = rn16(_mm256_fmadd_ps(W[0][0], xe0, z)), lo1 = rn16(_mm256_fmadd_ps(W[0][1], xe0, z));
+    __m256 hi0 = rn16(_mm256_fmadd_ps(W[1][0], xo0, z)), hi1 = rn16(_mm256_fmadd_ps(W[1][1], xo0, z));
+    __m256i tie = _mm256_setzero_si256();
+    for (int t = 1; t < 16; ++t) {
         const __m256 xe = _mm256_broadcast_ss(x + 2 * t), xo = _mm256_broadcast_ss(x + 2 * t + 1);
         lo0 = fma16f(W[2 * t][0], xe, lo0, tie);
         lo1 = fma16f(W[2 * t][1], xe, lo1, tie);
         hi0 = fma16f(W[2 * t + 1][0], xo, hi0, tie);
         hi1 = fma16f(W[2 * t + 1][1], xo, hi1, tie);
     }
-    if (__builtin_expect(_mm256_movemask_ps(tie) != 0, 0)) {
-        lo0 = lo1 = hi0 = hi1 = _mm256_setzero_ps();
+    if (__builtin_expect(!_mm256_testz_si256(tie, tie), 0)) {
+        lo0 = lo1 = hi0 = hi1 = z;
         for (int t = 0; t < 16; ++t) {
             const __m256 xe = _mm256_broadcast_ss(x + 2 * t), xo = _mm256_broadcast_ss(x + 2 * t + 1);
             lo0 = fma16(W[2 * t][0], xe, lo0);
@@ -774,9 +782,9 @@ FNX_CPUX_SIMD inline void decode_fma(const uint8_t (*tb)[256], const uint8_t* of
             for (int l = 0; l < 32; ++l) W[l][hh] = rn16(_mm256_fmadd_ps(codes8(tb[hh] + off[l], false), a[hh], b[hh]));
             continue;
         }
-        __m256 tie = _mm256_setzero_ps();   // the fast form and its test, the exact form where it flags
+        __m256i tie = _mm256_setzero_si256();   // the fast form and its test, the exact form where it flags
         for (int l = 0; l < 32; ++l) W[l][hh] = fma16f(codes8(tb[hh] + off[l], false), a[hh], b[hh], tie);
-        if (__builtin_expect(_mm256_movemask_ps(tie) != 0, 0))
+        if (__builtin_expect(!_mm256_testz_si256(tie, tie), 0))
             for (int l = 0; l < 32; ++l) W[l][hh] = fma16(codes8(tb[hh] + off[l], false), a[hh], b[hh]);
     }
 }
@@ -939,6 +947,23 @@ void down_chunk_exact_ref(const Work& w, const Expert& e, int i0, int i1) {
 }
 }  // namespace
 
+bool fma16f_x8(const float* w, const float* x, const float* c, float* out, uint32_t* flag) {
+#if FNX_CPUX_X86
+    if (!cpu_simd()) return false;
+    struct S {
+        FNX_CPUX_SIMD static void run(const float* w, const float* x, const float* c, float* out, uint32_t* flag) {
+            __m256i tie = _mm256_setzero_si256();
+            _mm256_storeu_ps(out, fma16f(_mm256_loadu_ps(w), _mm256_loadu_ps(x), _mm256_loadu_ps(c), tie));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(flag), tie);
+        }
+    };
+    S::run(w, x, c, out, flag);
+    return true;
+#else
+    (void) w, (void) x, (void) c, (void) out, (void) flag;
+    return false;
+#endif
+}
 bool fma16_x8(const float* w, const float* x, const float* c, float* out) {
 #if FNX_CPUX_X86
     if (!cpu_simd()) return false;

@@ -68,6 +68,8 @@ float gu_row_card_ref(uint32_t type, const uint8_t* row, int n, const uint16_t* 
 float dn_row_card_ref(uint32_t type, const uint8_t* row, int n, const uint16_t* h);
 // the AVX2 fp16 FMA of the exact kernels on 8 values (w * x exact in fp32): for the test; false without AVX2
 bool fma16_x8(const float* w, const float* x, const float* c, float* out);
+// the chains' fast form on 8 values, and each lane's flag (not 0: its run is done again with the exact form): for the test
+bool fma16f_x8(const float* w, const float* x, const float* c, float* out, uint32_t* flag);
 // gate|up rows [j0, j1) of the card's ffs: h[k][j] for the expert's tokens; then down rows [i0, i1): out[k][i]
 void gu_chunk(const Work& w, const Expert& e, int j0, int j1);
 void down_chunk(const Work& w, const Expert& e, int i0, int i1);

@@ -19,6 +19,8 @@ static_assert(N % 16 == 0 && (8 + DMA_MAX) * sizeof(int) <= CPU_HDR, "p100_cpu.c
 struct CpuBox {   // mapped host memory: the card writes the list, the picks and the rows, then seq
     volatile unsigned seq;
     int n, T, layer;
+    unsigned sum;                // the sum of every 32-bit word of the list, the picks and the rows: the host thread checks it
+    unsigned pad[3];             // the rows stay on a 16-byte boundary (the kernels copy them 16 bytes a step)
     int list[DMA_MAX];           // the listed experts (layer * NEXP + expert)
     int topi[MAXT * TOPK];       // the window's picks, pair t * TOPK + k
     uint16_t x[MAXT * N];        // the window's FFN input rows, f16
@@ -33,14 +35,20 @@ struct CpuDev {   // VRAM
     unsigned gflag;  // FNX_CPU_EXACT: the host thread's: the last list whose gate|up rows have landed
     unsigned hcnt;   // FNX_CPU_EXACT: k_cpu_swiglu's blocks that are done
     unsigned bitdiff;   // FNX_CPU_CHECK: values whose bits differ from the card's own
+    unsigned gdiff, hdiff;   // FNX_CPU_CHECK with FNX_CPU_EXACT: the CPU's gate|up sums, and the SwiGLU of them, that are not the card's bits
+    unsigned xsum, hsum;     // FNX_CPU_POST_ROWS, FNX_CPU_HB_DIRECT (the many-block posts, kept to measure them): the blocks' sums
 };
-// FNX_CPU_EXACT: the card's SwiGLU of the CPU's gate|up rows goes back through mapped host memory: the list's number, then the rows' h (f16)
+// FNX_CPU_EXACT: the card's SwiGLU of the CPU's gate|up rows goes back through mapped host memory: the list's number, the sum of the
+// rows' 32-bit words and the number of rows, then the rows' h (f16)
 constexpr size_t CPU_HB_HDR = 64;
+static_assert(offsetof(CpuBox, x) % 16 == 0, "p100_cpu.cuh: the mailbox's rows on a 16-byte boundary");
 static_assert(offsetof(CpuDev, seq) == 0 && offsetof(CpuDev, want) == sizeof(unsigned), "the router's last block writes CpuDev's seq and want as words 0 and 1 (moe.cuh)");
 struct CpuStat {
     std::atomic<unsigned long long> lists{0}, experts{0}, rows{0}, ns_work{0}, ns_send{0}, by_t[MAXT + 1], ex_t[MAXT + 1], ns_t[MAXT + 1], worst_ns{0};
-    std::atomic<unsigned long long> pool_late{0};   // cpux::Pool::late
     std::atomic<unsigned long long> ns_hand{0}, h_timeouts{0};   // FNX_CPU_EXACT: gate|up sent to the card's h back; waits given up
+    // what the card wrote to mapped host memory against its sum: lists read again until they matched, and those that never did
+    std::atomic<unsigned long long> box_again{0}, box_bad{0}, h_again{0}, h_bad{0};
+    std::atomic<unsigned long long> pool_late{0};   // cpux::Pool::late
 };
 struct CpuCard {
     int dev = 0, node = -1;
@@ -65,9 +73,38 @@ struct CpuCard {
     int gu_lanes = 2;
     char* gstage_h = nullptr;   // page-locked: the head (n_rows, seq), then each row's gate sums and up sums
     char* gstage_d = nullptr;
-    unsigned char* hb = nullptr;     // mapped: the list's number, then the rows' h (f16)
+    unsigned char* hb = nullptr;     // mapped: the list's number, the rows' sum and count, then the rows' h (f16)
     unsigned char* hb_d = nullptr;
+    char* hdev = nullptr;            // VRAM: the rows' h as k_cpu_swiglu wrote it; k_cpu_hpost copies it to hb
+    bool post_rows = false, hb_direct = false;   // FNX_CPU_POST_ROWS, FNX_CPU_HB_DIRECT: the many-block posts (measuring only)
 };
+
+// rows r0..r1-1 of the window (16 bytes a step), and with row 0 the list and the picks, into the mailbox: this thread's share, and the
+// sum of the 32-bit words it wrote
+__device__ __forceinline__ unsigned box_copy(const int* __restrict__ list, const int* __restrict__ topi, int T, const uint16_t* __restrict__ xh, CpuBox* box, int k, int tid,
+                                             int nth, int r0, int r1) {
+    unsigned sum = 0;
+    const uint4* src = reinterpret_cast<const uint4*>(xh);
+    uint4* dst = reinterpret_cast<uint4*>(box->x);
+    for (int i = r0 * (N / 8) + tid; i < r1 * (N / 8); i += nth) {
+        const uint4 v = src[i];
+        dst[i] = v;
+        sum += v.x + v.y + v.z + v.w;
+    }
+    if (r0 == 0) {
+        for (int i = tid; i < k; i += nth) {
+            const int v = list[1 + i];
+            box->list[i] = v;
+            sum += (unsigned) v;
+        }
+        for (int i = tid; i < T * TOPK; i += nth) {
+            const int v = topi[i];
+            box->topi[i] = v;
+            sum += (unsigned) v;
+        }
+    }
+    return sum;
+}
 
 __global__ void __launch_bounds__(256) k_cpu_publish(Job* gu, Job* dn, const int* __restrict__ njobs, int layer, const int* __restrict__ list,
                                                      const int* __restrict__ topi, int T, const uint16_t* __restrict__ xh, CpuBox* box, CpuDev* d, int mark) {
@@ -88,17 +125,17 @@ __global__ void __launch_bounds__(256) k_cpu_publish(Job* gu, Job* dn, const int
                 }
         }
     }
-    const uint4* src = reinterpret_cast<const uint4*>(xh);
-    uint4* dst = reinterpret_cast<uint4*>(box->x);
-    for (int i = tid; i < T * (N / 8); i += 256) dst[i] = src[i];
-    for (int i = tid; i < k; i += 256) box->list[i] = list[1 + i];
-    for (int i = tid; i < T * TOPK; i += 256) box->topi[i] = topi[i];
+    __shared__ unsigned ss[256];
+    ss[tid] = box_copy(list, topi, T, xh, box, k, tid, 256, 0, T);
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
+        unsigned sum = 0;
+        for (int i = 0; i < 256; ++i) sum += ss[i];
         box->n = k;
         box->T = T;
         box->layer = layer;
+        box->sum = sum;
         const unsigned s = ++d->seq;
         d->want = s;
         __threadfence_system();
@@ -107,29 +144,55 @@ __global__ void __launch_bounds__(256) k_cpu_publish(Job* gu, Job* dn, const int
     }
 }
 
-// the window's rows (a block a row), the plan's list and the picks to the mailbox, then the list's number (the router's last block set it in
-// d->want) by the last block to finish: on the third stream, beside the card's own experts
+// the window's rows, the plan's list and the picks to the mailbox, then the list's number (the router's last block set it in d->want): on
+// the third stream, beside the card's own experts. One block, as k_cpu_publish: every word of the mailbox and, after the threads'
+// fences, its sum and its number come from one SM; the host thread checks the sum (cpu_loop) before it computes from the mailbox, so
+// "the CPU read what the card wrote" is a counted line of the report, not an assumption. (A block a row with the number from the last
+// block to finish, as this was first written, is k_cpu_post_rows: FNX_CPU_POST_ROWS=1, to measure it. It has not been seen to arrive
+// torn: 0 of 113,604 lists a card. The rows that were not the card's came from cpux::Pool, see its `limit`.)
 __global__ void __launch_bounds__(256) k_cpu_post(int layer, const int* __restrict__ list, const int* __restrict__ topi, int T, const uint16_t* __restrict__ xh, CpuBox* box,
                                                   CpuDev* d) {
-    const int k = min(list[0], DMA_MAX), tid = threadIdx.x, r = blockIdx.x;
+    const int k = min(list[0], DMA_MAX), tid = threadIdx.x;
     if (k == 0) return;
-    const uint4* src = reinterpret_cast<const uint4*>(xh) + (size_t) r * (N / 8);
-    uint4* dst = reinterpret_cast<uint4*>(box->x) + (size_t) r * (N / 8);
-    for (int i = tid; i < N / 8; i += 256) dst[i] = src[i];
-    if (r == 0) {
-        for (int i = tid; i < k; i += 256) box->list[i] = list[1 + i];
-        for (int i = tid; i < T * TOPK; i += 256) box->topi[i] = topi[i];
-    }
+    __shared__ unsigned ss[256];
+    ss[tid] = box_copy(list, topi, T, xh, box, k, tid, 256, 0, T);
     __threadfence_system();
     __syncthreads();
-    if (tid == 0 && atomicAdd(&d->cnt, 1u) == (unsigned) (T - 1)) {
-        d->cnt = 0u;
+    if (tid == 0) {
+        unsigned sum = 0;
+        for (int i = 0; i < 256; ++i) sum += ss[i];
         box->n = k;
         box->T = T;
         box->layer = layer;
+        box->sum = sum;
         __threadfence_system();
         box->seq = d->want;
         __threadfence_system();
+    }
+}
+// FNX_CPU_POST_ROWS=1 (measuring only): a block a row, the blocks' sums added in VRAM, the list's number by the last block to finish
+__global__ void __launch_bounds__(256) k_cpu_post_rows(int layer, const int* __restrict__ list, const int* __restrict__ topi, int T, const uint16_t* __restrict__ xh,
+                                                       CpuBox* box, CpuDev* d) {
+    const int k = min(list[0], DMA_MAX), tid = threadIdx.x, r = blockIdx.x;
+    if (k == 0) return;
+    __shared__ unsigned ss[256];
+    ss[tid] = box_copy(list, topi, T, xh, box, k, tid, 256, r, r + 1);
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        unsigned sum = 0;
+        for (int i = 0; i < 256; ++i) sum += ss[i];
+        atomicAdd(&d->xsum, sum);
+        if (atomicAdd(&d->cnt, 1u) == (unsigned) (T - 1)) {
+            d->cnt = 0u;
+            box->n = k;
+            box->T = T;
+            box->layer = layer;
+            box->sum = atomicExch(&d->xsum, 0u);
+            __threadfence_system();
+            box->seq = d->want;
+            __threadfence_system();
+        }
     }
 }
 
@@ -162,27 +225,109 @@ __global__ void __launch_bounds__(32) k_cpu_wait_g(CpuDev* d) {
     __threadfence();
 }
 // FNX_CPU_EXACT: the card's SwiGLU of the CPU's gate|up rows, the very expression of k_swiglu_after (p100_moe_rows.cuh; its __expf and
-// division under --use_fast_math are the card's own and cannot be done on a CPU), into mapped host memory as f16; the last block then
-// writes the list's number in front of the rows
-__global__ void __launch_bounds__(256) k_cpu_swiglu(CpuDev* d, const char* __restrict__ stage, int ffs, unsigned char* hb) {
+// division under --use_fast_math are the card's own and cannot be done on a CPU), as f16 into VRAM
+__global__ void __launch_bounds__(256) k_cpu_swiglu(const CpuDev* d, const char* __restrict__ stage, int ffs, __half* __restrict__ h) {
+    const unsigned want = *(volatile unsigned*) &d->want;
+    if (want == 0) return;
+    const int* hd = reinterpret_cast<const int*>(stage);
+    const int nr = (unsigned) hd[1] == want ? hd[0] : 0;
+    const float* gu = reinterpret_cast<const float*>(stage + CPU_HDR);
+    for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < (size_t) nr * ffs; e += (size_t) gridDim.x * blockDim.x) {
+        const size_t r = e / ffs, i = e % ffs;
+        const float g = gu[r * 2 * ffs + i];
+        h[e] = __float2half(silu_over(g) * gu[r * 2 * ffs + ffs + i]);
+    }
+}
+// ... and those rows to the host thread through mapped memory, 16 bytes a step, with the sum of their 32-bit words and their count,
+// then the list's number: one block, and the host thread checks the sum, as for the mailbox. (FNX_CPU_HB_DIRECT=1 is the first version,
+// k_cpu_swiglu_direct: h straight into mapped memory from 40 blocks, the number from the last to finish; it too has not been seen to
+// arrive torn, 0 of 113,604 lists a card)
+__global__ void __launch_bounds__(256) k_cpu_hpost(const CpuDev* d, const char* __restrict__ stage, int ffs, const __half* __restrict__ h, unsigned char* hb) {
+    const unsigned want = *(volatile unsigned*) &d->want;
+    if (want == 0) return;
+    const int tid = threadIdx.x;
+    const int* hd = reinterpret_cast<const int*>(stage);
+    const int nr = (unsigned) hd[1] == want ? hd[0] : 0;
+    const uint4* src = reinterpret_cast<const uint4*>(h);
+    uint4* dst = reinterpret_cast<uint4*>(hb + CPU_HB_HDR);
+    unsigned sum = 0;
+    for (int i = tid; i < nr * (ffs / 8); i += 256) {
+        const uint4 v = src[i];
+        dst[i] = v;
+        sum += v.x + v.y + v.z + v.w;
+    }
+    __shared__ unsigned ss[256];
+    ss[tid] = sum;
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        sum = 0;
+        for (int i = 0; i < 256; ++i) sum += ss[i];
+        unsigned* w = reinterpret_cast<unsigned*>(hb);
+        w[1] = sum;
+        w[2] = (unsigned) nr;
+        __threadfence_system();
+        *reinterpret_cast<volatile unsigned*>(hb) = want;
+        __threadfence_system();
+    }
+}
+// FNX_CPU_HB_DIRECT=1 (measuring only): the first version, h straight into mapped memory from every block, the number from the last
+__global__ void __launch_bounds__(256) k_cpu_swiglu_direct(CpuDev* d, const char* __restrict__ stage, int ffs, unsigned char* hb) {
     const unsigned want = *(volatile unsigned*) &d->want;
     if (want == 0) return;
     const int* hd = reinterpret_cast<const int*>(stage);
     const int nr = (unsigned) hd[1] == want ? hd[0] : 0;
     const float* gu = reinterpret_cast<const float*>(stage + CPU_HDR);
     __half* h = reinterpret_cast<__half*>(hb + CPU_HB_HDR);
+    unsigned sum = 0;
     for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < (size_t) nr * ffs; e += (size_t) gridDim.x * blockDim.x) {
         const size_t r = e / ffs, i = e % ffs;
         const float g = gu[r * 2 * ffs + i];
-        h[e] = __float2half(silu_over(g) * gu[r * 2 * ffs + ffs + i]);
+        const __half v = __float2half(silu_over(g) * gu[r * 2 * ffs + ffs + i]);
+        h[e] = v;
+        sum += (unsigned) __half_as_ushort(v) << (16 * (e & 1));   // as the 32-bit words' sum
     }
+    __shared__ unsigned ss[256];
+    ss[threadIdx.x] = sum;
     __threadfence_system();
     __syncthreads();
-    if (threadIdx.x == 0 && atomicAdd(&d->hcnt, 1u) == gridDim.x - 1) {
-        d->hcnt = 0u;
-        __threadfence_system();
-        *reinterpret_cast<volatile unsigned*>(hb) = want;
-        __threadfence_system();
+    if (threadIdx.x == 0) {
+        sum = 0;
+        for (int i = 0; i < 256; ++i) sum += ss[i];
+        atomicAdd(&d->hsum, sum);
+        if (atomicAdd(&d->hcnt, 1u) == gridDim.x - 1) {
+            d->hcnt = 0u;
+            unsigned* w = reinterpret_cast<unsigned*>(hb);
+            w[1] = atomicExch(&d->hsum, 0u);
+            w[2] = (unsigned) nr;
+            __threadfence_system();
+            *reinterpret_cast<volatile unsigned*>(hb) = want;
+            __threadfence_system();
+        }
+    }
+}
+// FNX_CPU_CHECK with FNX_CPU_EXACT, after the take: a block a row of the CPU's list: its gate|up sums against the card's own of that
+// pair (gu, [P][2 * ffs]) and the SwiGLU the card made of them against the card's own (h16, [P][ffs]); values whose bits differ counted
+__global__ void __launch_bounds__(256) k_cpu_check_gh(CpuDev* d, const char* __restrict__ stage, const char* __restrict__ gstage, const __half* __restrict__ hc, int ffs,
+                                                      const float* __restrict__ gu, const __half* __restrict__ h16) {
+    if (d->want == 0 || (d->err & 1u)) return;
+    const int* hd = reinterpret_cast<const int*>(stage);
+    const int* ghd = reinterpret_cast<const int*>(gstage);
+    const int r = blockIdx.x, tid = threadIdx.x;
+    if (r >= hd[0] || (unsigned) hd[1] != d->want || (unsigned) ghd[1] != d->want || ghd[0] != hd[0]) return;
+    const int pair = hd[8 + r];
+    const float* a = reinterpret_cast<const float*>(gstage + CPU_HDR) + (size_t) r * 2 * ffs;
+    const float* b = gu + (size_t) pair * 2 * ffs;
+    unsigned ng = 0, nh = 0;
+    for (int i = tid; i < 2 * ffs; i += 256) ng += __float_as_uint(a[i]) != __float_as_uint(b[i]);
+    for (int i = tid; i < ffs; i += 256) nh += __half_as_ushort(hc[(size_t) r * ffs + i]) != __half_as_ushort(h16[(size_t) pair * ffs + i]);
+    __shared__ unsigned sg[256], sh[256];
+    sg[tid] = ng, sh[tid] = nh;
+    __syncthreads();
+    if (tid == 0) {
+        for (int i = 1; i < 256; ++i) ng += sg[i], nh += sh[i];
+        if (ng) atomicAdd(&d->gdiff, ng);
+        if (nh) atomicAdd(&d->hdiff, nh);
     }
 }
 
@@ -235,6 +380,31 @@ int cpu_node_of(int dev) {   // the card's NUMA node from sysfs, -1 unknown
     return node;
 }
 
+inline void cpu_pause() {
+#if defined(__x86_64__)
+    __builtin_ia32_pause();
+#endif
+}
+// the sum of the mailbox's 32-bit words, as box_copy adds them on the card: the list, the picks, the rows
+unsigned box_sum(const CpuBox* box, int n, int T) {
+    unsigned sum = 0;
+    for (int i = 0; i < n; ++i) sum += (unsigned) box->list[i];
+    for (int i = 0; i < T * TOPK; ++i) sum += (unsigned) box->topi[i];
+    const uint32_t* x = reinterpret_cast<const uint32_t*>(box->x);
+    unsigned sx = 0;
+    for (size_t i = 0; i < (size_t) T * (N / 2); ++i) sx += x[i];
+    return sum + sx;
+}
+// the card's SwiGLU rows in mapped memory against the count and the sum of 32-bit words it wrote with them
+bool hb_ok(const unsigned char* hb, int nr, int ffs) {
+    const uint32_t* w = reinterpret_cast<const uint32_t*>(hb);
+    if (w[2] != (unsigned) nr) return false;
+    const uint32_t* h = reinterpret_cast<const uint32_t*>(hb + CPU_HB_HDR);
+    unsigned sum = 0;
+    for (size_t i = 0; i < (size_t) nr * (ffs / 2); ++i) sum += h[i];
+    return sum == w[1];
+}
+
 // the card's lists, one after another: its half of each listed expert for the tokens that picked it, then the rows to the card
 void cpu_loop(CpuCard* c) {
     cudaSetDevice(c->dev);
@@ -253,7 +423,20 @@ void cpu_loop(CpuCard* c) {
         }
         std::atomic_thread_fence(std::memory_order_acquire);
         const auto t0 = std::chrono::steady_clock::now();
-        const int n = std::min(c->box->n, DMA_MAX), T = std::min(c->box->T, MAXT), layer = c->box->layer;
+        int n = std::min(c->box->n, DMA_MAX), T = std::min(c->box->T, MAXT), layer = c->box->layer;
+        // the mailbox against the card's sum of what it wrote: read again until it matches (words that land after the list's number)
+        if (box_sum(c->box, n, T) != c->box->sum) {
+            bool ok = false;
+            const auto give_up = c->post_rows ? std::chrono::milliseconds(2) : std::chrono::milliseconds(3000);
+            while (!ok && std::chrono::steady_clock::now() - t0 < give_up) {
+                cpu_pause();
+                std::atomic_thread_fence(std::memory_order_acquire);
+                n = std::min(c->box->n, DMA_MAX), T = std::min(c->box->T, MAXT), layer = c->box->layer;
+                ok = box_sum(c->box, n, T) == c->box->sum;
+            }
+            (ok ? c->st.box_again : c->st.box_bad).fetch_add(1, std::memory_order_relaxed);
+        }
+        if (layer < 0 || layer >= NL) layer = 0, n = 0;   // a mailbox that never matched: nothing to compute from it
         cpux::Work w;
         w.gu_type = c->gu_type[layer], w.dn_type = c->dn_type[layer];
         w.ffs = c->ffs, w.N = N;
@@ -295,11 +478,20 @@ void cpu_loop(CpuCard* c) {
                     ok = false;
                     break;
                 }
-#if defined(__x86_64__)
-                __builtin_ia32_pause();
-#endif
+                cpu_pause();
             }
             std::atomic_thread_fence(std::memory_order_acquire);
+            if (ok && !hb_ok(c->hb, nr, c->ffs)) {   // the rows against the card's sum of them, as the mailbox
+                bool good = false;
+                const auto give_up = c->hb_direct ? std::chrono::milliseconds(2) : std::chrono::milliseconds(3000);
+                const auto tv = std::chrono::steady_clock::now();
+                while (!good && std::chrono::steady_clock::now() - tv < give_up) {
+                    cpu_pause();
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                    good = hb_ok(c->hb, nr, c->ffs);
+                }
+                (good ? c->st.h_again : c->st.h_bad).fetch_add(1, std::memory_order_relaxed);
+            }
             c->st.ns_hand.fetch_add((unsigned long long) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - th0).count(),
                                     std::memory_order_relaxed);
             if (ok) {
@@ -379,19 +571,30 @@ void* p100_cpu_start(int dev, int rank, int share, const char* const* host_gu, c
         bool ok = true;
         for (int l = 0; l < NL; ++l) ok = ok && cpux::exact_ok(gu_type[l], dn_type[l]);
         c->gu_lanes = FNX_ROW_G;   // the card's lanes a gate|up row in phases 0 and 1 (p100_moe_rows.cuh)
-        if (!ok || (c->gu_lanes != 1 && c->gu_lanes != 2 && c->gu_lanes != 4 && c->gu_lanes != 8))
+        if (!ok || ffs % 8 || (c->gu_lanes != 1 && c->gu_lanes != 2 && c->gu_lanes != 4 && c->gu_lanes != 8))
             std::fprintf(stderr, "fnx: FNX_CPU_EXACT: %s, so the CPU's rows stay as without it (fp32 sums, not bit-exact)\n",
-                         ok ? "FNX_ROW_G is not 1, 2, 4 or 8" : "a layer's expert types have no exact steps on the CPU (gate|up Q4_K or Q5_K, down IQ4_NL, Q5_1 or Q8_0)");
+                         ok ? "FNX_ROW_G is not 1, 2, 4 or 8 (or an expert's width is not a multiple of 8)"
+                            : "a layer's expert types have no exact steps on the CPU (gate|up Q4_K or Q5_K, down IQ4_NL, Q5_1 or Q8_0)");
         else {
             const size_t gst = CPU_HDR + (size_t) DMA_MAX * 2 * ffs * sizeof(float), hbs = CPU_HB_HDR + (size_t) DMA_MAX * ffs * sizeof(uint16_t);
             if (cudaHostAlloc((void**) &c->gstage_h, gst, cudaHostAllocPortable) != cudaSuccess || cudaMalloc(&c->gstage_d, gst) != cudaSuccess ||
                 cudaMemset(c->gstage_d, 0, gst) != cudaSuccess || cudaHostAlloc((void**) &c->hb, hbs, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                cudaHostGetDevicePointer((void**) &c->hb_d, c->hb, 0) != cudaSuccess)
+                cudaHostGetDevicePointer((void**) &c->hb_d, c->hb, 0) != cudaSuccess || cudaMalloc(&c->hdev, hbs) != cudaSuccess ||
+                cudaMemset(c->hdev, 0, hbs) != cudaSuccess)
                 throw std::runtime_error(std::string("FNX_CPU_EXACT: ") + cudaGetErrorString(cudaGetLastError()));
             std::memset(c->gstage_h, 0, gst);
             std::memset(c->hb, 0, hbs);
             c->exact = true;
+            const char* hd = std::getenv("FNX_CPU_HB_DIRECT");
+            c->hb_direct = hd && std::atoi(hd) != 0;
         }
+    }
+    {
+        const char* pr = std::getenv("FNX_CPU_POST_ROWS");
+        c->post_rows = pr && std::atoi(pr) != 0;
+        if (c->post_rows || c->hb_direct)
+            std::fprintf(stderr, "fnx: FNX_CPU_EXPERTS: card %d: %s%s (measuring only: the host thread's sums count what does not arrive whole)\n", dev,
+                         c->post_rows ? "FNX_CPU_POST_ROWS: the mailbox from a block a row; " : "", c->hb_direct ? "FNX_CPU_HB_DIRECT: the SwiGLU rows from every block" : "");
     }
     for (int t = 0; t <= MAXT; ++t) c->st.by_t[t].store(0), c->st.ex_t[t].store(0), c->st.ns_t[t].store(0);
     c->x.assign((size_t) MAXT * N, 0.f);
@@ -429,6 +632,7 @@ void p100_cpu_stop(void* h) {
     if (c->gstage_h) cudaFreeHost(c->gstage_h);
     if (c->gstage_d) cudaFree(c->gstage_d);
     if (c->hb) cudaFreeHost(c->hb);
+    if (c->hdev) cudaFree(c->hdev);
     delete c;
 }
 
@@ -439,17 +643,17 @@ void p100_cpu_swiglu_probe(const float* gu, int nr, int ffs, uint16_t* h, void* 
     cudaStream_t s = (cudaStream_t) st;
     CpuDev* d = nullptr;
     char* stage = nullptr;
-    unsigned char* hb = nullptr;
+    __half* hb = nullptr;
     const size_t gb = (size_t) nr * 2 * ffs * sizeof(float), hbytes = (size_t) nr * ffs * sizeof(uint16_t);
     const unsigned one = 1;
     const int hd[2] = {nr, 1};
     if (cudaMalloc(&d, sizeof(CpuDev)) != cudaSuccess || cudaMemset(d, 0, sizeof(CpuDev)) != cudaSuccess ||
         cudaMemcpy(&d->want, &one, sizeof one, cudaMemcpyHostToDevice) != cudaSuccess || cudaMalloc(&stage, CPU_HDR + gb) != cudaSuccess ||
         cudaMemcpy(stage, hd, sizeof hd, cudaMemcpyHostToDevice) != cudaSuccess ||
-        cudaMemcpy(stage + CPU_HDR, gu, gb, cudaMemcpyDeviceToDevice) != cudaSuccess || cudaMalloc(&hb, CPU_HB_HDR + hbytes) != cudaSuccess)
+        cudaMemcpy(stage + CPU_HDR, gu, gb, cudaMemcpyDeviceToDevice) != cudaSuccess || cudaMalloc(&hb, hbytes) != cudaSuccess)
         throw std::runtime_error(std::string("cpu swiglu probe: ") + cudaGetErrorString(cudaGetLastError()));
     k_cpu_swiglu<<<40, 256, 0, s>>>(d, stage, ffs, hb);
-    cudaMemcpyAsync(h, hb + CPU_HB_HDR, hbytes, cudaMemcpyDeviceToDevice, s);
+    cudaMemcpyAsync(h, hb, hbytes, cudaMemcpyDeviceToDevice, s);
     const cudaError_t e = cudaStreamSynchronize(s);
     cudaFree(hb);
     cudaFree(stage);
@@ -462,9 +666,24 @@ void p100_cpu_swiglu(void* h, void* st) {
     auto* c = (CpuCard*) h;
     if (!c || !c->exact) return;
     k_cpu_wait_g<<<1, 32, 0, (cudaStream_t) st>>>(c->d);
-    k_cpu_swiglu<<<40, 256, 0, (cudaStream_t) st>>>(c->d, c->gstage_d, c->ffs, c->hb_d);
+    if (c->hb_direct) k_cpu_swiglu_direct<<<40, 256, 0, (cudaStream_t) st>>>(c->d, c->gstage_d, c->ffs, c->hb_d);
+    else {
+        k_cpu_swiglu<<<40, 256, 0, (cudaStream_t) st>>>(c->d, c->gstage_d, c->ffs, reinterpret_cast<__half*>(c->hdev));
+        k_cpu_hpost<<<1, 256, 0, (cudaStream_t) st>>>(c->d, c->gstage_d, c->ffs, reinterpret_cast<const __half*>(c->hdev), c->hb_d);
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) throw std::runtime_error(std::string("cpu swiglu: ") + cudaGetErrorString(e));
+}
+// FNX_CPU_CHECK with FNX_CPU_EXACT, on `st` after the take: the CPU's gate|up sums and the card's SwiGLU of them against the card's
+// own of the same pairs (gu [P][2 * ffs], h16 [P][ffs]): the stage a row that is not the card's went wrong at. Not with
+// FNX_CPU_HB_DIRECT (h is then only in mapped memory)
+void p100_cpu_check_stages(void* h, const float* gu, const uint16_t* h16, void* st) {
+    auto* c = (CpuCard*) h;
+    if (!c || !c->exact || c->hb_direct) return;
+    k_cpu_check_gh<<<(unsigned) DMA_MAX, 256, 0, (cudaStream_t) st>>>(c->d, c->stage_d, c->gstage_d, reinterpret_cast<const __half*>(c->hdev), c->ffs, gu,
+                                                                     reinterpret_cast<const __half*>(h16));
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) throw std::runtime_error(std::string("cpu check stages: ") + cudaGetErrorString(e));
 }
 
 void p100_cpu_publish(void* h, Job* gu, Job* dn, const int* njobs, int layer, const int* list, const int* topi, int T, const uint16_t* xh, bool mark, void* st) {
@@ -478,7 +697,8 @@ void* p100_cpu_dev(void* h) { return ((CpuCard*) h)->d; }
 // the window's rows (f16), the list and the picks to the mailbox, on `st`, a stream beside the card's own
 void p100_cpu_post(void* h, int layer, const int* list, const int* topi, int T, const uint16_t* xh, void* st) {
     auto* c = (CpuCard*) h;
-    k_cpu_post<<<(unsigned) T, 256, 0, (cudaStream_t) st>>>(layer, list, topi, T, xh, c->box_d, c->d);
+    if (c->post_rows) k_cpu_post_rows<<<(unsigned) T, 256, 0, (cudaStream_t) st>>>(layer, list, topi, T, xh, c->box_d, c->d);
+    else k_cpu_post<<<1, 256, 0, (cudaStream_t) st>>>(layer, list, topi, T, xh, c->box_d, c->d);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) throw std::runtime_error(std::string("cpu post: ") + cudaGetErrorString(e));
 }
@@ -509,6 +729,7 @@ void p100_cpu_report(void* h, bool check) {
     }
     std::fprintf(stderr, "fnx: cpu experts, card %d: %llu lists, %.2f experts and %.2f rows a list, %.0f us a list on the CPU (worst %.0f), %.0f us to send;%s\n",
                  c->dev, lists, (double) ex / lists, (double) rows / lists, nw / 1e3 / lists, worst / 1e3, ns / 1e3 / lists, by.c_str());
+    const unsigned long long ba = s.box_again.exchange(0), bb = s.box_bad.exchange(0), ha = s.h_again.exchange(0), hbd = s.h_bad.exchange(0);
     if (const unsigned long long pl = s.pool_late.exchange(0); pl || check)
         std::fprintf(stderr, "fnx: cpu experts, card %d: %llu workers came to a finished round of the pool as the next was set up (turned away)\n", c->dev, pl);
     if (c->exact) {
@@ -516,6 +737,9 @@ void p100_cpu_report(void* h, bool check) {
         std::fprintf(stderr, "fnx: FNX_CPU_EXACT, card %d: %.0f us a list from the gate|up rows sent to the card's SwiGLU back (in the CPU's time above)%s\n", c->dev,
                      hand / 1e3 / lists, hto ? ", some lists timed out waiting for it" : "");
     }
+    if (ba || bb || ha || hbd || c->exact || c->post_rows || check)
+        std::fprintf(stderr, "fnx: cpu experts, card %d: the card's writes against their sums: mailbox %llu lists read again, %llu never whole; SwiGLU rows %llu read again, "
+                     "%llu never whole%s\n", c->dev, ba, bb, ha, hbd, bb || hbd ? " (ROWS COMPUTED FROM WHAT WAS NOT THE CARD'S)" : "");
     if (check) {
         CpuDev d;
         cudaSetDevice(c->dev);
@@ -523,8 +747,11 @@ void p100_cpu_report(void* h, bool check) {
             std::fprintf(stderr, "fnx: FNX_CPU_CHECK, card %d: %.0f rows compared with the card's own: largest difference %.3g, largest value %.3g, worst row %.3g of its largest value; "
                          "%u values not bit for bit the card's%s\n",
                          c->dev, d.chk[2], d.chk[0], d.chk[1], d.chk[3], d.bitdiff, d.err ? " (a wait timed out)" : "");
+            if (c->exact && !c->hb_direct)
+                std::fprintf(stderr, "fnx: FNX_CPU_CHECK, card %d, by stage: %u gate|up sums of the CPU's not the card's bits, %u values of the SwiGLU made of them\n", c->dev,
+                             d.gdiff, d.hdiff);
             cudaMemset(reinterpret_cast<char*>(c->d) + offsetof(CpuDev, chk), 0, sizeof d.chk);
-            cudaMemset(reinterpret_cast<char*>(c->d) + offsetof(CpuDev, bitdiff), 0, sizeof d.bitdiff);
+            cudaMemset(reinterpret_cast<char*>(c->d) + offsetof(CpuDev, bitdiff), 0, 3 * sizeof(unsigned));
         }
     } else {
         unsigned err = 0;

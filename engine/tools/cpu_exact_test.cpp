@@ -1,6 +1,7 @@
 // cpu_exact_test.cpp: FNX_CPU_EXACT's arithmetic (src/cpu_experts.cpp), no GPU.
 //   cpu_exact_test [N]        1. the oracle (binary16 on the integers) on known answers, its rounding against F16C on N million floats;
-//                             2. the AVX2 fp16 FMA against the oracle on N million random triples, and on every first operand;
+//                             2. the AVX2 fp16 FMA against the oracle on N million random triples, and on every first operand; the
+//                                chains' fast form: every lane it does not flag is the oracle's bits;
 //                             3. the exact kernels (every gate|up and down type, 1-4 lanes, 1-3 tokens) against the card's steps done
 //                                with the oracle, bit for bit, directly and through the pool
 //   cpu_exact_test bench NTOK THREADS REPS
@@ -124,6 +125,60 @@ void test_fma16(long n) {
     }
     CHECK(bad == 0, "fma16 differs from the oracle in %ld of %ld cases", bad, cases);
     if (!bad) std::printf("fma16: %ld cases bit for bit the oracle's; fp32-then-fp16 would have differed in %ld of them\n", cases, naive);
+}
+
+// the chains' fast form: wherever it does not flag a lane, that lane is the oracle's bits (a flagged run is done again with fma16)
+void test_fma16f(long n) {
+    if (!have_simd()) return;
+    long bad = 0, flagged = 0, cases = 0, saved = 0;
+    alignas(32) float w[8], x[8], c[8], out[8];
+    alignas(32) uint32_t flag[8];
+    uint16_t hw[8], hx[8], hc[8];
+    auto run = [&] {
+        fma16f_x8(w, x, c, out, flag);
+        for (int i = 0; i < 8; ++i) {
+            const uint16_t ref = f16_fma_ref(hw[i], hx[i], hc[i]);
+            const bool same = same16(hw16(out[i]), ref) && same32(out[i], f16_to_f32(ref));
+            if (flag[i]) ++flagged;
+            else if (!same) ++bad;
+            if (flag[i] && !same) ++saved;
+            ++cases;
+        }
+    };
+    for (long i = 0; i < n / 8; ++i) {
+        const int mode = (int) (i % 4);
+        for (int k = 0; k < 8; ++k) {
+            hw[k] = mode >= 2 ? rnd_half(1, 30) : rnd_half(5, 13);
+            hx[k] = mode >= 2 ? rnd_half(1, 30) : rnd_half(8, 18);
+            hc[k] = mode == 0 ? rnd_half(1, 16) : rnd_half(1, 30);
+            const float p = f16_to_f32(hw[k]) * f16_to_f32(hx[k]);
+            if (mode == 1 && (rng() & 1)) {   // c near -w*x: cancellation, sums in the subnormal range
+                hc[k] = hw16(-p);
+                hc[k] = (uint16_t) (hc[k] + (int) (rng() % 5) - 2);
+                if ((hc[k] & 0x7c00) == 0x7c00) hc[k] = 0;
+            }
+            if (mode == 3) {   // aim the sum at a midpoint (or just beside one): c = the fp16 value nearest (a random midpoint - w*x)
+                const uint16_t m = rnd_half(1, 30);
+                const float mid = bitsf(fbits(f16_to_f32(m)) + (1u << 12));
+                hc[k] = hw16(mid - p);
+                hc[k] = (uint16_t) (hc[k] + (int) (rng() % 3) - 1);
+                if ((hc[k] & 0x7c00) == 0x7c00) hc[k] = 0;
+            }
+            w[k] = f16_to_f32(hw[k]), x[k] = f16_to_f32(hx[k]), c[k] = f16_to_f32(hc[k]);
+        }
+        run();
+    }
+    for (uint32_t a = 0; a < 65536; ++a) {   // every third operand against small products: sums in every binade, the subnormal ones too
+        for (int k = 0; k < 8; ++k) {
+            hw[k] = rnd_half(1, 12), hx[k] = rnd_half(1, 12), hc[k] = (uint16_t) a;
+            if ((hc[k] & 0x7c00) == 0x7c00) hc[k] = (uint16_t) (hc[k] & 0x83ff);
+            w[k] = f16_to_f32(hw[k]), x[k] = f16_to_f32(hx[k]), c[k] = f16_to_f32(hc[k]);
+        }
+        run();
+    }
+    CHECK(bad == 0, "the fast form is wrong in %ld unflagged cases of %ld", bad, cases);
+    CHECK(saved > 0, "no case where the fast form is wrong: the test does not reach the midpoints");
+    if (!bad) std::printf("fma16f: %ld cases: every unflagged one bit for bit the oracle's; %ld flagged, %ld of them where the fast form is wrong\n", cases, flagged, saved);
 }
 
 // random blocks: every byte random, the fp16 fields in the ranges given (exponent fields)
@@ -251,6 +306,7 @@ int main(int argc, char** argv) {
     std::printf("AVX2+FMA+F16C: %s\n", have_simd() ? "yes" : "no (the exact kernels run the oracle's steps)");
     test_oracle(n);
     test_fma16(n);
+    test_fma16f(n);
     test_kernels(false);
     test_kernels(true);
     std::printf(fails ? "cpu_exact_test: %d FAILED\n" : "cpu_exact_test: all passed\n", fails);

@@ -1869,6 +1869,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         else p100_moe_rows_phase(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, T, b.h16, b.part, 2, b.st);
         if (cpu_chk_x) ck(cudaStreamWaitEvent(b.st, b.join2, 0), "join2 wait");
         if (cpu_chk) p100_cpu_take(b.cpux, b.part, T, true, b.st);
+        if (cpu_chk_x) p100_cpu_check_stages(b.cpux, b.gu, b.h16, b.st);
         }
     } else if (sh_in) moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
     else if (b.xh16) {
