@@ -27,7 +27,8 @@ Inkling 2 Mini (`ink2`, exact): **~84 tok/s writing · ~100 tok/s Koda edits · 
 > exact, ~84 tok/s writing with its DSpark drafter, ~965 tok/s reading, a 256k or a 512k context and pictures; llama.cpp
 > did 13 / 143 on the same cards. **A chat keeps its place:** the next turn reads only its new messages (0.76 s to the first
 > byte instead of ~20 s on a 16k chat), other conversations wait in RAM, and **since 23 Nov such short reads are 18-22 %
-> faster** (128 new tokens in 336 ms instead of 409). On branch [`inkling2`](https://github.com/Megla123/Scream-P100/tree/inkling2): [what it is and how to run it](#-inkling-2-mini-an-engine-of-its-own).
+> faster** (128 new tokens in 336 ms instead of 409). **And since 23 Nov on one P100 too** ([`ink2_1c`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#one-p100-ink2_1c-23-nov)): 40 tok/s
+> writing exactly within 8 GB of RAM, 48 with a lossy option within 6 GB. On branch [`inkling2`](https://github.com/Megla123/Scream-P100/tree/inkling2): [what it is and how to run it](#-inkling-2-mini-an-engine-of-its-own).
 
 > 🧪 **Tencent Hy4 flash on the same two P100s**, with an engine of its own: 27 tok/s writing, 337 tok/s reading (442
 > with f16 sums). A test build on branch [`hy4-test`](https://github.com/Megla123/Scream-P100/tree/hy4-test):
@@ -224,6 +225,16 @@ place:** checkpoints and parked conversations in RAM, so a chat's next turn, a s
 another one pushed off the cards reads only what is new (a 38k conversation back from RAM in 0.8 s instead of 51.5), and
 such a short read costs less since 23 Nov (64 / 128 / 256 new tokens in 251 / 336 / 484 ms instead of 322 / 409 / 562).
 
+[![Inkling 2 Mini on one Tesla P100](docs/inkling2-1c-scream-p100.jpg)](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#one-p100-ink2_1c-23-nov)
+
+**One P100** (23 Nov, `ink2_1c`, `INK2_CARDS=1 bash engine-inkling2/run.sh DATA`): the same engine on one card. The most used
+experts (by a plan from routing traces) fill the VRAM left after everything else, the others wait in RAM, and an on-card
+LRU cache that the card fills itself after each layer's routing holds the RAM experts in use; the reading path copies them
+in groups while it computes. Exact: **40.2 tok/s** fresh writing, 41.1 on an edit, 378 reading a 34.7k prompt, 45 of 45
+functions like two cards, within **8 GB of RAM** (6.9 GiB used). `INK2_LOSSY=1` requantizes the last 4 layers' Q8 experts
+to NVFP4: **48.0 tok/s** within **6 GB** (5.3 GiB used), 43 of 45 functions. No drafter on one card (it did not pay).
+[Details](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#one-p100-ink2_1c-23-nov).
+
 ```bash
 git clone -b inkling2 https://github.com/Megla123/Scream-P100.git && cd Scream-P100
 bash engine-inkling2/build.sh && bash engine-inkling2/setup.sh /data/inkling2
@@ -303,7 +314,7 @@ settles. What has and has not been tested is in [Known limitations](docs/GUIDE.m
 | [tune/README.md](tune/README.md) | `check.py` and `tune.py`: diagnose and tune your own machine |
 | [Branch `poc-4x-p100`](https://github.com/Megla123/Scream-P100/tree/poc-4x-p100/docs/POC-4X.md) | ⚠️ **Unverified proof of concept**, never run on four cards: a build for four P100 behind one PCIe switch (`build.sh --4x`) |
 | [Branch `m40-2x`](https://github.com/Megla123/Scream-P100/blob/m40-2x/docs/M40.md) | ⚠️ **Test build** for two Tesla M40 24 GB (sm_52), measured on one machine only: IQ3_XXS, 256k, 32 GB of RAM (`build.sh --m40`) |
-| [Branch `inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md) | Thinking Machines' Inkling 2 Mini on the same two P100, an engine of its own (`ink2`), measured on one machine only: the whole model in VRAM, exact, ~84 tok/s writing, ~965 tok/s reading, 256k or 512k context, pictures, a chat's next turn in under a second (`engine-inkling2/`) |
+| [Branch `inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md) | Thinking Machines' Inkling 2 Mini on the same two P100, an engine of its own (`ink2`), measured on one machine only: the whole model in VRAM, exact, ~84 tok/s writing, ~965 tok/s reading, 256k or 512k context, pictures, a chat's next turn in under a second (`engine-inkling2/`); also on **one P100** (`ink2_1c`): 40 tok/s writing within 8 GB of RAM, 48 lossy within 6 GB |
 | [Branch `hy4-test`](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md) | ⚠️ **Test build** for Tencent Hy4 flash on the same two P100, an engine of its own, measured on one machine only: IQ3_XXS, 64k, 96 GB of RAM, 337 / 442 tok/s reading (`engine-hy4/`) |
 | [NOTICE.md](NOTICE.md) · [docs/PROVENANCE.md](docs/PROVENANCE.md) · [docs/upstream-v0.2.10.diff](docs/upstream-v0.2.10.diff) | What is ours and what is Strata's, file by file and line by line |
 
@@ -311,6 +322,14 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
 
 ## 📰 News
 
+- **23 Nov 2026 (evening):** 🦑 **Inkling 2 Mini on one P100** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#one-p100-ink2_1c-23-nov): `ink2_1c`,
+  the same engine for one card. The whole model does not fit (experts 15.4 GiB), so the experts used most stay in VRAM by a
+  plan from routing traces and the others wait in page-locked RAM; after each layer's routing the card copies the picked RAM
+  experts into an LRU cache of its own (on written text a fixed choice hit only 85 %, the cache cut the PCIe bytes by ~40 %),
+  and the reading path stages them in groups. Exact: 40.2 tok/s fresh, 41.1 edit, 378 reading 34.7k, 45/45 functions,
+  16/16 English, 12/15 Slovenian (as two cards) within 8 GB of RAM. `INK2_LOSSY=1` (the last 4 layers' Q8 experts
+  requantized to NVFP4 at load): 48.0 / 45.6 / 396 within 6 GB, 43/45 functions. Writing is 55-65 % of two cards, reading
+  about half.
 - **23 Nov 2026:** 🦑 **Inkling 2 Mini reads short pieces 18-22 % faster** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#short-pieces-read-faster-p25-p27).
   Since conversations keep their place, most requests read a few dozen to a few hundred new tokens, and such a piece had a
   fixed cost of ~270 ms. Most of it was the last 4 layers' experts, which are Q8_0 and still went through f32 copies and a
