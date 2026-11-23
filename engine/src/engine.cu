@@ -1804,6 +1804,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
             ck(cudaEventRecord(b.fork2, b.st), "fork2");
             ck(cudaStreamWaitEvent(b.st3, b.fork2, 0), "fork2 wait");
             p100_cpu_post(b.cpux, l, b.cache_list, b.topi, T, b.xh16, b.st3);
+            p100_cpu_swiglu(b.cpux, b.st3);   // FNX_CPU_EXACT: the card's SwiGLU of the CPU's gate|up rows, beside the card's own experts
             ck(cudaEventRecord(b.join2, b.st3), "join2");
         } else if (live && over && rt.box) {   // FNX_FOLD 1: the router's last block did both
         } else if (live && over) {
@@ -1822,7 +1823,14 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         // first the experts that stayed in VRAM, while the copy runs; then wait for it, and the copied ones
         if (lat) lat_in();
         else if (!rt.xh && !cpu) p100_f32_f16(b.mixed, (size_t) T * N, b.xh16, b.st);
+        const bool cpu_chk_x = cpu_chk && p100_cpu_exact_on(b.cpux);
         if (cpu_chk) p100_cpu_publish(b.cpux, b.jobs_gu, b.jobs_dn, b.njobs, lyr, b.cache_list, b.topi, T, b.xh16, false, b.st);
+        if (cpu_chk_x) {   // FNX_CPU_EXACT under the check: the card's SwiGLU for the CPU on the third stream (joined before the take)
+            ck(cudaEventRecord(b.fork2, b.st), "fork2");
+            ck(cudaStreamWaitEvent(b.st3, b.fork2, 0), "fork2 wait");
+            p100_cpu_swiglu(b.cpux, b.st3);
+            ck(cudaEventRecord(b.join2, b.st3), "join2");
+        }
         // FNX_NOC_FILE split (IDEJE 31): the copier sends gate|up parts first, so gate|up waits for those only and down for the rest
         const bool split = dma && noc_mode().split;
         const bool split2 = dma && noc_mode().split == 2;   // perexp_patch.py: phase 2's blocks wait for their own expert's part
@@ -1859,6 +1867,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
             p100_moe_rows_phase_w(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, T, b.h16, b.part, 2, b.st, p100_dma_done(b.dma, 1),
                                   p100_dma_want_ptr(b.dma), b.cache_list, lyr, p100_dma_err_ptr(b.dma));
         else p100_moe_rows_phase(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, T, b.h16, b.part, 2, b.st);
+        if (cpu_chk_x) ck(cudaStreamWaitEvent(b.st, b.join2, 0), "join2 wait");
         if (cpu_chk) p100_cpu_take(b.cpux, b.part, T, true, b.st);
         }
     } else if (sh_in) moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);

@@ -2,6 +2,8 @@
 // run time, so the file builds with the project's flags on any x86-64 and falls back to the scalar steps elsewhere.
 #include "cpu_experts.hpp"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -332,6 +334,144 @@ void f16_to_f32(const uint16_t* src, float* dst, size_t n) {
     for (size_t i = 0; i < n; ++i) dst[i] = half_f(src[i]);
 }
 
+// ---- FNX_CPU_EXACT (cpu_experts.hpp): the oracle, on the integers
+namespace {
+typedef unsigned __int128 u128;
+struct H16 {   // cls 0: finite, (-1)^sign * m * 2^e; 1: infinite; 2: NaN
+    int sign, cls;
+    uint32_t m;
+    int e;
+};
+inline H16 h16_dec(uint16_t h) {
+    H16 v{h >> 15, 0, 0u, 0};
+    const uint32_t ex = (h >> 10) & 31u, mt = h & 1023u;
+    if (ex == 31) v.cls = mt ? 2 : 1;
+    else if (ex == 0) v.m = mt, v.e = -24;
+    else v.m = 1024u + mt, v.e = (int) ex - 25;
+    return v;
+}
+inline int bitlen(u128 x) {
+    const uint64_t hi = (uint64_t) (x >> 64), lo = (uint64_t) x;
+    return hi ? 128 - __builtin_clzll(hi) : lo ? 64 - __builtin_clzll(lo) : 0;
+}
+// sign * mag * 2^L (exact) to binary16: to nearest, ties to even, overflow to infinity
+uint16_t h16_round(int sign, u128 mag, int L) {
+    const uint16_t sb = (uint16_t) (sign << 15);
+    if (mag == 0) return sb;
+    int em = bitlen(mag) - 1 + L;              // the leading bit's exponent
+    const int qe = em >= -14 ? em - 10 : -24;  // the exponent of the result's last bit (normal, subnormal)
+    const int sh = qe - L;
+    u128 q;
+    if (sh <= 0) q = mag << (unsigned) -sh;
+    else {
+        q = mag >> (unsigned) sh;
+        const u128 rem = mag - (q << (unsigned) sh), half = (u128) 1 << (unsigned) (sh - 1);
+        if (rem > half || (rem == half && (q & 1))) ++q;
+    }
+    if (em >= -14) {
+        if (q == 2048) q = 1024, ++em;
+        if (em > 15) return (uint16_t) (sb | 0x7c00u);
+        return (uint16_t) (sb | ((unsigned) (em + 15) << 10) | (unsigned) (q - 1024));
+    }
+    return (uint16_t) (sb | (unsigned) q);   // a subnormal (q 1024: the smallest normal, which has the same bits)
+}
+inline uint16_t h16_mul_ref(uint16_t a, uint16_t b) { return f16_fma_ref(a, b, 0x8000u); }   // a * b + (-0): the product's own zero sign
+inline uint16_t h16_int(int v) { return f16_from_f32_ref((float) v); }
+}  // namespace
+
+uint16_t f16_fma_ref(uint16_t a, uint16_t b, uint16_t c) {
+    const H16 x = h16_dec(a), y = h16_dec(b), z = h16_dec(c);
+    const int ps = x.sign ^ y.sign;
+    if (x.cls == 2 || y.cls == 2 || z.cls == 2) return 0x7e00u;
+    if (x.cls == 1 || y.cls == 1) {
+        if ((x.cls == 0 && x.m == 0) || (y.cls == 0 && y.m == 0)) return 0x7e00u;   // infinity times zero
+        if (z.cls == 1 && z.sign != ps) return 0x7e00u;                              // infinity minus infinity
+        return (uint16_t) ((ps << 15) | 0x7c00);
+    }
+    if (z.cls == 1) return c;
+    const int pe = x.e + y.e, L = std::min(pe, z.e);
+    const u128 P = (u128) ((uint64_t) x.m * y.m) << (unsigned) (pe - L), C = (u128) z.m << (unsigned) (z.e - L);
+    if (P == 0 && C == 0) return (uint16_t) ((ps & z.sign) << 15);   // two zeros: -0 only from two -0
+    if (ps == z.sign) return h16_round(ps, P + C, L);
+    if (P == C) return 0;                                            // an exact cancellation: +0, rounding to nearest
+    return P > C ? h16_round(ps, P - C, L) : h16_round(z.sign, C - P, L);
+}
+uint16_t f16_from_f32_ref(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    const int sign = (int) (u >> 31), ex = (int) ((u >> 23) & 255);
+    const uint32_t mt = u & 0x7fffffu;
+    if (ex == 255) return mt ? 0x7e00u : (uint16_t) ((sign << 15) | 0x7c00);
+    return ex ? h16_round(sign, mt | 0x800000u, ex - 150) : h16_round(sign, mt, -149);
+}
+float f16_to_f32(uint16_t h) { return half_f(h); }
+
+bool exact_ok(uint32_t gu_type, uint32_t dn_type) {
+    return (gu_type == T_Q4_K || gu_type == T_Q5_K) && (dn_type == T_IQ4_NL || dn_type == T_Q5_1 || dn_type == T_Q8_0);
+}
+
+// the card's gate|up row (p100_moe_rows.cuh k_moe_rows, kq_finish of p100_iq_gemm.cuh) with the oracle's steps: `lanes` parts, part p
+// the 256-value groups [p * ngr / lanes, (p + 1) * ngr / lanes); a run's two chains from +0; the parts added as the xor shuffles do
+float gu_row_card_ref(uint32_t type, const uint8_t* row, int n, const uint16_t* x, int lanes) {
+    const bool k5 = type == T_Q5_K;
+    const int bb = k5 ? 176 : 144, nruns = n / 32, ngr = (nruns + 7) / 8;
+    float s[8] = {};
+    for (int p = 0; p < lanes; ++p)
+        for (int g = p * ngr / lanes; g < (p + 1) * ngr / lanes; ++g) {
+            const uint8_t* b = row + (size_t) g * bb;
+            const float d = half_f(rd16(b)), dm = half_f(rd16(b + 2));
+            for (int ib = 0; ib < 8; ++ib) {
+                uint8_t sc, m;
+                scale_min_k4(ib, b + 4, sc, m);
+                const uint16_t A = f16_from_f32_ref(d * (float) sc), B = f16_from_f32_ref(-dm * (float) m);
+                uint16_t w[32];
+                for (int l = 0; l < 32; ++l) {
+                    int q = (b[(k5 ? 48 : 16) + 32 * (ib >> 1) + l] >> (4 * (ib & 1))) & 15;
+                    if (k5) q |= ((b[16 + l] >> ib) & 1) << 4;
+                    w[l] = f16_fma_ref(h16_int(q), A, B);
+                }
+                const uint16_t* xr = x + (size_t) g * 256 + ib * 32;
+                uint16_t lo = 0, hi = 0;
+                for (int t = 0; t < 16; ++t) {
+                    lo = f16_fma_ref(w[2 * t], xr[2 * t], lo);
+                    hi = f16_fma_ref(w[2 * t + 1], xr[2 * t + 1], hi);
+                }
+                s[p] = s[p] + (half_f(lo) + half_f(hi));
+            }
+        }
+    for (int o = 1; o < lanes; o <<= 1)
+        for (int p = 0; p + o < lanes; p += 2 * o) s[p] = s[p] + s[p + o];
+    return s[0];
+}
+// the card's down row (one lane): IQ4_NL fp16(v d), Q8_0 fp16(q d), Q5_1 fp16(q d + m)
+float dn_row_card_ref(uint32_t type, const uint8_t* row, int n, const uint16_t* h) {
+    const int bb = type == T_Q5_1 ? 24 : type == T_Q8_0 ? 34 : 18;
+    float s = 0.f;
+    for (int b = 0; b < n / 32; ++b) {
+        const uint8_t* blk = row + (size_t) b * bb;
+        const uint16_t D = rd16(blk);
+        uint16_t w[32];
+        for (int l = 0; l < 32; ++l) {
+            if (type == T_Q8_0) w[l] = h16_mul_ref(h16_int((int8_t) blk[2 + l]), D);
+            else if (type == T_IQ4_NL) w[l] = h16_mul_ref(h16_int(KV_IQ4NL[(l < 16 ? blk[2 + l] : blk[2 + l - 16] >> 4) & 15]), D);
+            else {
+                uint32_t qh;
+                std::memcpy(&qh, blk + 4, 4);
+                const int q = ((l < 16 ? blk[8 + l] : blk[8 + l - 16] >> 4) & 15) | (int) (((qh >> l) & 1u) << 4);
+                w[l] = f16_fma_ref(h16_int(q), D, rd16(blk + 2));
+            }
+        }
+        const uint16_t* hr = h + (size_t) b * 32;
+        uint16_t lo = 0, hi = 0;
+        for (int t = 0; t < 16; ++t) {
+            lo = f16_fma_ref(w[2 * t], hr[2 * t], lo);
+            hi = f16_fma_ref(w[2 * t + 1], hr[2 * t + 1], hi);
+        }
+        s = s + (half_f(lo) + half_f(hi));
+    }
+    return s;
+}
+
 #if FNX_CPUX_X86
 // ---- the products straight from the blocks (no decoded row in between): a sub-block's 32 values share a scale and a minimum, so
 //      sum x (d q - m) = d * sum(x q) - m * sum(x), with sum(x) over each 32 columns taken once a token (xs)
@@ -508,9 +648,320 @@ FNX_CPUX_SIMD void down_chunk_k(const Work& w, const Expert& e, int i0, int i1) 
         }
     }
 }
+// ---- FNX_CPU_EXACT's kernels: 16 rows at a time, a row a lane of two vectors, each lane's two chains the card's two chains of that row
+FNX_CPUX_SIMD inline __m256 rn16(__m256 v) { return _mm256_cvtph_ps(_mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT)); }
+FNX_CPUX_SIMD inline float rn16s(float f) { return _cvtsh_ss(_cvtss_sh(f, _MM_FROUND_TO_NEAREST_INT)); }
+// fp16(w * x + c) of fp16 values held in floats, w * x exact in fp32 (as every product of two fp16 values): the fp32 sum s, its error e
+// (TwoSum, each step exact), s rounded to odd where e is not 0 (moved one ulp toward the exact sum when its last bit is 0), then to fp16:
+// the correctly rounded result, as the card's HFMA2 gives it. The subtractions as FMAs with 1.0 (the same exact result once rounded):
+// Haswell adds on one port only, FMAs on two
+FNX_CPUX_SIMD inline __m256 fma16(__m256 w, __m256 x, __m256 c) {
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 p = _mm256_mul_ps(w, x);
+    const __m256 s = _mm256_add_ps(p, c);
+    const __m256 bb = _mm256_fmsub_ps(s, one, p);
+    const __m256 e = _mm256_add_ps(_mm256_fmsub_ps(p, one, _mm256_fmsub_ps(s, one, bb)), _mm256_fmsub_ps(c, one, bb));
+    const __m256i si = _mm256_castps_si256(s), i1 = _mm256_set1_epi32(1);
+    const __m256i inexact = _mm256_castps_si256(_mm256_cmp_ps(e, _mm256_setzero_ps(), _CMP_NEQ_OQ));   // not for NaN (an infinite s)
+    const __m256i even = _mm256_cmpeq_epi32(_mm256_and_si256(si, i1), _mm256_setzero_si256());
+    const __m256i away = _mm256_or_si256(_mm256_srai_epi32(_mm256_xor_si256(si, _mm256_castps_si256(e)), 31), i1);   // +1 away from 0, else -1
+    return rn16(_mm256_castsi256_ps(_mm256_add_epi32(si, _mm256_and_si256(away, _mm256_and_si256(inexact, even)))));
+}
+// the fast form: fp16(fp32(w * x + c)), wrong only where that fp32 sum s was rounded (inexact) onto a point exactly halfway between two
+// fp16 values. `tie` gets every such lane (and a few more), off the chain's dependency path: every fp16 midpoint (normal, subnormal,
+// 65520) has at most 12 significant bits, so its float's low 12 bits are 0; s = p + c is exact when s - p == c and s - c == p (for the
+// larger operand that subtraction is Fast2Sum's, exact). A run with a flagged lane is done again with fma16 (about one in twenty).
+FNX_CPUX_SIMD inline __m256 fma16f(__m256 w, __m256 x, __m256 c, __m256& tie) {
+    const __m256 p = _mm256_mul_ps(w, x), s = _mm256_add_ps(p, c);
+    const __m256 few = _mm256_castsi256_ps(_mm256_cmpeq_epi32(_mm256_and_si256(_mm256_castps_si256(s), _mm256_set1_epi32(0xfff)), _mm256_setzero_si256()));
+    const __m256 inexact = _mm256_or_ps(_mm256_cmp_ps(_mm256_sub_ps(s, p), c, _CMP_NEQ_OQ), _mm256_cmp_ps(_mm256_sub_ps(s, c), p, _CMP_NEQ_OQ));
+    tie = _mm256_or_ps(tie, _mm256_and_ps(few, inexact));
+    return rn16(s);
+}
+// lanes where q a + b is exact in fp32 for every integer q < 32: a or b zero, or both normal fp16 values whose exponents differ by at
+// most 7. (q a is a multiple of a's last bit below 2^(ea + 6), b of its own below 2^(eb + 1): the sum spans at most
+// max(ea + 6, eb + 1) - min(ea, eb) + 11 <= 24 bits.) There fp16(fp32(q a + b)) is the card's one rounding
+FNX_CPUX_SIMD inline bool decode_plain(__m256 a, __m256 b) {
+    const __m256i m = _mm256_set1_epi32(0x7fffffff), ai = _mm256_and_si256(_mm256_castps_si256(a), m), bi = _mm256_and_si256(_mm256_castps_si256(b), m);
+    const __m256i ea = _mm256_srli_epi32(ai, 23), eb = _mm256_srli_epi32(bi, 23), d = _mm256_sub_epi32(ea, eb), lim = _mm256_set1_epi32(112);
+    const __m256i normal = _mm256_and_si256(_mm256_cmpgt_epi32(ea, lim), _mm256_cmpgt_epi32(eb, lim));   // fp32 exponent 113 = 2^-14
+    const __m256i close = _mm256_and_si256(_mm256_cmpgt_epi32(_mm256_set1_epi32(8), d), _mm256_cmpgt_epi32(d, _mm256_set1_epi32(-8)));
+    const __m256i zero = _mm256_or_si256(_mm256_cmpeq_epi32(ai, _mm256_setzero_si256()), _mm256_cmpeq_epi32(bi, _mm256_setzero_si256()));
+    return _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_or_si256(zero, _mm256_and_si256(normal, close)))) == 0xff;
+}
+// 8 vectors' lanes transposed (rows to columns)
+FNX_CPUX_SIMD inline void tr8_ps(__m256* v) {
+    const __m256 t0 = _mm256_unpacklo_ps(v[0], v[1]), t1 = _mm256_unpackhi_ps(v[0], v[1]), t2 = _mm256_unpacklo_ps(v[2], v[3]), t3 = _mm256_unpackhi_ps(v[2], v[3]);
+    const __m256 t4 = _mm256_unpacklo_ps(v[4], v[5]), t5 = _mm256_unpackhi_ps(v[4], v[5]), t6 = _mm256_unpacklo_ps(v[6], v[7]), t7 = _mm256_unpackhi_ps(v[6], v[7]);
+    const __m256 u0 = _mm256_shuffle_ps(t0, t2, 0x44), u1 = _mm256_shuffle_ps(t0, t2, 0xEE), u2 = _mm256_shuffle_ps(t1, t3, 0x44), u3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+    const __m256 u4 = _mm256_shuffle_ps(t4, t6, 0x44), u5 = _mm256_shuffle_ps(t4, t6, 0xEE), u6 = _mm256_shuffle_ps(t5, t7, 0x44), u7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+    v[0] = _mm256_permute2f128_ps(u0, u4, 0x20), v[1] = _mm256_permute2f128_ps(u1, u5, 0x20), v[2] = _mm256_permute2f128_ps(u2, u6, 0x20), v[3] = _mm256_permute2f128_ps(u3, u7, 0x20);
+    v[4] = _mm256_permute2f128_ps(u0, u4, 0x31), v[5] = _mm256_permute2f128_ps(u1, u5, 0x31), v[6] = _mm256_permute2f128_ps(u2, u6, 0x31), v[7] = _mm256_permute2f128_ps(u3, u7, 0x31);
+}
+// 8 rows of 32 bytes to 32 groups of 8 bytes, a group one byte position of the 8 rows (rows in order); tr_off: each position's group
+FNX_CPUX_SIMD inline void tr8x32(const __m256i* v, uint8_t* out) {
+    const __m256i a0 = _mm256_unpacklo_epi8(v[0], v[1]), a1 = _mm256_unpackhi_epi8(v[0], v[1]);
+    const __m256i a2 = _mm256_unpacklo_epi8(v[2], v[3]), a3 = _mm256_unpackhi_epi8(v[2], v[3]);
+    const __m256i a4 = _mm256_unpacklo_epi8(v[4], v[5]), a5 = _mm256_unpackhi_epi8(v[4], v[5]);
+    const __m256i a6 = _mm256_unpacklo_epi8(v[6], v[7]), a7 = _mm256_unpackhi_epi8(v[6], v[7]);
+    const __m256i b0 = _mm256_unpacklo_epi16(a0, a2), b1 = _mm256_unpackhi_epi16(a0, a2), b2 = _mm256_unpacklo_epi16(a1, a3), b3 = _mm256_unpackhi_epi16(a1, a3);
+    const __m256i b4 = _mm256_unpacklo_epi16(a4, a6), b5 = _mm256_unpackhi_epi16(a4, a6), b6 = _mm256_unpacklo_epi16(a5, a7), b7 = _mm256_unpackhi_epi16(a5, a7);
+    __m256i* o = reinterpret_cast<__m256i*>(out);
+    _mm256_store_si256(o + 0, _mm256_unpacklo_epi32(b0, b4));
+    _mm256_store_si256(o + 1, _mm256_unpackhi_epi32(b0, b4));
+    _mm256_store_si256(o + 2, _mm256_unpacklo_epi32(b1, b5));
+    _mm256_store_si256(o + 3, _mm256_unpackhi_epi32(b1, b5));
+    _mm256_store_si256(o + 4, _mm256_unpacklo_epi32(b2, b6));
+    _mm256_store_si256(o + 5, _mm256_unpackhi_epi32(b2, b6));
+    _mm256_store_si256(o + 6, _mm256_unpacklo_epi32(b3, b7));
+    _mm256_store_si256(o + 7, _mm256_unpackhi_epi32(b3, b7));
+}
+FNX_CPUX_SIMD __attribute__((noinline)) void tr_probe(uint8_t* map) {   // the transpose run on the positions' own numbers
+    alignas(32) uint8_t id[32], out[256];
+    for (int l = 0; l < 32; ++l) id[l] = (uint8_t) l;
+    __m256i v[8];
+    for (auto& x : v) x = _mm256_load_si256(reinterpret_cast<const __m256i*>(id));
+    tr8x32(v, out);
+    for (int g = 0; g < 32; ++g) map[out[8 * g]] = (uint8_t) (8 * g);
+}
+const uint8_t* tr_off() {
+    static const std::array<uint8_t, 32> m = [] {
+        std::array<uint8_t, 32> a{};
+        tr_probe(a.data());
+        return a;
+    }();
+    return m.data();
+}
+FNX_CPUX_SIMD inline __m256 codes8(const uint8_t* g, bool sgn) {   // a group's 8 bytes as floats
+    const __m128i b = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(g));
+    return _mm256_cvtepi32_ps(sgn ? _mm256_cvtepi8_epi32(b) : _mm256_cvtepu8_epi32(b));
+}
+// Q5_1's 32 fifth bits: byte l is 16 where bit l of qh is set
+FNX_CPUX_SIMD inline __m256i bits16(uint32_t qh) {
+    const __m256i sh = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+    const __m256i bm = _mm256_set1_epi64x(0x8040201008040201LL);
+    const __m256i b = _mm256_shuffle_epi8(_mm256_set1_epi32((int) qh), sh);
+    return _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(b, bm), bm), _mm256_set1_epi8(16));
+}
+// a run's 32 weights of 16 rows (W[l][half]) times one token's 32 values: the card's chains (even values, odd values, from +0), folded.
+// The fast form first; when any lane met a midpoint, the run again with fma16
+FNX_CPUX_SIMD inline void chain32(const __m256 (*W)[2], const float* x, __m256* acc) {
+    __m256 lo0 = _mm256_setzero_ps(), lo1 = lo0, hi0 = lo0, hi1 = lo0, tie = lo0;
+    for (int t = 0; t < 16; ++t) {
+        const __m256 xe = _mm256_broadcast_ss(x + 2 * t), xo = _mm256_broadcast_ss(x + 2 * t + 1);
+        lo0 = fma16f(W[2 * t][0], xe, lo0, tie);
+        lo1 = fma16f(W[2 * t][1], xe, lo1, tie);
+        hi0 = fma16f(W[2 * t + 1][0], xo, hi0, tie);
+        hi1 = fma16f(W[2 * t + 1][1], xo, hi1, tie);
+    }
+    if (__builtin_expect(_mm256_movemask_ps(tie) != 0, 0)) {
+        lo0 = lo1 = hi0 = hi1 = _mm256_setzero_ps();
+        for (int t = 0; t < 16; ++t) {
+            const __m256 xe = _mm256_broadcast_ss(x + 2 * t), xo = _mm256_broadcast_ss(x + 2 * t + 1);
+            lo0 = fma16(W[2 * t][0], xe, lo0);
+            lo1 = fma16(W[2 * t][1], xe, lo1);
+            hi0 = fma16(W[2 * t + 1][0], xo, hi0);
+            hi1 = fma16(W[2 * t + 1][1], xo, hi1);
+        }
+    }
+    acc[0] = _mm256_add_ps(acc[0], _mm256_add_ps(lo0, hi0));
+    acc[1] = _mm256_add_ps(acc[1], _mm256_add_ps(lo1, hi1));
+}
+// weights fp16(q a + b) of a run, 16 rows: one rounding of the fp32 sum where that sum is exact for every q (decode_plain), else fma16
+FNX_CPUX_SIMD inline void decode_fma(const uint8_t (*tb)[256], const uint8_t* off, const __m256* a, const __m256* b, __m256 (*W)[2]) {
+    for (int hh = 0; hh < 2; ++hh) {
+        if (decode_plain(a[hh], b[hh])) {
+            for (int l = 0; l < 32; ++l) W[l][hh] = rn16(_mm256_fmadd_ps(codes8(tb[hh] + off[l], false), a[hh], b[hh]));
+            continue;
+        }
+        __m256 tie = _mm256_setzero_ps();   // the fast form and its test, the exact form where it flags
+        for (int l = 0; l < 32; ++l) W[l][hh] = fma16f(codes8(tb[hh] + off[l], false), a[hh], b[hh], tie);
+        if (__builtin_expect(_mm256_movemask_ps(tie) != 0, 0))
+            for (int l = 0; l < 32; ++l) W[l][hh] = fma16(codes8(tb[hh] + off[l], false), a[hh], b[hh]);
+    }
+}
+// 16 gate|up rows (Q4_K, or Q5_K with K5) of n values times nt tokens: res[k * 16 + r]
+template <bool K5>
+FNX_CPUX_SIMD void gu16_exact(const uint8_t* const* rp, int n, int lanes, int nt, const float* const* x, float* res) {
+    const int bb = K5 ? 176 : 144, nruns = n / 32, ngr = (nruns + 7) / 8;
+    const uint8_t* off = tr_off();
+    const __m256i m4 = _mm256_set1_epi8(0x0F), one8 = _mm256_set1_epi8(1);
+    alignas(32) uint8_t tb[2][256];
+    __m256 W[32][2], part[8][16][2], As[2][8], Bs[2][8];
+    for (int p = 0; p < lanes; ++p) {
+        __m256 acc[16][2];
+        for (int k = 0; k < nt; ++k) acc[k][0] = acc[k][1] = _mm256_setzero_ps();
+        for (int g = p * ngr / lanes; g < (p + 1) * ngr / lanes; ++g) {
+            // the 8 runs' a = fp16(d sc) and b = fp16(-dmin m) of each row (ggml's unpacking of the 12 scale bytes), then by run
+            for (int hh = 0; hh < 2; ++hh) {
+                for (int r = 0; r < 8; ++r) {
+                    const uint8_t* blk = rp[8 * hh + r] + (size_t) g * bb;
+                    uint32_t u[4];
+                    std::memcpy(u, blk + 4, 12);
+                    u[3] = ((u[2] >> 4) & 0x0f0f0f0fu) | (((u[1] >> 6) & 0x03030303u) << 4);
+                    const uint32_t ux = u[1] & 0x3f3f3f3fu;
+                    u[1] = (u[2] & 0x0f0f0f0fu) | (((u[0] >> 6) & 0x03030303u) << 4);
+                    u[2] = ux;
+                    u[0] &= 0x3f3f3f3fu;
+                    const __m256 sc = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(u))));
+                    const __m256 mn = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(u + 2))));
+                    As[hh][r] = rn16(_mm256_mul_ps(_mm256_set1_ps(half_s(blk)), sc));   // the products exact, one rounding each
+                    Bs[hh][r] = rn16(_mm256_mul_ps(_mm256_set1_ps(-half_s(blk + 2)), mn));
+                }
+                tr8_ps(As[hh]);
+                tr8_ps(Bs[hh]);
+            }
+            for (int ib = 0; ib < 8; ++ib) {
+                const __m128i cq = _mm_cvtsi32_si128(4 * (ib & 1)), ch = _mm_cvtsi32_si128(ib);
+                for (int hh = 0; hh < 2; ++hh) {
+                    __m256i v[8];
+                    for (int r = 0; r < 8; ++r) {
+                        const uint8_t* blk = rp[8 * hh + r] + (size_t) g * bb;
+                        __m256i c = _mm256_and_si256(_mm256_srl_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + (K5 ? 48 : 16) + 32 * (ib >> 1))), cq), m4);
+                        if (K5)
+                            c = _mm256_or_si256(c, _mm256_slli_epi16(_mm256_and_si256(_mm256_srl_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + 16)), ch), one8), 4));
+                        v[r] = c;
+                    }
+                    tr8x32(v, tb[hh]);
+                }
+                const __m256 a[2] = {As[0][ib], As[1][ib]}, b[2] = {Bs[0][ib], Bs[1][ib]};
+                decode_fma(tb, off, a, b, W);
+                const int col = g * 256 + ib * 32;
+                for (int k = 0; k < nt; ++k) chain32(W, x[k] + col, acc[k]);
+            }
+        }
+        for (int k = 0; k < nt; ++k) part[p][k][0] = acc[k][0], part[p][k][1] = acc[k][1];
+    }
+    for (int o = 1; o < lanes; o <<= 1)   // the warp's xor shuffles: lane 0 ends with ((s0 + s1) + (s2 + s3)) + ...
+        for (int p = 0; p + o < lanes; p += 2 * o)
+            for (int k = 0; k < nt; ++k)
+                part[p][k][0] = _mm256_add_ps(part[p][k][0], part[p + o][k][0]), part[p][k][1] = _mm256_add_ps(part[p][k][1], part[p + o][k][1]);
+    for (int k = 0; k < nt; ++k) _mm256_storeu_ps(res + 16 * k, part[0][k][0]), _mm256_storeu_ps(res + 16 * k + 8, part[0][k][1]);
+}
+// 16 down rows (TY 20 IQ4_NL, 7 Q5_1, 8 Q8_0) of n values times nt rows of h: res[k * 16 + r]
+template <int TY>
+FNX_CPUX_SIMD void dn16_exact(const uint8_t* const* rp, int n, int nt, const float* const* h, float* res) {
+    const int bb = TY == 7 ? 24 : TY == 8 ? 34 : 18;
+    const uint8_t* off = tr_off();
+    const __m256i m4 = _mm256_set1_epi8(0x0F), kv = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(KV_IQ4NL)));
+    alignas(32) float D[16], M[16];
+    alignas(32) uint8_t tb[2][256];
+    __m256 W[32][2], acc[16][2];
+    for (int k = 0; k < nt; ++k) acc[k][0] = acc[k][1] = _mm256_setzero_ps();
+    for (int b = 0; b < n / 32; ++b) {
+        for (int hh = 0; hh < 2; ++hh) {
+            __m256i v[8];
+            for (int r = 0; r < 8; ++r) {
+                const int rr = 8 * hh + r;
+                const uint8_t* blk = rp[rr] + (size_t) b * bb;
+                D[rr] = half_s(blk);
+                if constexpr (TY == 8) v[r] = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(blk + 2));
+                else {
+                    const __m128i q = _mm_loadu_si128(reinterpret_cast<const __m128i*>(blk + (TY == 7 ? 8 : 2)));
+                    __m256i c = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(q, 4), q), m4);   // values 0-15: low nibbles, 16-31: high
+                    if constexpr (TY == 20) c = _mm256_shuffle_epi8(kv, c);
+                    else {
+                        uint32_t qh;
+                        std::memcpy(&qh, blk + 4, 4);
+                        c = _mm256_or_si256(c, bits16(qh));
+                        M[rr] = half_s(blk + 2);
+                    }
+                    v[r] = c;
+                }
+            }
+            tr8x32(v, tb[hh]);
+        }
+        const __m256 d[2] = {_mm256_load_ps(D), _mm256_load_ps(D + 8)};
+        if constexpr (TY == 7) {   // fp16(q d + m)
+            const __m256 m[2] = {_mm256_load_ps(M), _mm256_load_ps(M + 8)};
+            decode_fma(tb, off, d, m, W);
+        } else
+            for (int l = 0; l < 32; ++l) {   // fp16(v d): the product exact, one rounding
+                W[l][0] = rn16(_mm256_mul_ps(codes8(tb[0] + off[l], true), d[0]));
+                W[l][1] = rn16(_mm256_mul_ps(codes8(tb[1] + off[l], true), d[1]));
+            }
+        for (int k = 0; k < nt; ++k) chain32(W, h[k] + b * 32, acc[k]);
+    }
+    for (int k = 0; k < nt; ++k) _mm256_storeu_ps(res + 16 * k, acc[k][0]), _mm256_storeu_ps(res + 16 * k + 8, acc[k][1]);
+}
+FNX_CPUX_SIMD void gu_chunk_exact_simd(const Work& w, const Expert& e, int j0, int j1) {
+    const size_t rb = row_bytes(w.gu_type, w.N);
+    const float* x[16];
+    for (int k = 0; k < e.n; ++k) x[k] = w.x + (size_t) e.rows[k] * w.x_stride;
+    alignas(32) float res[16 * 16];
+    for (int part = 0; part < 2; ++part)   // the gate rows, then the up rows
+        for (int j = j0; j < j1; j += 16) {
+            const uint8_t* rp[16];
+            for (int r = 0; r < 16; ++r) rp[r] = e.gu + (size_t) (part * w.ffs + std::min(j + r, j1 - 1)) * rb;
+            if (w.gu_type == T_Q5_K) gu16_exact<true>(rp, w.N, w.gu_lanes, e.n, x, res);
+            else gu16_exact<false>(rp, w.N, w.gu_lanes, e.n, x, res);
+            for (int k = 0; k < e.n; ++k)
+                for (int r = 0; r < 16 && j + r < j1; ++r) e.gu_out[(size_t) k * 2 * w.ffs + (size_t) part * w.ffs + j + r] = res[16 * k + r];
+        }
+}
+FNX_CPUX_SIMD void down_chunk_exact_simd(const Work& w, const Expert& e, int i0, int i1) {
+    const size_t rb = row_bytes(w.dn_type, w.ffs);
+    const float* h[16];
+    for (int k = 0; k < e.n; ++k) h[k] = e.h + (size_t) k * w.ffs;
+    alignas(32) float res[16 * 16];
+    for (int i = i0; i < i1; i += 16) {
+        const uint8_t* rp[16];
+        for (int r = 0; r < 16; ++r) rp[r] = e.dn + (size_t) std::min(i + r, i1 - 1) * rb;
+        if (w.dn_type == T_Q5_1) dn16_exact<7>(rp, w.ffs, e.n, h, res);
+        else if (w.dn_type == T_Q8_0) dn16_exact<8>(rp, w.ffs, e.n, h, res);
+        else dn16_exact<20>(rp, w.ffs, e.n, h, res);
+        for (int k = 0; k < e.n; ++k)
+            for (int r = 0; r < 16 && i + r < i1; ++r) e.out[(size_t) k * w.out_stride + i + r] = res[16 * k + r];
+    }
+}
 #endif
 
+namespace {
+// without AVX2: the oracle's steps, a row at a time (slow; exact all the same)
+void gu_chunk_exact_ref(const Work& w, const Expert& e, int j0, int j1) {
+    const size_t rb = row_bytes(w.gu_type, w.N);
+    std::vector<uint16_t> x16((size_t) e.n * w.N);
+    for (int k = 0; k < e.n; ++k)
+        for (int c = 0; c < w.N; ++c) x16[(size_t) k * w.N + c] = f16_from_f32_ref(w.x[(size_t) e.rows[k] * w.x_stride + c]);
+    for (int part = 0; part < 2; ++part)
+        for (int j = j0; j < j1; ++j)
+            for (int k = 0; k < e.n; ++k)
+                e.gu_out[(size_t) k * 2 * w.ffs + (size_t) part * w.ffs + j] =
+                    gu_row_card_ref(w.gu_type, e.gu + (size_t) (part * w.ffs + j) * rb, w.N, x16.data() + (size_t) k * w.N, w.gu_lanes);
+}
+void down_chunk_exact_ref(const Work& w, const Expert& e, int i0, int i1) {
+    const size_t rb = row_bytes(w.dn_type, w.ffs);
+    std::vector<uint16_t> h16((size_t) e.n * w.ffs);
+    for (size_t i = 0; i < h16.size(); ++i) h16[i] = f16_from_f32_ref(e.h[i]);
+    for (int i = i0; i < i1; ++i)
+        for (int k = 0; k < e.n; ++k)
+            e.out[(size_t) k * w.out_stride + i] = dn_row_card_ref(w.dn_type, e.dn + (size_t) i * rb, w.ffs, h16.data() + (size_t) k * w.ffs);
+}
+}  // namespace
+
+bool fma16_x8(const float* w, const float* x, const float* c, float* out) {
+#if FNX_CPUX_X86
+    if (!cpu_simd()) return false;
+    struct S {
+        FNX_CPUX_SIMD static void run(const float* w, const float* x, const float* c, float* out) {
+            _mm256_storeu_ps(out, fma16(_mm256_loadu_ps(w), _mm256_loadu_ps(x), _mm256_loadu_ps(c)));
+        }
+    };
+    S::run(w, x, c, out);
+    return true;
+#else
+    (void) w, (void) x, (void) c, (void) out;
+    return false;
+#endif
+}
+
 void gu_chunk(const Work& w, const Expert& e, int j0, int j1) {
+    if (w.exact) {
+#if FNX_CPUX_X86
+        if (cpu_simd()) return gu_chunk_exact_simd(w, e, j0, j1);
+#endif
+        return gu_chunk_exact_ref(w, e, j0, j1);
+    }
 #if FNX_CPUX_X86
     if (cpu_simd() && w.gu_type == T_Q4_K) return gu_chunk_kq<false>(w, e, j0, j1);
     if (cpu_simd() && w.gu_type == T_Q5_K) return gu_chunk_kq<true>(w, e, j0, j1);
@@ -527,6 +978,12 @@ void gu_chunk(const Work& w, const Expert& e, int j0, int j1) {
     }
 }
 void down_chunk(const Work& w, const Expert& e, int i0, int i1) {
+    if (w.exact) {
+#if FNX_CPUX_X86
+        if (cpu_simd()) return down_chunk_exact_simd(w, e, i0, i1);
+#endif
+        return down_chunk_exact_ref(w, e, i0, i1);
+    }
 #if FNX_CPUX_X86
     if (cpu_simd() && w.dn_type == T_IQ4_NL) return down_chunk_k<20>(w, e, i0, i1);
     if (cpu_simd() && w.dn_type == T_Q5_1) return down_chunk_k<7>(w, e, i0, i1);
@@ -668,7 +1125,7 @@ Pool::~Pool() {
 }
 int Pool::threads() const { return (int) p_->th.size(); }
 unsigned long long Pool::late() { return p_->late.exchange(0, std::memory_order_relaxed); }
-void Pool::run(Work& w, const Rows* rows) {
+void Pool::run_gu(Work& w, const Rows* rows) {
     if (w.m <= 0) return;
     if (rows && rows->x16) {
         if (rows->T <= 4) {   // a few rows: here, a round of the pool costs more than they do
@@ -678,7 +1135,14 @@ void Pool::run(Work& w, const Rows* rows) {
         w.x = rows->xf, w.x_stride = (size_t) w.N;
     }
     p_->phase_run(w, 1);
+}
+void Pool::run_down(Work& w) {
+    if (w.m <= 0) return;
     p_->phase_run(w, 2);
+}
+void Pool::run(Work& w, const Rows* rows) {
+    run_gu(w, rows);
+    run_down(w);
 }
 
 std::vector<int> node_cores(int node) {
