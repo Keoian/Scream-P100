@@ -257,6 +257,18 @@ __global__ void k_add_ord(float* y, const float* other, size_t n, int card) {   
     if (i < n) y[i] = card == 0 ? y[i] + other[i] : other[i] + y[i];
 }
 
+// p27: the attention's input projections of a piece by groups of rows with the same input into T [C][ldT], then each part
+// (dst[g], its width ld[g], from column off[g] of T) to its own buffer
+struct CatSegs { float* dst[8]; int ld[8], off[8], n; };
+__global__ void k_cat_scatter(const float* __restrict__ T, int ldT, int C, CatSegs s) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t) C * ldT) return;
+    const int t = (int) (i / ldT), j = (int) (i % ldT);
+    int g = 0;
+    while (g + 1 < s.n && j >= s.off[g + 1]) ++g;
+    s.dst[g][(size_t) t * s.ld[g] + j - s.off[g]] = T[i];
+}
+
 // p3c: NVFP4 experts of a chunk without an f32 copy (after Hy4's k_iq3_gemm3): a block = 128 rows of one expert by up to 64 of its
 // tokens at a time (rows of x in the expert-sorted order: expert e's from offs[e] to offs[e + 1]), steps of 32 input values (two
 // NVFP4 sub-blocks: thread (row dr, half dh) decodes one into shared memory), each thread an 8-row by 4-token tile, the next step's
@@ -434,11 +446,84 @@ __device__ __forceinline__ void fp4_tile(const uint8_t* __restrict__ pcodes, con
     }
     __syncthreads();
 }
+// p24: tiles of TN = 8 or 4 tokens for an expert's last few tokens (short pieces of a prompt: ~8 or fewer tokens an expert): RT
+// rows x 1 token a thread (RT 4 or 2; 128 / RT row groups x TN tokens = 256 threads). The same sums as fp4_tile, column by column
+template <int TN, int RT>
+__device__ __forceinline__ void fp4_tile_s(const uint8_t* __restrict__ pcodes, const uint8_t* __restrict__ pscales, int nsteps, const float* tab,
+                                           float (*ws)[F4M], float* xsm, const float* __restrict__ x, int ldx, int row0, int nk, float* y,
+                                           int ldy, int r0) {
+    static_assert(F4M / RT * TN == 256, "a thread a row group and token");
+    float (*xs)[TN] = (float (*)[TN]) xsm;
+    const int ty = threadIdx.x / TN, tx = threadIdx.x % TN;
+    const int dr = threadIdx.x & (F4M - 1), dh = threadIdx.x >> 7;
+    const int tok = threadIdx.x >> 2, seg = (threadIdx.x & 3) * 8;
+    const float* xr = tok < nk ? x + (size_t) (row0 + tok) * ldx + seg : nullptr;
+    uint8_t rd;
+    uint32_t q0, q1;
+    float4 v0, v1;
+    auto load = [&](int ks) {
+        const int sb = (ks & 1) * 2 + dh;
+        const uint8_t* c = pcodes + (size_t) (ks >> 1) * 32 + sb * 8;
+        rd = __ldg(pscales + (size_t) (ks >> 1) * 4 + sb);
+        q0 = __ldg((const uint32_t*) c);
+        q1 = __ldg((const uint32_t*) (c + 4));
+        v0 = v1 = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (xr) {
+            v0 = __ldg((const float4*) (xr + ks * F4K));
+            v1 = __ldg((const float4*) (xr + ks * F4K + 4));
+        }
+    };
+    load(0);
+    float acc[RT];
+#pragma unroll
+    for (int a = 0; a < RT; ++a) acc[a] = 0.0f;
+    for (int ks = 0; ks < nsteps; ++ks) {
+        __syncthreads();
+        {
+            const float d = ue4m3(rd);
+            const int k = dh * 16;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t b0 = (q0 >> (8 * j)) & 0xFFu, b1 = (q1 >> (8 * j)) & 0xFFu;
+                ws[k + j][dr] = tab[b0 & 15] * d;
+                ws[k + 4 + j][dr] = tab[b1 & 15] * d;
+                ws[k + 8 + j][dr] = tab[b0 >> 4] * d;
+                ws[k + 12 + j][dr] = tab[b1 >> 4] * d;
+            }
+            if (tok < TN) {
+                xs[seg + 0][tok] = v0.x; xs[seg + 1][tok] = v0.y; xs[seg + 2][tok] = v0.z; xs[seg + 3][tok] = v0.w;
+                xs[seg + 4][tok] = v1.x; xs[seg + 5][tok] = v1.y; xs[seg + 6][tok] = v1.z; xs[seg + 7][tok] = v1.w;
+            }
+        }
+        __syncthreads();
+        if (ks + 1 < nsteps) load(ks + 1);
+#pragma unroll 8
+        for (int k = 0; k < F4K; ++k) {
+            float w[RT];
+            if constexpr (RT == 4) {
+                const float4 w0 = *(const float4*) &ws[k][ty * 4];
+                w[0] = w0.x; w[1] = w0.y; w[2] = w0.z; w[3] = w0.w;
+            } else {
+                const float2 w0 = *(const float2*) &ws[k][ty * 2];
+                w[0] = w0.x; w[1] = w0.y;
+            }
+            const float xx = xs[k][tx];
+#pragma unroll
+            for (int a = 0; a < RT; ++a) acc[a] += w[a] * xx;
+        }
+    }
+    if (tx < nk) {
+        float* yr = y + (size_t) (row0 + tx) * ldy + r0 + ty * RT;
+#pragma unroll
+        for (int a = 0; a < RT; ++a) yr[a] = acc[a];
+    }
+    __syncthreads();
+}
 // p19b: one block a tile: the tiles (expert, first row of x, rows) from the host's routing counts, the 64-token ones first, so a
 // big expert's tiles run side by side instead of one after the other in one block (2048 tokens: up to ~1,500 rows on one expert)
 struct FTile { int e, row0, nk; };
 __global__ void __launch_bounds__(256) k_fp4_gemm5(const uint8_t* __restrict__ W, size_t estride, int rows, int cols, const FTile* tiles,
-                                                   const float* x, int ldx, float* y, int ldy) {
+                                                   const float* x, int ldx, float* y, int ldy, int small = 1) {   // p24: small = tiles of 8 and 4 tokens
     __shared__ __align__(16) float ws[F4K][F4M];
     __shared__ __align__(16) float xs[F4K * F4N];
     __shared__ float tab[16];
@@ -452,8 +537,12 @@ __global__ void __launch_bounds__(256) k_fp4_gemm5(const uint8_t* __restrict__ W
         fp4_tile<64>(pcodes, pscales, nsteps, tab, ws, xs, x, ldx, t.row0, t.nk, y, ldy, r0);
     else if (t.nk > 16)
         fp4_tile<32>(pcodes, pscales, nsteps, tab, ws, xs, x, ldx, t.row0, t.nk, y, ldy, r0);
-    else
+    else if (t.nk > 8 || !small)
         fp4_tile<16>(pcodes, pscales, nsteps, tab, ws, xs, x, ldx, t.row0, t.nk, y, ldy, r0);
+    else if (t.nk > 4)   // p24
+        fp4_tile_s<8, 4>(pcodes, pscales, nsteps, tab, ws, xs, x, ldx, t.row0, t.nk, y, ldy, r0);
+    else
+        fp4_tile_s<4, 2>(pcodes, pscales, nsteps, tab, ws, xs, x, ldx, t.row0, t.nk, y, ldy, r0);
 }
 // the tile list of k_fp4_gemm5 from the experts' row offsets (offs[e] .. offs[e + 1]): 64-token tiles, then the 32s, then the 16s
 inline int fp4_tiles(const int* offs, FTile* out) {
@@ -466,6 +555,167 @@ inline int fp4_tiles(const int* offs, FTile* out) {
                 t0 += tn;
             }
     return n;
+}
+
+// p25: Q8 experts (int8 rows, a half scale for 32 values: the last 4 layers) by k_fp4_gemm5's tiles, straight from the bytes
+// instead of k_q8s_f32 copies and a cublasSgemm an expert. Step of 32 values = one Q8 block a row: thread (row dr, half dh)
+// decodes 16 of them (scale x int8 in f32, as k_q8s_f32) into shared memory; inputs, products and stores as fp4_tile
+template <int TN>
+__device__ __forceinline__ void q8_tile(const int8_t* __restrict__ qrow, const unsigned short* __restrict__ drow, int nsteps,
+                                        float (*ws)[F4M], float* xsm, const float* __restrict__ x, int ldx, int row0, int nk, float* y,
+                                        int ldy, int r0) {
+    constexpr int TT = TN / 16;   // tokens a thread
+    float (*xs)[TN] = (float (*)[TN]) xsm;
+    const int ty = threadIdx.x >> 4, tx = threadIdx.x & 15;
+    const int dr = threadIdx.x & (F4M - 1), dh = threadIdx.x >> 7;
+    const int tok = threadIdx.x >> 2, seg = (threadIdx.x & 3) * 8;
+    const float* xr = tok < nk ? x + (size_t) (row0 + tok) * ldx + seg : nullptr;
+    int4 q;
+    unsigned short dq;
+    float4 v0, v1;
+    auto load = [&](int ks) {
+        q = __ldg((const int4*) (qrow + (size_t) ks * F4K + dh * 16));
+        dq = __ldg(drow + ks);
+        v0 = v1 = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (xr) {
+            v0 = __ldg((const float4*) (xr + ks * F4K));
+            v1 = __ldg((const float4*) (xr + ks * F4K + 4));
+        }
+    };
+    load(0);
+    float acc[8][TT];
+#pragma unroll
+    for (int a = 0; a < 8; ++a)
+#pragma unroll
+        for (int k = 0; k < TT; ++k) acc[a][k] = 0.0f;
+    for (int ks = 0; ks < nsteps; ++ks) {
+        __syncthreads();
+        {
+            const float sc = __half2float(__ushort_as_half(dq));
+            const int8_t* w = (const int8_t*) &q;
+            const int k = dh * 16;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) ws[k + j][dr] = sc * w[j];
+            if (tok < TN) {
+                xs[seg + 0][tok] = v0.x; xs[seg + 1][tok] = v0.y; xs[seg + 2][tok] = v0.z; xs[seg + 3][tok] = v0.w;
+                xs[seg + 4][tok] = v1.x; xs[seg + 5][tok] = v1.y; xs[seg + 6][tok] = v1.z; xs[seg + 7][tok] = v1.w;
+            }
+        }
+        __syncthreads();
+        if (ks + 1 < nsteps) load(ks + 1);
+#pragma unroll 8
+        for (int k = 0; k < F4K; ++k) {
+            const float4 w0 = *(const float4*) &ws[k][ty * 8], w1 = *(const float4*) &ws[k][ty * 8 + 4];
+            const float w[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
+            float xx[TT];
+            if constexpr (TT == 4) {
+                const float4 xv = *(const float4*) &xs[k][tx * 4];
+                xx[0] = xv.x; xx[1] = xv.y; xx[2] = xv.z; xx[3] = xv.w;
+            } else if constexpr (TT == 2) {
+                const float2 xv = *(const float2*) &xs[k][tx * 2];
+                xx[0] = xv.x; xx[1] = xv.y;
+            } else {
+                xx[0] = xs[k][tx];
+            }
+#pragma unroll
+            for (int a = 0; a < 8; ++a)
+#pragma unroll
+                for (int kk = 0; kk < TT; ++kk) acc[a][kk] += w[a] * xx[kk];
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < TT; ++i) {
+        const int tk = tx * TT + i;
+        if (tk >= nk) continue;
+        float* yr = y + (size_t) (row0 + tk) * ldy + r0 + ty * 8;
+#pragma unroll
+        for (int a = 0; a < 8; ++a) yr[a] = acc[a][i];
+    }
+    __syncthreads();
+}
+// p26: p24's small tiles for the Q8 experts: q8_tile's decode, fp4_tile_s's products (RT rows x 1 token a thread)
+template <int TN, int RT>
+__device__ __forceinline__ void q8_tile_s(const int8_t* __restrict__ qrow, const unsigned short* __restrict__ drow, int nsteps,
+                                          float (*ws)[F4M], float* xsm, const float* __restrict__ x, int ldx, int row0, int nk, float* y,
+                                          int ldy, int r0) {
+    static_assert(F4M / RT * TN == 256, "a thread a row group and token");
+    float (*xs)[TN] = (float (*)[TN]) xsm;
+    const int ty = threadIdx.x / TN, tx = threadIdx.x % TN;
+    const int dr = threadIdx.x & (F4M - 1), dh = threadIdx.x >> 7;
+    const int tok = threadIdx.x >> 2, seg = (threadIdx.x & 3) * 8;
+    const float* xr = tok < nk ? x + (size_t) (row0 + tok) * ldx + seg : nullptr;
+    int4 q;
+    unsigned short dq;
+    float4 v0, v1;
+    auto load = [&](int ks) {
+        q = __ldg((const int4*) (qrow + (size_t) ks * F4K + dh * 16));
+        dq = __ldg(drow + ks);
+        v0 = v1 = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (xr) {
+            v0 = __ldg((const float4*) (xr + ks * F4K));
+            v1 = __ldg((const float4*) (xr + ks * F4K + 4));
+        }
+    };
+    load(0);
+    float acc[RT];
+#pragma unroll
+    for (int a = 0; a < RT; ++a) acc[a] = 0.0f;
+    for (int ks = 0; ks < nsteps; ++ks) {
+        __syncthreads();
+        {
+            const float sc = __half2float(__ushort_as_half(dq));
+            const int8_t* w = (const int8_t*) &q;
+            const int k = dh * 16;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) ws[k + j][dr] = sc * w[j];
+            if (tok < TN) {
+                xs[seg + 0][tok] = v0.x; xs[seg + 1][tok] = v0.y; xs[seg + 2][tok] = v0.z; xs[seg + 3][tok] = v0.w;
+                xs[seg + 4][tok] = v1.x; xs[seg + 5][tok] = v1.y; xs[seg + 6][tok] = v1.z; xs[seg + 7][tok] = v1.w;
+            }
+        }
+        __syncthreads();
+        if (ks + 1 < nsteps) load(ks + 1);
+#pragma unroll 8
+        for (int k = 0; k < F4K; ++k) {
+            float w[RT];
+            if constexpr (RT == 4) {
+                const float4 w0 = *(const float4*) &ws[k][ty * 4];
+                w[0] = w0.x; w[1] = w0.y; w[2] = w0.z; w[3] = w0.w;
+            } else {
+                const float2 w0 = *(const float2*) &ws[k][ty * 2];
+                w[0] = w0.x; w[1] = w0.y;
+            }
+            const float xx = xs[k][tx];
+#pragma unroll
+            for (int a = 0; a < RT; ++a) acc[a] += w[a] * xx;
+        }
+    }
+    if (tx < nk) {
+        float* yr = y + (size_t) (row0 + tx) * ldy + r0 + ty * RT;
+#pragma unroll
+        for (int a = 0; a < RT; ++a) yr[a] = acc[a];
+    }
+    __syncthreads();
+}
+// Q: int8 [NE][rows][cols], D: half [NE][rows][cols / 32] (qstride / dstride an expert); rows a multiple of F4M, cols of F4K
+__global__ void __launch_bounds__(256) k_q8_gemm5(const int8_t* __restrict__ Q, const __half* __restrict__ D, size_t qstride, size_t dstride,
+                                                  int cols, const FTile* tiles, const float* x, int ldx, float* y, int ldy, int small = 1) {
+    __shared__ __align__(16) float ws[F4K][F4M];
+    __shared__ __align__(16) float xs[F4K * F4N];
+    const FTile t = tiles[blockIdx.y];
+    const int r0 = blockIdx.x * F4M, dr = threadIdx.x & (F4M - 1), nsteps = cols / F4K;
+    const int8_t* qrow = Q + (size_t) t.e * qstride + (size_t) (r0 + dr) * cols;
+    const unsigned short* drow = (const unsigned short*) D + (size_t) t.e * dstride + (size_t) (r0 + dr) * (cols / 32);
+    if (t.nk > 32)
+        q8_tile<64>(qrow, drow, nsteps, ws, xs, x, ldx, t.row0, t.nk, y, ldy, r0);
+    else if (t.nk > 16)
+        q8_tile<32>(qrow, drow, nsteps, ws, xs, x, ldx, t.row0, t.nk, y, ldy, r0);
+    else if (t.nk > 8 || !small)
+        q8_tile<16>(qrow, drow, nsteps, ws, xs, x, ldx, t.row0, t.nk, y, ldy, r0);
+    else if (t.nk > 4)   // p26
+        q8_tile_s<8, 4>(qrow, drow, nsteps, ws, xs, x, ldx, t.row0, t.nk, y, ldy, r0);
+    else
+        q8_tile_s<4, 2>(qrow, drow, nsteps, ws, xs, x, ldx, t.row0, t.nk, y, ldy, r0);
 }
 
 

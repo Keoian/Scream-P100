@@ -150,8 +150,11 @@ struct Engine {
     bool ilv = getenv("INK2_FP4_ILV") != nullptr;   // p4d off: NVFP4 experts interleaved as in the file (the older kernels need it)
     bool rows2 = getenv("INK2_ROWS2") != nullptr;   // p4b off: p4a's NVFP4 writing kernel
     bool gemm5 = getenv("INK2_GEMM5") ? atoi(getenv("INK2_GEMM5")) != 0 : true;
+    int tile_s = getenv("INK2_TILE_S") ? atoi(getenv("INK2_TILE_S")) : 1;   // p24: expert tiles of 8 and 4 tokens for an expert's last few (0: 16-token tiles)
     int xsplit = getenv("INK2_XSPLIT") ? std::max(1, std::min(PFB::XS_MAX, atoi(getenv("INK2_XSPLIT")))) : 4;   // p19d: slices of an exchange (1: xch_pf; 22. 11.: 2 / 3 / 4 = 14k 876 / 896 / 914)   // p19b: one block a tile of 64 / 32 / 16 tokens (0: k_fp4_gemm)
     bool pf_deq = getenv("INK2_PF_DEQ") != nullptr;  // p3c: NVFP4 experts of the reading path dequantized to f32 + cuBLAS (p3b)
+    bool catm = getenv("INK2_CATM") ? atoi(getenv("INK2_CATM")) != 0 : false;   // p27: the input projections in one call a group of rows (23. 11.: 128 tokens 322 -> 320 ms, routing ties move: off)
+    bool q8g = getenv("INK2_Q8G") ? atoi(getenv("INK2_Q8G")) != 0 : true;   // p25: Q8 experts of the reading path by k_q8_gemm5 (0: k_q8s_f32 + cuBLAS)
     float eps, qk_clip, rel_clip_thr, log_alpha, log_floor, situ_b, situ_lb, wscale, softcap;
     // host side of a step
     float* h_x0 = nullptr;   // p4c: page-locked (a graph's memcpy nodes read them at each replay)
@@ -159,7 +162,7 @@ struct Engine {
     float* h_tau = nullptr;
     bool graf = getenv("INK2_GRAF") != nullptr;   // p4c: the writing path's forward as a CUDA graph (measured 21. 11.: no gain, off)
     int pfc = 2048;                           // p3: INK2_PF_CHUNK, tokens a reading chunk
-    int pf_min = 41;                          // p3: INK2_PF_MIN, shortest piece that goes the reading path (INK2_PF_OFF: never); p23: 41, was MAXT + 1
+    int pf_min = 31;                          // p3: INK2_PF_MIN, shortest piece that goes the reading path (INK2_PF_OFF: never); p23: 41, was MAXT + 1; p27: 31
     std::atomic<unsigned> pf_rec[NC];         // p3: the exchange each card has recorded
     static constexpr int EB = 16, QS = 256;   // p3: experts dequantized at once; queries per attention block
     bool perm_on = getenv("INK2_PERM") ? atoi(getenv("INK2_PERM")) != 0 : false;   // p11: a window's expert jobs by expert (21. 11.: same speed, off)
@@ -1755,9 +1758,20 @@ struct Engine {
         if (L.fp4 && !pf_deq && gemm5 && !ilv && !gemm2) {   // p19b: the tile list from the counts the host has already
             const int nt = fp4_tiles(P.h_offs.data(), P.h_tiles.data());
             CK(cudaMemcpyAsync(P.tiles, P.h_tiles.data(), (size_t) nt * sizeof(FTile), cudaMemcpyHostToDevice, K.st));
-            k_fp4_gemm5<<<dim3(gu_rows / F4M, nt), 256, 0, K.st>>>(L.gu, gu_rows * (N / 64) * 36, (int) gu_rows, N, P.tiles, P.Xg, N, P.GU, (int) gu_rows);
+            k_fp4_gemm5<<<dim3(gu_rows / F4M, nt), 256, 0, K.st>>>(L.gu, gu_rows * (N / 64) * 36, (int) gu_rows, N, P.tiles, P.Xg, N, P.GU, (int) gu_rows, tile_s);
             k_situ_s<<<(n * FF_C + 255) / 256, 256, 0, K.st>>>(P.GU, P.HH, n, P.rowexp, L.gu_s, situ_b, situ_lb);
-            k_fp4_gemm5<<<dim3(N / F4M, nt), 256, 0, K.st>>>(L.dn, (size_t) N * (FF_C / 64) * 36, N, FF_C, P.tiles, P.HH, FF_C, P.EY, N);
+            k_fp4_gemm5<<<dim3(N / F4M, nt), 256, 0, K.st>>>(L.dn, (size_t) N * (FF_C / 64) * 36, N, FF_C, P.tiles, P.HH, FF_C, P.EY, N, tile_s);
+            if (comb) moe_comb(K, L, 0, C);
+            return;
+        }
+        if (!L.fp4 && q8g) {   // p25: the Q8 experts by the same tiles, straight from int8 rows and half scales
+            const int nt = fp4_tiles(P.h_offs.data(), P.h_tiles.data());
+            CK(cudaMemcpyAsync(P.tiles, P.h_tiles.data(), (size_t) nt * sizeof(FTile), cudaMemcpyHostToDevice, K.st));
+            k_q8_gemm5<<<dim3(gu_rows / F4M, nt), 256, 0, K.st>>>((const int8_t*) L.gu, L.gu_d, gu_e, gu_rows * (N / 32), N, P.tiles, P.Xg, N,
+                                                                   P.GU, (int) gu_rows, tile_s);
+            k_situ_s<<<(n * FF_C + 255) / 256, 256, 0, K.st>>>(P.GU, P.HH, n, P.rowexp, nullptr, situ_b, situ_lb);
+            k_q8_gemm5<<<dim3(N / F4M, nt), 256, 0, K.st>>>((const int8_t*) L.dn, L.dn_d, dn_e, (size_t) N * (FF_C / 32), FF_C, P.tiles, P.HH,
+                                                             FF_C, P.EY, N, tile_s);
             if (comb) moe_comb(K, L, 0, C);
             return;
         }
@@ -1836,13 +1850,38 @@ struct Engine {
         }
         deq8(K, L.cat, P.Wf);
         const int nqr = 2 * QC + NH_C * NREL + NH_C, nkr = KVC + (L.full ? NKV_C * NCONV : 0);
+        if (catm) {   // p27: a call a group of rows with the same input, into P.Egu, then each part to its buffer
+            CatSegs s{};
+            int r0 = 0, nr = 0;
+            auto part = [&](float* dst, int w) { s.dst[s.n] = dst; s.ld[s.n] = w; s.off[s.n] = nr; nr += w; ++s.n; };
+            auto flush = [&](const float* x) {
+                sgemm(K, P.Wf + (size_t) r0 * N, nr, N, x, N, P.Egu, nr, C);
+                k_cat_scatter<<<(unsigned) (((size_t) C * nr + 255) / 256), 256, 0, K.st>>>(P.Egu, nr, C, s);
+                r0 += nr;
+                nr = 0;
+                s = CatSegs{};
+            };
+            part(P.q, QC);
+            part(P.gate, QC);
+            part(P.r, NH_C * NREL);
+            part(P.sink, NH_C);
+            const bool one = nq == nk && nk == nv;
+            if (!one) flush(nq);
+            part(P.k, KVC);
+            if (L.full) part(P.dk, NKV_C * NCONV);
+            if (!one) flush(nk);
+            part(P.v, KVC);
+            if (L.full) part(P.dv, NKV_C * NCONV);
+            flush(nv);
+        } else {
         sgemm(K, P.Wf, QC, N, nq, N, P.q, QC, C);
         sgemm(K, P.Wf + (size_t) QC * N, QC, N, nq, N, P.gate, QC, C);
         sgemm(K, P.Wf + (size_t) 2 * QC * N, NH_C * NREL, N, nq, N, P.r, NH_C * NREL, C);
         sgemm(K, P.Wf + (size_t) (2 * QC + NH_C * NREL) * N, NH_C, N, nq, N, P.sink, NH_C, C);
         sgemm(K, P.Wf + (size_t) nqr * N, KVC, N, nk, N, P.k, KVC, C);
         sgemm(K, P.Wf + (size_t) (nqr + nkr) * N, KVC, N, nv, N, P.v, KVC, C);
-        if (L.full) {
+        }
+        if (L.full && !catm) {
             sgemm(K, P.Wf + (size_t) (nqr + KVC) * N, NKV_C * NCONV, N, nk, N, P.dk, NKV_C * NCONV, C);
             sgemm(K, P.Wf + (size_t) (nqr + nkr + KVC) * N, NKV_C * NCONV, N, nv, N, P.dv, NKV_C * NCONV, C);
         }
