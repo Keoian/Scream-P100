@@ -11,7 +11,10 @@ turn reads only its new messages (first byte after 0.76 s instead of ~20 s on a 
 another one pushed off the cards comes back from RAM in under a second, writing is 10 % faster without drafts and 2 % with
 them, and code in a prompt is tokenized as written. **Short pieces 18-22 % faster** (23 Nov, p25-p27,
 [below](#short-pieces-read-faster-p25-p27)): a chat turn's 64 or 128 new tokens are read in 251 / 336 ms instead of 322 /
-409, the experts of the last 4 layers no longer go through f32 copies.
+409, the experts of the last 4 layers no longer go through f32 copies. **One P100 too** (23 Nov, `ink2_1c`,
+[below](#one-p100-ink2_1c-23-nov)): `INK2_CARDS=1`, the most used experts in VRAM and the rest in RAM with an on-card cache,
+40 tok/s fresh writing exactly (45/45 functions, as two cards) within 8 GB of RAM, or 48 tok/s within 6 GB with the lossy
+`INK2_LOSSY=1`.
 
 Thinking Machines' **Inkling 2 Mini** (26.4B MoE: 24 layers, layers 6-17 run three times for 48 passes, 128 experts of which 8
 per token, a 1,024-token window on most layers, one full-attention layer in six, NVFP4 experts) on the same two P100s as
@@ -119,6 +122,83 @@ coding agent's write / bash tools worked on our machine. **Pictures**: `image_ur
 local path; checked with one picture a message). Limits: **greedy only** (no sampler yet), one request at a time. A follow-up turn of a
 conversation reads only the new part, and so does a prompt that parts from the conversation earlier or comes back after
 another one ([checkpoints and parked conversations](#conversations-keep-their-place-p21-p23)).
+
+## One P100 (`ink2_1c`, 23 Nov)
+
+The same engine for **one Tesla P100 16 GB** and as little RAM as it takes: `build/ink2_1c` (from `src-1c/`, built by
+`build.sh`), run with `INK2_CARDS=1 bash engine-inkling2/run.sh DATA [CTX]`. The whole model does not fit on one card (experts
+15.4 GiB, the rest ~3.5 GiB with a 32k context), so the experts that are used most stay in VRAM and the others wait in RAM:
+
+- **Placement:** after everything else is on the card, the experts fill what is left in the order of `data/plan_1c.txt`
+  (most used a byte first; made by `tools/plan_1c.py` from 5 × 30k tokens of reading and 5 × 400 written tokens, see its
+  header). Routing is concentrated: in a layer, 64 of the 128 experts carry 70-90 % of the picks. The rest sit in page-locked
+  RAM that the card can read; the kernels take every expert through a table of addresses.
+- **Writing:** an on-card **cache of RAM experts** (1.5 GiB by default): after a layer's routing the card itself copies each
+  picked RAM expert into the least recently used slot of that layer in one transfer, and the next passes of the loop and the
+  next tokens find it there. Writing traces showed why: on written text a static choice of 11 GiB hits only 85 % of the picks
+  (reading had promised 96 %), and an LRU cache of 1-1.5 GiB cut the bytes over PCIe by ~40 %.
+- **Reading:** the RAM experts with rows in a chunk go to the card in groups through two staging buffers, copied while the
+  group before is multiplied (each crosses PCIe once a chunk); chunks of 1,024 tokens and smaller scratch (the window layers'
+  rings, the attention buffers) leave ~1.5 GiB more for experts.
+- **No drafter** by default: on one card a rejected draft also costs its experts' transfers, and the drafter's VRAM is taken
+  from the experts; with it writing was a few percent slower (fresh 37.8 against 40.0, the edit 37.2 against 41.0).
+- **Lossy option `INK2_LOSSY=1`:** the last 4 layers' experts are Q8_0 in the file (the release's MXFP8, 8.46 MB an expert);
+  this requantizes them at load to NVFP4 like the other 20 layers (4.48 MB: a scale an expert matrix, an E4M3 scale a 16
+  values, E2M1 codes), so ~2 GB more of the model fits on the card. The output changes (KL against two cards 1e-5 to 2.5e-3
+  on short prompts, 6.5e-3 on a 4k prompt; the exact one-card build: 1e-9 to 1e-11 on the short ones).
+
+**Speed** (the same machine, one card, temperature 0, `bench.py` through the API at CTX 40960 inside a systemd scope with
+`MemoryMax` and no swap, as on a PC with that much RAM; two cards for comparison):
+
+| | One card, exact | One card, `INK2_LOSSY=1` | Lossy at CTX 65536 | Two cards |
+|---|---|---|---|---|
+| Fresh writing | **40.2** tok/s | **48.0** | 44.2 | 73.4 |
+| The edit | 41.1 | 45.6 | 42.1 | 88.1 |
+| 34,699-token read / writing after it | 378 / 33.5 | 396 / 38.7 | 403 / 35.9 | 792 / 58.9 |
+| RAM limit / most used (engine, server, tokenizer) | 8 GB / **6.9 GiB** | 6 GB / **5.3 GiB** | 7 GB / 6.1 GiB | not limited (checkpoints and parked chats up to 24 + 32 GiB) |
+| Experts in VRAM / RAM | 9.7 / 5.0 GiB | 9.7 / 3.1 GiB | 8.9 / 3.9 GiB | all in VRAM |
+| Ready in | ~52 s | ~80 s (the requantizing) | ~80 s | ~48 s |
+
+Writing 200 tokens after four prompts (CLI, CTX 32768): exact 35.9 / 38.5 / 45.4 / 39.4 tok/s (a 4k text, a chat, Slovenian,
+code), lossy 44.9 / 48.0 / 49.4 / 48.3; a 4k prompt reads at ~500 tok/s (two cards: ~965). Reading is about half of two cards
+(one card does all the work); writing reaches 55-65 % of two cards without drafts.
+
+**Quality** (the shared sets of our Flash-Next builds, through the API, reasoning low):
+
+| | functions with hidden tests | English | Slovenian questions | not in Slovenian / foreign words |
+|---|---|---|---|---|
+| One card, exact | **45/45** | 16/16 | 12/15 | 0/18, 0/6 |
+| One card, lossy | 43/45 (`decode`, `lfu`) | 16/16 | 12/15 | 0/18, 0/6 |
+| Two cards | 45/45 | 16/16 | 12/15 | 0/18, 0/6 |
+
+The exact one-card build is the same math as two cards (only the order of the sums differs): on short prompts the same
+tokens. 43 to 45 of 45 is the range we have seen between exact builds before (43 and 44 on 22 Nov).
+
+**Context:** every 32k of context takes ~1 GiB of the card from the experts (65536 still runs well, above that writing slows).
+The KV cache cannot go to RAM instead: every written token reads all of the full layers' rows (~32 KB a token of context),
+while it needs only ~5 % of the experts. **RAM:** the RAM experts (3-5 GiB, page-locked), checkpoints of the conversation up
+to 2048 MiB (`INK2_CKPT_MB`), no parked conversations (`INK2_PARK_MB`, 0 with one card); the model file is read once through
+the page cache while loading. With the drafter 6 GB was too little.
+
+Switches (environment of `run.sh`): `INK2_CARDS=1`, `INK2_LOSSY=1`, `CUDA_VISIBLE_DEVICES` (the card, default 0),
+`INK2_1C_CACHE_MB` (the cache of RAM experts, 1536), `INK2_1C_MARGIN_MB` (VRAM left free, 150), `INK2_1C_PLAN` (the order),
+`INK2_1C_EXP_MB` (at most this much for the static experts), `INK2_1C_STAGE_MB` (64, the reading path's two staging buffers),
+`INK2_1C_SCRATCH_MB` (256, a window's RAM experts beyond the cache), `INK2_RTRACE=FILE` (the writing path's routing, for
+`tools/plan_1c.py`).
+
+Checked from a clean clone of this branch on our machine (23 Nov, CUDA 12.4, `HOST_CXX=g++-13`, card 0): `build.sh` in 2 min
+(now also `build/ink2_1c`), then `INK2_CARDS=1 run.sh DATA 40960` and the same with `INK2_LOSSY=1`:
+
+| | `INK2_CARDS=1` | `INK2_CARDS=1 INK2_LOSSY=1` |
+|---|---|---|
+| Ready, experts in VRAM / RAM | 76 s, 9.71 / 5.00 GiB | 100 s, 9.72 / 3.10 GiB |
+| Picture: the title | read word for word (952-token prompt in 2.7 s, writing 35.8 tok/s) | |
+| `tools/conversation_check.py` (a 13k chat with a tool) | all OK; the next turns 1.2-1.5 s to the first byte, writing 36.6-37.2 | all OK; 0.9-1.3 s, 42.2-44.0 |
+| `tools/bench.py`: fresh / edit / 34,699-token read / writing after it | 40.2 / 38.2 / 379.4 / 33.6 tok/s | 48.0 / 46.8 / 397.7 / 38.7 |
+
+(The edit test repeats `serve/ink2_server.py`, which grew on 23 Nov, so its number is not comparable with the table above.)
+
+[![Inkling 2 Mini on one Tesla P100](inkling2-1c-scream-p100.jpg)](#one-p100-ink2_1c-23-nov)
 
 ## Conversations keep their place (p21-p23)
 
