@@ -9,7 +9,8 @@
 # SIGTERM stops both. The log goes to the terminal and, with each line's time, to DATA/ink2-PORT.log (INK2_LOG: another file,
 # 0 = none). INK2_* switches pass through to the engine (docs/INKLING2.md); INK2_OA_MTP / INK2_OA_LOOKUP set the
 # server's default drafts (3 / 15), INK2_LOOP_TEXT / INK2_LOG_EVERY its loop limit for answers and tool calls (16000
-# characters) and its progress line while a request runs (60 s). The engine keeps conversations' checkpoints and parked
+# characters) and its progress line while a request runs (60 s), INK2_EFFORT the reasoning effort of a request that names
+# none (low = 0.2; clients such as Open WebUI send none). The engine keeps conversations' checkpoints and parked
 # conversations in RAM (up to INK2_CKPT_MB = 24576 and INK2_PARK_MB = 32768 MiB, taken as they are needed; set them lower on
 # a machine with less RAM).
 # One P100 (docs/INKLING2.md "One P100"): INK2_CARDS=1 runs build/ink2_1c on CUDA_VISIBLE_DEVICES (default 0) without the drafter:

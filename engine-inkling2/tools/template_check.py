@@ -78,6 +78,9 @@ for name, tools, eff, msgs in CASES:
             tc["function"]["arguments"] = json.loads(a) if isinstance(a, str) else a
     ref = TMPL.render(messages=jmsgs, tools=tools, reasoning_effort=eff, add_generation_prompt=False)
     ours = srv.render(msgs, eff, tools)
+    # effort 0 with no tools: the server adds the answer's start on purpose (an answer without reasoning, 23 Nov)
+    if eff in (0, 0.0, "none") and not tools and ours.endswith("<|message_model|><|content_text|>"):
+        ours = ours[: -len("<|message_model|><|content_text|>")]
     if ref == ours:
         print(f"{name}: same ({len(ref)} characters)")
     else:

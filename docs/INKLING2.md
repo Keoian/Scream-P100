@@ -385,6 +385,35 @@ hash, so a conversation's cached state never mixes two pictures. The engine puts
 placeholder and, as llama.cpp does, skips `token_embd_norm` for them. Checked on this branch's card picture: the title read
 word for word (the 960-token prompt read in 1.5 s, the answer written at 85.5 tok/s).
 
+## Reasoning effort: low by default (23 Nov)
+
+Inkling 2 reasons before it answers, and how long is the request's `reasoning_effort` (none 0, minimal 0.1, low 0.2, medium
+0.7, high 0.9, as its template maps them). A reviewer found medium (0.7) running to tens of thousands of tokens of reasoning
+and recommends 0.1-0.2. Both stuck chats we know of ([below](#loops-in-the-reasoning-the-answer-or-a-tool-call)) were
+tool-heavy chats at 0.7 or 0.9 with greedy decoding: a chat app that sent medium, and Open WebUI, which sends no effort, so
+the server used its old default 0.9. We ran our quality sets on both cards with every request forced to one effort:
+
+| Effort | Functions with hidden tests | Tokens for the 45 functions | English | Slovenian questions | Empty answers | Longest reply | Writing time |
+|---|---|---|---|---|---|---|---|
+| minimal (0.1) | 43/45 | 33,179 | 16/16 | 12/15 | 0 | 6,000 (the limit) | 9.4 min |
+| **low (0.2)** | **45/45** | **29,564** | 16/16 | 12/15 | 0 | 1,458 | **8.7 min** |
+| medium (0.7) | 42/45 | 51,964 | 16/16 | 12/15 | 3 (Slovenian: the reasoning took the whole reply) | 6,000 (the limit) | 14.3 min |
+
+So since 23 Nov `serve/ink2_server.py` gives a request that names no effort **low** (`INK2_EFFORT` sets another; it was 0.9),
+and effort **none without tools** now means no reasoning at all: the prompt ends with the start of the answer (the model
+reasoned a little even at 0; maya-inkling-mini and Unbiased Strata do the same). A request that names an effort gets it, as
+before. A **tool call** that Inkling writes as `{"name":"X"args":{..}}` (the comma and the quote before `args` left out: the
+model's own top pick on some prompts, reported for maya-inkling-mini and seen in llama.cpp) is now read as the call instead of
+coming back as text. Checked on the engine: a request with an effort gives the same text to the token as before, none answers
+`391` to 17 × 23 without reasoning (was 238 characters of it), `tools/template_check.py` matches the template (the added
+answer start aside), `tools/conversation_check.py` all OK.
+
+**Sampling, tried and left out:** the model card says temperature 1.0, top-p 1, top-k 0, min-p 0. We added exact sampling to
+the engine (Gumbel noise on the card, the drafts still lossless) and ran the same sets at low with temperature 1.0 over the
+whole vocabulary: **7/45 functions**, 15/16 English, foreign words in 3 of 6 open Slovenian answers. A token from the long
+tail now and then breaks code and language. maya-inkling-mini samples from its top 1,000 candidates (and its server turns a
+top_k of 0 into 64), so the published scores with sampling are not plain full-vocabulary sampling. The engine stays greedy.
+
 ## Loops in the reasoning, the answer or a tool call
 
 The engine has no sampler: every answer is greedy. On 22 Nov, after ~20 tool calls (web searches and pages, a 15k-token

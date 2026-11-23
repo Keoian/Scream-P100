@@ -12,7 +12,10 @@ cached by the picture's SHA-256 in INK2_IMG_DIR, default /tmp/ink2-img) and its 
 has no sampler, so temperature and the like are ignored. Drafts: DSpark (MTP) 3 + prompt lookup 15 unless a request says
 "mtp" / "lookup". The reply's <|content_thinking|> part streams as reasoning_content, its <|content_text|> part as content.
 reasoning_effort (none / minimal / low / medium / high / xhigh) or chat_template_kwargs.reasoning_effort sets the template's
-"Thinking effort level". One generation at a time; the other endpoints answer meanwhile. A client that leaves stops the
+"Thinking effort level"; a request with none gets INK2_EFFORT (low = 0.2 since 23 Nov, was 0.9: on our sets low gave the best
+code in the fewest tokens, medium more tokens, worse code and empty answers), and effort none without tools answers without
+reasoning (the prompt ends with the answer's start). A tool call written as {"name":"X"args":{..}} (the comma before "args"
+left out, the model's own pick on some prompts) is read as the call. One generation at a time; the other endpoints answer meanwhile. A client that leaves stops the
 generation, also in a part that streams nothing (a tool call). SIGTERM stops the engine too when INK2_ENGINE_PID is set
 (run.sh does). A reasoning that falls into repeating itself word for word (greedy decoding can) is cut after its first copy
 and the model writes its answer; an answer or a tool call that does so for over 16,000 characters (INK2_LOOP_TEXT) ends the
@@ -63,6 +66,7 @@ ROLE = {"user": "<|message_user|>", "assistant": "<|message_model|>", "system": 
 EOS = 200006
 MTP = int(os.environ.get("INK2_OA_MTP", "3"))
 LOOKUP = int(os.environ.get("INK2_OA_LOOKUP", "15"))
+EFFORT_DEFAULT = os.environ.get("INK2_EFFORT", "0.2")   # p37: the effort of a request that names none (was 0.9)
 
 r = gguf.GGUFReader(A.model)
 f = r.fields["tokenizer.ggml.tokens"]
@@ -189,6 +193,8 @@ def render(messages, effort, tools=None, images=None):
             s += "<|content_model_end_sampling|>"
     if not emitted:
         s += effort_msg
+    if num == 0.0 and not tools and (not messages or messages[-1].get("role") != "assistant"):
+        s += "<|message_model|><|content_text|>"   # p37: effort 0, no tools: the answer at once, without reasoning
     return s
 
 
@@ -355,7 +361,28 @@ def effort_of(body):
     e = kw.get("reasoning_effort", body.get("reasoning_effort"))
     if e is None and kw.get("enable_thinking") is False:
         e = "none"
-    return e if e is not None else 0.9
+    if e is not None:
+        return e
+    return EFFORT_DEFAULT if EFFORT_DEFAULT in EFFORT else float(EFFORT_DEFAULT)   # p37
+
+
+_LOOSE_HEAD = re.compile(r'\s*\{\s*"name"\s*:\s*"((?:[^"\\]|\\.)*)"\s*(?:,\s*)?"?args"?\s*:\s*')
+
+
+def loose_call(raw):
+    """p37: (name, args) of a call json.loads refused when Inkling wrote it as {"name":"X"args":{..}} (the comma and the quote
+    before "args" left out; a whole name and one JSON object of arguments, then only the closing brace), else None."""
+    m = _LOOSE_HEAD.match(raw)
+    if not m:
+        return None
+    try:
+        args, end = json.JSONDecoder().raw_decode(raw[m.end():])
+        name = json.loads('"' + m.group(1) + '"')
+    except ValueError:
+        return None
+    if not isinstance(args, dict) or raw[m.end() + end:].strip() not in ("}", ""):
+        return None
+    return name, args
 
 
 class Parts:
@@ -381,7 +408,11 @@ class Parts:
             d = json.loads(raw)
             out.append(("tool", {"name": d["name"], "arguments": json.dumps(d.get("args") or {}, ensure_ascii=False)}))
         except (ValueError, KeyError, TypeError):
-            out.append(("c", raw))   # not a call after all: keep its text
+            lc = loose_call(raw)   # p37
+            if lc:
+                out.append(("tool", {"name": lc[0], "arguments": json.dumps(lc[1], ensure_ascii=False)}))
+            else:
+                out.append(("c", raw))   # not a call after all: keep its text
 
     def feed(self, ids):
         out = []
