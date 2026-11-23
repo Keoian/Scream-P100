@@ -78,7 +78,9 @@ bash engine-inkling2/run.sh /data/inkling2 256k   # or 512k; OpenAI-compatible A
 ```
 
 `run.sh DATA [CTX] [PORT]`: CTX `256k` (= 262144), `512k` (= 524288) or any number up to 524288 (default 32768); pictures are
-on when DATA holds the projector (`setup.sh DATA --no-pictures` leaves it out, `INK2_PICTURES=0` turns them off).
+on when DATA holds the projector (`setup.sh DATA --no-pictures` leaves it out, `INK2_PICTURES=0` turns them off). The log
+(the engine's and the server's lines) goes to the terminal and, each line with its time, to `DATA/ink2-PORT.log`, appended
+(`INK2_LOG=FILE` for another file, `INK2_LOG=0` for none); its first lines name the context, the port and the commit.
 `python3 engine-inkling2/tools/bench.py` measures fresh writing, an edit and a long read through the API,
 `python3 engine-inkling2/tools/picture_check.py` sends a picture (by default this branch's card picture) and asks for its title,
 `python3 engine-inkling2/tools/conversation_check.py` runs a chat with a long system message and a tool the way a chat app
@@ -336,6 +338,7 @@ either: the server noticed a client that left only when it wrote to it. Since th
 - While a request runs, the log gets a line every minute: the time, the prompt's tokens, the tokens written so far and
   the part being written (reasoning, answer, a tool call). `INK2_LOG_EVERY` sets the seconds (0 = none). A request that
   waits for the one before it says so too. `curl -s 127.0.0.1:8080/slots` shows `n_decoded` growing while the engine writes.
+- `run.sh` keeps the log in a file, `DATA/ink2-PORT.log`, each line with its time, so it can be sent along with a report.
 
 Checked with a fake engine (scripted tokens through the engine's socket, no cards): plain and tool-call replies, streamed
 and not, came back byte for byte as before. A tool call looping in its JSON ended after 2.0 s instead of running to its

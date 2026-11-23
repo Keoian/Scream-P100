@@ -11,7 +11,7 @@ its new messages, a 128-token piece in 336 ms (23 Nov). The full write-up: [docs
 ```bash
 bash engine-inkling2/build.sh                 # build/ink2_v1, build/ink2_vis, build/ink2_tok + llama-tokenize (CPU)
 bash engine-inkling2/setup.sh /data/inkling2  # model 17.6 GB + drafter 0.4 GB + projector 0.64 GB (--no-pictures: without), a venv
-bash engine-inkling2/run.sh /data/inkling2 [CTX=32768|256k|512k] [PORT=8080]
+bash engine-inkling2/run.sh /data/inkling2 [CTX=32768|256k|512k] [PORT=8080]   # log also in /data/inkling2/ink2-PORT.log
 python3 engine-inkling2/tools/bench.py http://127.0.0.1:8080
 python3 engine-inkling2/tools/picture_check.py http://127.0.0.1:8080
 python3 engine-inkling2/tools/conversation_check.py http://127.0.0.1:8080
