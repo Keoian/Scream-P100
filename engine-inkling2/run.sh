@@ -18,9 +18,14 @@
 # parked conversations), with an on-card cache of RAM experts (INK2_1C_CACHE_MB, 1536). INK2_LOSSY=1 (one card only) requantizes
 # the last 4 layers' Q8 experts to NVFP4 at load: ~18 % faster writing and ~2 GiB less RAM, but the output changes (see the docs).
 # The context costs the card's room for experts: 32768 is the default, 65536 still runs well; above that writing slows.
+# Several conversations at once (test builds, docs/INKLING2.md "Several conversations at once"): INK2_MULTI=tpb runs build/ink2_tpb
+# (production's layout with conversation slots and batches; a conversation alone is bit for bit build/ink2_v1), INK2_MULTI=pp
+# build/ink2_pp (a pipeline: half of the layers on each card). Up to INK2_SLOTS (4) requests run side by side, each in its own
+# slot of CTX tokens (default tpb 24576, pp 65536; tpb: 4 x 24k or 3 x 40k, pp: 4 x 64k or 6 x 32k fit). No pictures, no
+# checkpoints or parked conversations (a conversation stays in its slot until another needs it).
 set -euo pipefail
 H=$(cd "$(dirname "$0")" && pwd); B=$H/build
-D=${1:?usage: run.sh DATA [CTX|256k|512k] [PORT]}; CTX=${2:-32768}; PORT=${3:-8080}
+D=${1:?usage: run.sh DATA [CTX|256k|512k] [PORT]}; CTX=${2:-32768}; CTX_SET=${2:+1}; PORT=${3:-8080}
 case "$CTX" in 256k|256K) CTX=262144 ;; 512k|512K) CTX=524288 ;; esac
 [[ "$CTX" =~ ^[0-9]+$ ]] && [ "$CTX" -le 524288 ] || { echo "CTX: a number up to 524288, 256k or 512k" >&2; exit 2; }
 # everything below (this script's, the engine's and the server's lines) also goes to a log file, each line with its time:
@@ -40,17 +45,27 @@ if [ "${INK2_CARDS:-2}" = 1 ]; then   # one P100: build/ink2_1c, no drafter (on 
   if [ "${INK2_LOSSY:-0}" = 1 ]; then export INK2_1C_Q8_FP4=1; MODE="one card, lossy (last 4 layers NVFP4)"; fi
   [ -x "$ENG" ] || { echo "no $ENG: run build.sh again" >&2; exit 1; }
 fi
+SERVER=$H/serve/ink2_server.py; SL=()
+if [ -n "${INK2_MULTI:-}" ]; then   # several conversations at once (test builds): one slot a request, up to INK2_SLOTS side by side
+  case "$INK2_MULTI" in tpb|pp) ;; *) echo "INK2_MULTI: tpb or pp" >&2; exit 2 ;; esac
+  ENG=$B/ink2_$INK2_MULTI; SLOTS=${INK2_SLOTS:-4}
+  [ -n "$CTX_SET" ] || CTX=$([ "$INK2_MULTI" = tpb ] && echo 24576 || echo 65536)
+  [ -x "$ENG" ] || { echo "no $ENG: run build.sh again" >&2; exit 1; }
+  MODE="both cards, up to $SLOTS conversations at once (ink2_$INK2_MULTI, a slot of $CTX each)"; INK2_PICTURES=0
+  SERVER=$B/ink2_server_multi.py; SL=(--slots "$SLOTS")
+  "$D/venv/bin/python" "$H/serve/make_multi.py" "$H/serve/ink2_server.py" "$SERVER" "ink2_$INK2_MULTI" >&2 || exit 1
+fi
 MMPROJ=$D/mmproj-Inkling-2-Mini-BF16.gguf; VIS=()
 if [ "${INK2_PICTURES:-1}" != 0 ] && [ -f "$MMPROJ" ] && [ -x "$B/ink2_vis" ]; then VIS=(--mmproj "$MMPROJ" --vis "$B/ink2_vis"); fi
 echo "run.sh: $MODE, context $CTX ($([ "$CTX" -gt 262144 ] && echo "KV int8 from row 32768" || echo "KV f16")), pictures $([ ${#VIS[@]} -gt 0 ] && echo on || echo off), port $PORT, commit $(git -C "$H" log -1 --format=%h 2>/dev/null || echo ?)" >&2
 SOCK=$D/ink2-$PORT.sock
 rm -f "$SOCK"
-"$ENG" --model "$D/Inkling-2-Mini-NVFP4-Q8_0.gguf" ${DRAFT[@]+"${DRAFT[@]}"} --serve "$SOCK" --ctx "$CTX" &
+"$ENG" --model "$D/Inkling-2-Mini-NVFP4-Q8_0.gguf" ${DRAFT[@]+"${DRAFT[@]}"} --serve "$SOCK" --ctx "$CTX" ${SL[@]+"${SL[@]}"} &
 EP=$!
 trap 'kill $EP 2>/dev/null' EXIT
 for i in $(seq 180); do [ -S "$SOCK" ] && break; kill -0 $EP 2>/dev/null || { echo "the engine ended while loading" >&2; exit 1; }; sleep 1; done
 [ -S "$SOCK" ] || { echo "no engine socket after 180 s" >&2; exit 1; }
 export INK2_ENGINE_PID=$EP
 TOK=(); [ -x "$B/ink2_tok" ] && TOK=(--tok "$B/ink2_tok")   # the tokenizer that stays up (a build from before it: llama-tokenize a request)
-"$D/venv/bin/python" "$H/serve/ink2_server.py" --port "$PORT" --sock "$SOCK" --ctx "$CTX" --model "$D/Inkling-2-Mini-NVFP4-Q8_0.gguf" \
-  --tokenizer "$B/llama.cpp/build/bin/llama-tokenize" --gguf-py "$B/llama.cpp/gguf-py" ${VIS[@]+"${VIS[@]}"} ${TOK[@]+"${TOK[@]}"}
+"$D/venv/bin/python" "$SERVER" --port "$PORT" --sock "$SOCK" --ctx "$CTX" --model "$D/Inkling-2-Mini-NVFP4-Q8_0.gguf" \
+  --tokenizer "$B/llama.cpp/build/bin/llama-tokenize" --gguf-py "$B/llama.cpp/gguf-py" ${VIS[@]+"${VIS[@]}"} ${TOK[@]+"${TOK[@]}"} ${SL[@]+"${SL[@]}"}
