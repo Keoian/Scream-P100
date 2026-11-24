@@ -14,7 +14,10 @@ them, and code in a prompt is tokenized as written. **Short pieces 18-22 % faste
 409, the experts of the last 4 layers no longer go through f32 copies. **One P100 too** (23 Nov, `ink2_1c`,
 [below](#one-p100-ink2_1c-23-nov)): `INK2_CARDS=1`, the most used experts in VRAM and the rest in RAM with an on-card cache,
 40 tok/s fresh writing exactly (45/45 functions, as two cards) within 8 GB of RAM, or 48 tok/s within 6 GB with the lossy
-`INK2_LOSSY=1`.
+`INK2_LOSSY=1`. **Several chats at once** (24 Nov, two test builds, [below](#several-conversations-at-once-ink2_tpb-ink2_pp-24-nov)):
+`INK2_MULTI=tpb` writes for up to 4 agents together, 121 / 134 / 136 tok/s in all for 2 / 3 / 4 instead of ~85 one after another,
+while a single chat stays bit for bit `ink2_v1`; `INK2_MULTI=pp`, a pipeline with half of the layers on each card, reaches
+148 tok/s with 4 and 162-166 with 6. Every conversation's output is the same alone and beside the others.
 
 Thinking Machines' **Inkling 2 Mini** (26.4B MoE: 24 layers, layers 6-17 run three times for 48 passes, 128 experts of which 8
 per token, a 1,024-token window on most layers, one full-attention layer in six, NVFP4 experts) on the same two P100s as
@@ -119,9 +122,153 @@ clients work. `reasoning_effort` (none … xhigh) sets Inkling's "Thinking effor
 as the template's `tool_declare`, the model's calls come back as `tool_calls` (streamed too), tool results as its tool messages;
 the prompt equals the GGUF template's to the character (`tools/template_check.py`), and a web search tool in a chat app and a
 coding agent's write / bash tools worked on our machine. **Pictures**: `image_url` parts (a data URL, an http(s) URL or a
-local path; checked with one picture a message). Limits: **greedy only** (no sampler yet), one request at a time. A follow-up turn of a
+local path; checked with one picture a message). Limits: **greedy only** (no sampler yet), one request at a time (the [test builds for several chats](#several-conversations-at-once-ink2_tpb-ink2_pp-24-nov) take more). A follow-up turn of a
 conversation reads only the new part, and so does a prompt that parts from the conversation earlier or comes back after
 another one ([checkpoints and parked conversations](#conversations-keep-their-place-p21-p23)).
+
+## Several conversations at once (`ink2_tpb`, `ink2_pp`, 24 Nov)
+
+> ⚠️ Two **test builds**, measured on one machine. No pictures, no checkpoints or parked conversations.
+
+With `ink2_v1` the server writes for one request at a time. A second chat or agent waits until the first answer is done, so
+the two cards give ~85 tok/s whatever the number of agents. These two builds write for several conversations at once.
+
+Each conversation has a **slot** of its own on the cards: its KV cache, the convolutions' states and the drafter's rings.
+**Its output does not depend on the others.** Alone or beside 1-3 others, a conversation gets the same tokens and the same
+logits at every step. We checked this on every stage of the work, with every step's logits hashed.
+
+### `ink2_tpb`: production's layout with slots
+
+`src-tpb/`, run with `INK2_MULTI=tpb`. Both cards work on every layer, as in `ink2_v1`, plus slots and **batches**:
+
+- **Batches.** The writing pieces of up to 4 conversations go through one forward:
+  - the parts every row shares (the dense matrices, the experts, the loop controllers, the head) run once for all rows;
+  - the parts that read a conversation's own state (attention, the short convolutions) run group by group, with the rows
+    that conversation would have alone, so no sum changes.
+- **Gathering.** One thread drives both cards, and a piece waits up to 5 ms for others to join it.
+- **Interleaved reading.** A reading chunk (2,048 tokens) goes in 8 parts, with the waiting writers' pieces between them, so
+  a long prompt does not stall the other chats.
+- **Alone it is bit for bit `ink2_v1`**, at the same speed: the same logits on our four reference prompts (English,
+  Slovenian, code, a 4k text).
+
+### `ink2_pp`: a pipeline over the two cards
+
+`src-pp/`, run with `INK2_MULTI=pp`. Half of the model sits on each card, with the one-card kernels of `ink2_1c`:
+
+- **Split.** Card 0 holds layers 0-5 and 12-17 and the head. Card 1 holds layers 6-11 and 18-23, the DSpark drafter and the
+  final mix.
+- **Segments.** Layers 6-17 run three times, so each card has 24 of the 48 passes. A token goes through 8 segments of
+  6 passes that alternate between the cards, then the head.
+- **Overlap.** Each card has its own thread and queue of segments. While card 1 works for one conversation, card 0 works
+  for another. Segments of several conversations go through together as a batch.
+- **Hand-off.** The hidden state crosses between the cards through page-locked RAM (no P2P on our machine).
+- **Speed.** One conversation alone uses one card at a time and is slower; four to six keep both cards busy.
+- **Exactness.** Not bit for bit `ink2_v1`: other kernels sum in another order. KL against it is 9·10⁻¹⁰ on a short
+  prompt and 5·10⁻³ on a 4k text, where the first token differs (a near tie).
+
+### Speed with several chats
+
+Measured on the engine's socket: every conversation a different prompt, 256 fresh tokens each, greedy. The numbers are the
+sum of the conversations' writing speeds, what the two cards write in a second. "With drafts" is MTP 3 + lookup 15, the
+server's default.
+
+| At once | `ink2_v1`, with drafts / without | **`ink2_tpb`** | **`ink2_pp`** |
+|---|---|---|---|
+| 1 | 88 / 63 | **86** / 62 | 61 / 50 |
+| 2 | ~85 / 63 (the second waits) | **121** / 90 | 108 / 96 |
+| 3 | ~85 / 63 | **134** / 99 | |
+| 4 | ~85 / 63 | 136 / 104 | **148** / 119 |
+| 6 (6 slots of 32k) | | (does not fit) | **162-166** / 133 |
+
+- **Each conversation is slower, the cards write more.** With `ink2_tpb`, a conversation writes 86, 60.5, 44.5 and
+  34 tok/s with 1-4 at once, but the cards write 40-60 % more in all.
+- **Reading** a 4k / 30k prompt:
+
+  | | 4k | 30k | writing after the 30k read |
+  |---|---|---|---|
+  | `ink2_tpb` | 987 | 856 | 54.5 |
+  | `ink2_pp` | 953-958 | 837 | 42.6 |
+  | `ink2_v1` | 956 | 836 | 54.9 |
+
+- **A long read beside writers.** One conversation read 12k while three others wrote. With `ink2_tpb` the writers' first
+  token came after 0.6-1.3 s, against 4.5-6.8 s without the interleaving. All four ended about as before (21.1 against
+  21.6 s).
+
+**Which build:** `ink2_tpb` for 1-3 agents, where a single chat loses nothing against `ink2_v1`; `ink2_pp` for four and
+more (with two they are close).
+
+**Slots:**
+
+- `ink2_tpb`: a slot takes 1.0 GiB a card at 24k and 1.47 GiB at 40k, so 4 × 24k or 3 × 40k fit.
+- `ink2_pp`: 4 × 64k or 6 × 32k.
+
+A request takes the free slot that already holds the longest part of its prompt (its last turn, or the snapshot before the
+last answer), or else the one used least recently.
+
+**Follow-up turns.** A request that continues its slot's tokens exactly (an agent's tool round) reads only what is new. A
+chat app that sends the previous answer without its reasoning, as most do, makes the next turn read the whole prompt again,
+because these builds do not have p21's checkpoints yet (see the clean-clone check below).
+
+```bash
+INK2_MULTI=tpb bash engine-inkling2/run.sh /data/inkling2                   # 4 slots of 24576
+INK2_MULTI=tpb INK2_SLOTS=3 bash engine-inkling2/run.sh /data/inkling2 40960
+INK2_MULTI=pp bash engine-inkling2/run.sh /data/inkling2                    # 4 slots of 65536
+INK2_MULTI=pp INK2_SLOTS=6 bash engine-inkling2/run.sh /data/inkling2 32768
+python3 engine-inkling2/tools/multi_bench.py http://127.0.0.1:8080 1,2,4    # speed at once, and alone = together
+```
+
+At every start `run.sh` makes `build/ink2_server_multi.py` from `serve/ink2_server.py` (`serve/make_multi.py`: a semaphore
+of `--slots` instead of the lock). Up to `INK2_SLOTS` requests run at once; more wait. Limits of the test builds:
+
+- no pictures (a request with one gets an error);
+- no checkpoints or parked conversations: a conversation lives only in its slot;
+- the context is per slot.
+
+**Switches** (named in our notes' Slovenian):
+
+| Switch | Default | What |
+|---|---|---|
+| `INK2_PP_PAKET` | 4 | conversations in a batch; 1 = no batches |
+| `INK2_PP_ZBIRAJ_MS` | 5 | `ink2_tpb`: how long a piece waits for others |
+| `INK2_PP_PREPLETI` | 1 | `ink2_tpb`: the interleaved reading |
+| `INK2_PP_SPIN_MS` | 80 / 20 | how long a thread spins before it sleeps (`ink2_tpb` / `ink2_pp`) |
+| `INK2_PP_DELITEV` | `il` | `ink2_pp` only; `12` = layers 0-11 / 12-23 |
+| `INK2_PP_GLAVA` | 0 | `ink2_pp` only; 1 = the head split by halves of the vocabulary |
+| `INK2_PP_RISAR` | 1 | `ink2_pp` only: the drafter and final mix on card 1 |
+| `INK2_PP_INFLIGHT` | 2 | `ink2_pp` only: chunks of one prompt in the pipe |
+| `INK2_PF_CHUNK` | 1024 | `ink2_pp` only (the reading chunk here) |
+
+**What did not help** (all exact):
+
+- the drafter's Markov chain on the card instead of one transfer a step (the drafter is only ~7 % of a round);
+- CUDA events instead of waiting at the hand-offs: 119 → 104 tok/s, because the threads fill a card's queue and a hand-off
+  waits behind it;
+- `INK2_FUSE2=15`;
+- `INK2_PERM=1`;
+- 3-4 chunks of a prompt in the pipe;
+- MTP 4 (MTP 2 ≈ MTP 3);
+- other draft confidence limits.
+
+A reading chunk of 2,048 in the pipeline (`-DINK2_RING=4096`) reads 1.5-6 % faster, but with other bits.
+
+**Checked from a clean clone** of this branch on our machine (24 Nov, CUDA 12.4, `HOST_CXX=g++-13`, default slots). The
+sources are byte for byte the ones measured above, and `build.sh` took 4 min (now also `build/ink2_tpb` and `build/ink2_pp`).
+
+| | `INK2_MULTI=tpb` (4 × 24k) | `INK2_MULTI=pp` (4 × 64k) | `INK2_MULTI=pp INK2_SLOTS=6` (6 × 32k) |
+|---|---|---|---|
+| Alone against `build/ink2_v1` (CLI, 32 tokens) | **bit for bit** on English, Slovenian, code, a 4k text | KL 9·10⁻¹⁰ (English), 5·10⁻³ (4k text); the clone's build = the measured one bit for bit | |
+| Ready | 48 s | 50 s | 52 s |
+| `tools/multi_bench.py`, tok/s in all, 1 / 2 / 3 / 4 / 6 at once | 69.0 / 85.6 / 92.0 / **110.0** | 51.5 / 87.4 / - / **123.7** | 52.5 / - / - / - / **133.8** |
+| The same answers alone and together | yes | yes | yes |
+| `tools/conversation_check.py` (a 13k chat with a tool) | tool round 0.65 s to the first byte; the next turns read all 13k again: 13.9 s | tool round 1.1 s; the next turns 14.4 s | |
+
+`multi_bench.py`'s prompts draft less well than the ones in the speed table (alone 55-86 tok/s with `ink2_tpb`), so its
+totals are lower. The gain from more conversations is the same:
+
+- `ink2_tpb`: ×1.6 with 4;
+- `ink2_pp`: ×2.4 with 4 and ×2.5 with 6.
+
+[![Inkling 2 Mini: several chats at once on two Tesla P100](inkling2-multi-scream-p100.jpg)](#several-conversations-at-once-ink2_tpb-ink2_pp-24-nov)
 
 ## One P100 (`ink2_1c`, 23 Nov)
 

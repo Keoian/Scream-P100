@@ -8,16 +8,21 @@ with tool calls and pictures. Fresh writing 62 tok/s (84 with drafts), edits ~10
 13.0 / 143. A conversation keeps its place: checkpoints and parked conversations in RAM, so a chat's next turn reads only
 its new messages, a 128-token piece in 336 ms (23 Nov). **One P100** (`build/ink2_1c`, `INK2_CARDS=1`): the most used experts in
 VRAM, the rest in RAM with an on-card cache, 40 tok/s fresh writing within 8 GB of RAM (exact) or 48 within 6 GB (`INK2_LOSSY=1`).
+**Several chats at once** (test builds `build/ink2_tpb` and `build/ink2_pp`, `INK2_MULTI=tpb|pp`): up to 4-6 conversations
+write together, 121 / 136 tok/s in all with 2 / 4 (`ink2_tpb`, alone bit for bit `ink2_v1`) or 148 / 162-166 with 4 / 6
+(`ink2_pp`, a pipeline), each answer the same as alone.
 The full write-up: [docs/INKLING2.md](../docs/INKLING2.md).
 
 ```bash
-bash engine-inkling2/build.sh                 # build/ink2_v1, build/ink2_1c, build/ink2_vis, build/ink2_tok + llama-tokenize (CPU)
+bash engine-inkling2/build.sh                 # build/ink2_v1, ink2_1c, ink2_tpb, ink2_pp, ink2_vis, ink2_tok + llama-tokenize (CPU)
 bash engine-inkling2/setup.sh /data/inkling2  # model 17.6 GB + drafter 0.4 GB + projector 0.64 GB (--no-pictures: without), a venv
 bash engine-inkling2/run.sh /data/inkling2 [CTX=32768|256k|512k] [PORT=8080]   # log also in /data/inkling2/ink2-PORT.log
 INK2_CARDS=1 bash engine-inkling2/run.sh /data/inkling2   # one P100 (INK2_LOSSY=1: faster, ~2 GB less RAM, output changes)
+INK2_MULTI=tpb bash engine-inkling2/run.sh /data/inkling2  # up to 4 chats at once (test build; INK2_MULTI=pp: the pipeline)
 python3 engine-inkling2/tools/bench.py http://127.0.0.1:8080
 python3 engine-inkling2/tools/picture_check.py http://127.0.0.1:8080
 python3 engine-inkling2/tools/conversation_check.py http://127.0.0.1:8080
+python3 engine-inkling2/tools/multi_bench.py http://127.0.0.1:8080 1,2,4   # with INK2_MULTI: speed at once, alone = together
 ```
 
 | Path | What |
@@ -30,13 +35,17 @@ python3 engine-inkling2/tools/conversation_check.py http://127.0.0.1:8080
 | `src/ink2_vis.cpp` | the picture encoder: llama.cpp's mtmd (the vision projector) on the CPU, rows to a file |
 | `src/ink2_tok.cpp` | llama.cpp's tokenizer as a process that stays up (the server's `--tok`) |
 | `src-1c/` | the one-card build (`-DINK2_NC=1 -DINK2_RING=2048`, `gguf_min.*` from `src/`): experts placed by a plan, staged reading, the on-card cache of RAM experts, the lossy requantizing |
+| `src-tpb/` | several chats at once in production's layout (`ink2_tpb.cu` over a copy of the engine with `INK2_PP`): conversation slots, batches of up to 4 conversations' writing pieces, reading chunks interleaved with the waiting writers |
+| `src-pp/` | several chats at once as a pipeline (`ink2_pp.cu`, one-card kernels, `-DINK2_RING=2048`): half of the layers on each card, 8 segments a token, a thread and a queue a card, the drafter on card 1 |
 | `src/gguf_min.*` | a small GGUF reader (NVFP4 = type 40) |
 | `src/bench_dec.cu`, `src/ink2_bench.cuh` | a one-card microbenchmark of the decode kernels on random weights |
 | `serve/ink2_server.py` | the HTTP server (OpenAI API + llama-server endpoints, tools, pictures), greedy |
 | `data/draft_vocab_32768.bin`, `tools/draft_vocab.py` | the drafter's reduced vocabulary and how it was made |
 | `data/plan_1c.txt`, `tools/plan_1c.py` | the one-card build's order of experts for VRAM and how to make one from routing traces |
+| `serve/make_multi.py` | the server for `INK2_MULTI` (`build/ink2_server_multi.py`): up to `--slots` requests at once |
 | `tools/bench.py` | fresh writing, an edit and a long read through the API |
 | `tools/picture_check.py` | a picture and two questions through the API |
+| `tools/multi_bench.py` | 1, 2, 4 … conversations at once through the API, and every answer the same as alone |
 | `tools/conversation_check.py` | a chat-style conversation with a tool: tokens read a request, first byte; a written backslash-n |
 
 Measured on one machine only (2× P100 16 GB, PCIe 3.0 x16 each, 99 GiB RAM, CUDA 12.4). MIT, like the rest of the repository;
