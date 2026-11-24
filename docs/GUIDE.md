@@ -1343,8 +1343,8 @@ the CPU's. Here: `FNX_CPU_CHECK=1` found 0 values that are not the card's bits i
 file and 3.3 million on UD-Q4_K_XL; `bench.py`'s 27 first-token logits were the cards-only run's byte for byte in each
 of three rounds on each file; HumanEval's 164 greedy answers were the cards-only run's, text for text, on both, and so
 were eight greedy answers under `FNX_VRAM_CHURN=600` and the picture sequence with `--vram-elastic`; the check with a
-control vector (`FNX_CVEC`) found 0 values on both; and on bitlamas' file the decode-path yardstick's file was the
-cards-only run's.
+control vector (`FNX_CVEC`) found 0 values on both; and the decode-path yardstick's file was the cards-only run's on
+both.
 
 **Limits.** What `FNX_CPU_EXPERTS` needs (above), and gate|up Q4_K or Q5_K with down IQ4_NL, Q5_1 or Q8_0
 (UD-Q4_K_XL's types and bitlamas' Q4_K_XL-IQ4NL's), `FNX_ROW_G` 1, 2, 4 or 8 and `FNX_ROWS_G2` unset, as the profiles
