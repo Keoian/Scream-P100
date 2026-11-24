@@ -93,6 +93,22 @@ T_IMGPH = next(i for i, t in SPECIAL.items() if t == "<|unused_200054|>")
 LOCK = threading.Lock()
 STATE = {"busy": False, "n_prompt": 0, "n_decoded": 0, "n_ctx": A.ctx, "t_start": 0.0, "requests": 0, "tokens_out": 0, "part": "",
          "t_note": 0.0}
+# /metrics' counters since the start, summed from every finished request's timings (llama-server's names): prompt tokens read
+# (not the ones from the conversation cache: checkpoints, parked conversations), their seconds, the cached ones, the written
+# tokens' seconds, drafted and accepted draft tokens. STATE's tokens_out is llamacpp:tokens_predicted_total
+TOTALS = {"prompt_tokens": 0, "prompt_seconds": 0.0, "cached_tokens": 0, "predicted_seconds": 0.0, "drafted": 0, "accepted": 0}
+TOTALS_MUTEX = threading.Lock()
+METRICS = [   # name, type, help, value
+    ("requests_processing", "gauge", "Number of requests processing.", lambda: 1 if STATE["busy"] else 0),
+    ("prompt_tokens_total", "counter", "Number of prompt tokens processed.", lambda: TOTALS["prompt_tokens"]),
+    ("prompt_seconds_total", "counter", "Prompt process time.", lambda: round(TOTALS["prompt_seconds"], 6)),
+    ("prompt_tokens_cached_total", "counter", "Number of prompt tokens taken from the conversation cache.",
+     lambda: TOTALS["cached_tokens"]),
+    ("tokens_predicted_total", "counter", "Number of generation tokens processed.", lambda: STATE["tokens_out"]),
+    ("tokens_predicted_seconds_total", "counter", "Predict process time.", lambda: round(TOTALS["predicted_seconds"], 6)),
+    ("n_drafted_total", "counter", "Number of draft tokens.", lambda: TOTALS["drafted"]),
+    ("n_drafted_accepted_total", "counter", "Number of accepted draft tokens.", lambda: TOTALS["accepted"]),
+]
 LOG_EVERY = float(os.environ.get("INK2_LOG_EVERY", "60"))
 
 
@@ -642,9 +658,10 @@ class H(BaseHTTPRequestHandler):
             st = STATE
             return self._send(200, [{"id": 0, "n_ctx": A.ctx, "is_processing": st["busy"], "n_prompt_tokens": st["n_prompt"],
                                      "next_token": [{"n_decoded": st["n_decoded"], "has_next_token": st["busy"]}]}])
-        if path == "/metrics":
-            return self._send(200, f"# ink2_v1\nllamacpp:requests_processing {1 if STATE['busy'] else 0}\n"
-                                   f"llamacpp:tokens_predicted_total {STATE['tokens_out']}\n", "text/plain")
+        if path == "/metrics":   # Prometheus' text format, llama-server's names
+            with TOTALS_MUTEX:
+                text = "".join(f"# HELP llamacpp:{m} {h}\n# TYPE llamacpp:{m} {t}\nllamacpp:{m} {v()}\n" for m, t, h, v in METRICS)
+            return self._send(200, text, "text/plain; version=0.0.4")
         if path in ("/v1/models", "/models"):
             return self._send(200, {"object": "list", "data": [{"id": A.alias, "object": "model", "owned_by": "ink2_v1",
                                                                 "meta": {"n_ctx_train": 1048576, "n_ctx": A.ctx}}]})
@@ -746,6 +763,13 @@ class H(BaseHTTPRequestHandler):
                        "draft_n": tot["drafted"], "draft_n_accepted": tot["accepted"]}
             if tot["cuts"]:
                 timings["loop_cuts"] = tot["cuts"]
+            with TOTALS_MUTEX:   # /metrics
+                TOTALS["prompt_tokens"] += timings["prompt_n"]
+                TOTALS["prompt_seconds"] += timings["prompt_ms"] / 1000
+                TOTALS["cached_tokens"] += timings["cache_n"]
+                TOTALS["predicted_seconds"] += timings["predicted_ms"] / 1000
+                TOTALS["drafted"] += timings["draft_n"]
+                TOTALS["accepted"] += timings["draft_n_accepted"]
             usage = {"prompt_tokens": len(ids), "completion_tokens": n, "total_tokens": len(ids) + n,
                      "prompt_tokens_details": {"cached_tokens": tot["cached"]}}
             if stream:

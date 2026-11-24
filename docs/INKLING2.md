@@ -91,6 +91,11 @@ on when DATA holds the projector (`setup.sh DATA --no-pictures` leaves it out, `
 `python3 engine-inkling2/tools/picture_check.py` sends a picture (by default this branch's card picture) and asks for its title,
 `python3 engine-inkling2/tools/conversation_check.py` runs a chat with a long system message and a tool the way a chat app
 sends it and says how many tokens each request read.
+`GET /metrics` answers in Prometheus' text format with llama-server's names (24 Nov, issue #10): counters since the start,
+summed from every request's `timings`: `llamacpp:prompt_tokens_total` (prompt tokens read, not the ones from the conversation
+cache), `llamacpp:prompt_seconds_total`, `llamacpp:prompt_tokens_cached_total` (from checkpoints and parked conversations),
+`llamacpp:tokens_predicted_total`, `llamacpp:tokens_predicted_seconds_total`, `llamacpp:n_drafted_total`,
+`llamacpp:n_drafted_accepted_total`, and the gauge `llamacpp:requests_processing`.
 Checked from a clean clone of this branch on our machine (22 Nov, CUDA 12.4, `HOST_CXX=g++-13`): `build.sh` in 3.5 min
 (llama.cpp downloaded and built anew), `setup.sh`, then for each option `run.sh`, `tools/picture_check.py` and `tools/bench.py`;
 in the morning with the pictures and the 512k option, at noon again with p19's faster reading (the same clone, `build.sh`
