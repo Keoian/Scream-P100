@@ -1,11 +1,13 @@
 # `FNX_CPU_EXACT`: the CPU's missing experts, bit for bit the card's
 
-Branch `fnx-cpu-experts-exact`, on top of `fnx-cpu-experts` (PR #7). `FNX_CPU_EXPERTS=1 FNX_CPU_EXACT=1` computes routed
-experts that are not in VRAM on the CPU with the card's own arithmetic, so the engine's output is the card-only build's,
-byte for byte, whatever is in VRAM at a window. Off by default; without the switch the CPU path is PR #7's fp32 one.
-`FNX_CPU_SHARE=A,B` beside it shares each window's missing experts between the copy engine and the CPU (A per cent on
-the CPU in a window of 1 row, B in one of 16); any split gives the same bits. On the server it was measured on (one
-card in a x8 slot) it is faster than no CPU path on every writing test and slower than the fp32 path:
+Branch `fnx-cpu-exact`: PR #8's branch `fnx-cpu-experts-exact` on main, which has `FNX_CPU_EXPERTS` since PR #7.
+`FNX_CPU_EXPERTS=1 FNX_CPU_EXACT=1` computes routed experts that are not in VRAM on the CPU with the card's own
+arithmetic, so the engine's output is the card-only build's, byte for byte, whatever is in VRAM at a window. Off by
+default; without the switch the CPU path is PR #7's fp32 one. `FNX_CPU_SHARE=A,B` beside it shares each window's missing
+experts between the copy engine and the CPU (A per cent on the CPU in a window of 1 row, B in one of 16); any split
+gives the same bits. On the server it was measured on (one card in a x8 slot, fast CPUs) it is faster than no CPU path
+on every writing test and slower than the fp32 path; on the maintainer's (both cards on x16, slow CPUs) it holds the
+bits and loses to the cards alone ("Verified"):
 
 | tok/s | no CPU path (#5's build) | fp32 path (#7) | exact (this branch) | exact against no CPU path |
 |---|---:|---:|---:|---:|
@@ -159,14 +161,22 @@ The engine:
 |---|---|---|
 | `FNX_CPU_CHECK=1` (the copy engine and the cards compute every window as without the path; each row the CPU computed is compared with the card's own) | 3,172,127 rows a card in four runs, 1,596,630 of them at the final settings: 0 values not bit for bit, by stage 0 gate\|up sums and 0 SwiGLU values, every post whole | 3,293,093 rows a card in three runs (1,113,675 + 1,082,504 at the final settings, 1,096,914 in the tuner's check): 0 values not bit for bit, by stage 0 gate\|up sums and 0 SwiGLU values, every post whole |
 | First-token logits of `bench.py`'s 27 requests, the CPU's rows used | byte for byte the card-only build's in each of three rounds; the three runs each other's | byte for byte the card-only build's in each of three rounds; the three runs each other's (the card-only build's three runs repeat too; the fp32 path's differ from each other in 26 of 27 files) |
-| The decode-path yardstick (4,995 positions teacher-forced in windows of 16 rows; a TSV row a position) | the card-only run's file byte for byte, twice | not run on this file |
+| The decode-path yardstick (4,995 positions teacher-forced in windows of 16 rows; a TSV row a position) | the card-only run's file byte for byte, twice | not run (the reference file is file A's) |
 | HumanEval, 164 problems, greedy | all 164 answers the card-only build's, text for text (158 passed in both; 37,295 completion tokens in both) | all 164 answers the card-only build's, text for text (158 passed in both; 37,471 completion tokens in both); median writing 60.6 tok/s against 31.2 |
-| `FNX_VRAM_CHURN=600` with `--vram-elastic` (eight greedy answers) | the eight texts and the eight logit files the card-only build's without the hook | not run on this file |
-| Pictures on demand (`--vram-elastic`, one sequence) | its six answers the card-only build's, text for text | not run on this file |
-| A control vector (`FNX_CVEC`, `project` on layers 4-44) with pictures on demand, the check | 771,285 rows a card, 0 values | not run on this file |
+| `FNX_VRAM_CHURN=600` with `--vram-elastic` (eight greedy answers) | the eight texts and the eight logit files the card-only build's without the hook | the eight texts and the eight logit files the card-only build's without the hook (670 lends and give-backs) |
+| Pictures on demand (`--vram-elastic`, one sequence) | its six answers the card-only build's, text for text | its six answers the card-only build's, text for text |
+| A control vector (`FNX_CVEC`, `project` on layers 4-44) with pictures on demand, the check | 771,285 rows a card, 0 values | 1,068,144 rows a card, 0 values |
 
 `tune.py`'s own check of the profile it writes is among the rows counted (792,199 rows a card on file A, 1,096,914 on
 file B).
+
+**On another machine** (the maintainer's, 24 Nov, their numbers from PR #8's thread, the branch at `26fe28f`: two P100 on
+x16, 2 x Xeon Bronze 3106 with 8 cores a socket at 1.7 GHz, UD-Q4_K_XL at 512k): `FNX_CPU_CHECK=1` 0 values on both cards,
+every exact arm's first-token logits the cards-only run's byte for byte, and with no CPU switch 27 of 27 logits and the
+speed of main. The speed is the other way round there: cards only 51.8-54.8 tok/s fresh and 64 on the edits; exact with
+`FNX_CPU_SHARE=25,40` 41.9 and 49-51, with `40,40` 37.3 and 49-50, with `60,60` 28.9 and 36-38. A list costs those CPUs
+about five times what it costs ours, and the copies half. So the path holds its bits on a second machine and is for
+machines like the first: a card on a narrow link, cores to spare.
 
 ## What the cards found: the pool, not the arithmetic
 
@@ -288,16 +298,24 @@ Decoding an expert half to fp16 is about 715 us of the one-core time and did not
 
 ## Tried and not kept
 
+Four of these were built into the engine behind measuring switches and measured there, on an experimental build that is
+not in this branch (`FNX_CPU_RND`, `FNX_CPU_TAB`, `FNX_CPU_DCACHE`, `FNX_CPU_RPULL`; the default kernels are template
+instantiations of their own and do not change with them). File A, the final settings, 24 Nov; "the default" is that
+build's own default path, three rounds: 55.9 / 100.2 / 104.6 tok/s fresh and edits, 44.8 after the long read (the
+row fetch's window: 56.1 / 100.2 / 104.5 / 45.1). Every such run's first-token logits were the card-only build's, and
+each variant's `FNX_CPU_CHECK=1` run found 0 values in some 780,000 rows a card.
+
 | What | Measured | Why not |
 |---|---|---|
+| Rounding to fp16 inside the fp32 register: to nearest even at bit 13 with integer operations (5 uops) in place of `vcvtps2ph` / `vcvtph2ps` (4), a run in which a lane's sum was zero or under 2^-14 done again with the round trip | **in the engine, one run: 27.0 / 33.7 / 34.9 / 21.4** (-52 % to -67 %). Kernel bench, one core, an expert half, 1 and 4 rows: 2,200 and 6,469 us against 1,293 and 2,773; the bare rounding without the tracking (not exact) 1,388 and 3,271 | below 2^-14 fp16 rounds at a place that moves with the exponent, which the fixed bit cannot do; 93-94 % of the runs (16 rows x 32 partial sums) have such a sum or a zero, so nearly every run is done twice. And the bare rounding is already 7-17 % slower than the round trip: one uop more in a step that the core's window bounds |
+| Per-row tables: a row's 16 possible weights once, looked up with `pshufb`, the two byte planes transposed | **in the engine, three rounds: 55.7 / 99.5 / 103.7 / 44.3** (-0.4 % to -1.0 %). Kernel bench: +4 to +6 % an expert half on one core; the decoder alone 153-154 against 120-126 cycles for 8 rows x 32 values | the lanes are rows, so each lane has its own table; the planes' way out alone costs 97-102 cycles |
+| A cache of decoded weights (fp16 lanes, 4.7 MiB an expert half; a cache a card, the clock's second chance) | **in the engine, 4 GiB a card (873 expert halves), three rounds: 48.6 / 71.6 / 74.8 / 38.5** (-13 % to -28 %); 20.9 % of the run's 486,680 listed experts were found in it. Kernel bench: the same expert again (hot) 0.58 of the default; the pass that writes an entry +13 % on one core, +17-24 % on 16 threads | four fifths of the listed experts are not in it and pay for the write; a found one is read cold from RAM, 4.7 MiB where the decode reads 1.4 MB of blocks |
+| Only the down weights copied, the card doing SwiGLU and down | bounded in the engine, not built: `FNX_CPU_DNPROBE=1` copies every listed expert's down weights as that scheme would (which alone costs 7 % of fresh writing and 16 % of the edits) and pairs the two cards' lists of each layer; with the card's own SwiGLU and down counted as nothing, the most a layer could save is the time from "the later card's gate\|up sums done and down weights there" to "the CPU's rows on both cards". Summed over a run: **at most +1.0 % on fresh text and -11 % on the edits at shares 70,75**; -0.6 % / -6 % at 70,90; -6 % / -10 to -14 % at 100,100; -0.2 % / -17 % at 50,60; -7 % / -19 % at 30,60 | the down weights cost the link more than the CPU's down rows cost the CPU. Not measured with both cards on x16 |
+| The CPU's finished rows fetched by the card from mapped host memory (one block, as the gate\|up sums are fetched) in place of their copy on the card's copy queue | **in the engine, three rounds: 55.8 / 100.2 / 103.6 / 44.5** against 56.1 / 100.2 / 104.5 / 45.1 (-0.5 %, 0, -0.9 %, -1.3 %). `FNX_CPU_ROWPROBE=1`: the rows are on the card 43-55 us after they are computed in windows of 1-4 rows and about 100 us at 16 rows (x8 card), the callback's own delay included | there is little to take away, and the fetch costs as much |
 | Eight chains with the first version's step | 391 against 361 cycles a run and row | that step is bound by its uops, not its length |
-| Rounding to fp16 inside the fp32 register (add and subtract 2^(e+13)) instead of `vcvtps2ph` / `vcvtph2ps` | 473 against 361 cycles a run and row | 10 uops replace the round trip's 4 |
 | A cheap look at each step and an exact check of the steps that need it | 386 against 361 cycles; 1.8 steps a run have a lane on a midpoint | too many branches |
 | Sixteen chains (four runs at once) | 256-346 against 242-317 cycles for eight (a busy box) | no better; the core's window holds about seven steps |
 | Comparing `d` with `-(w x)` bit for bit instead of the second FMA | within 1-2 % | one uop more for two cycles less; the 9-uop form is kept |
-| Per-row tables: a row's 16 possible weights once, looked up with `pshufb`, the two byte planes transposed | 153-154 against 120-126 cycles for 8 rows x 32 values (the same weights) | the lanes are rows, so each lane has its own table; the planes' way out alone costs 97-102 |
-| A cache of decoded weights (fp16 lanes, 4.9 MB an expert half against 1.4 MB of blocks) | one core hot: 710 against 1,226 us; 16 processes at once on a card's cores, cold: 1,744 against 1,722 us | with the pool busy, reading 4.9 MB costs what decoding 1.4 MB costs; and of 34,335 listed experts 15.7 % had been listed within the card's last 1,000 (`FNX_CPU_REUSE=1`) |
-| Only the down weights copied, the card doing SwiGLU and down | `FNX_CPU_DNPROBE=1`: the down weights land 2,032 us after a 16-row list arrives on the x8 card, the CPU's whole list is done after 1,700 (2 rows: 649 against 390); on the x16 card 988 against 1,542 | on the x8 card the weights arrive after the CPU has finished, at every window size, and a layer waits for both cards. Not measured with both cards on x16 |
 | `FNX_CPU_WARM=1` (the pool's waiting threads run 256-bit FMAs) | kernel bench: a list after 3 ms idle 157 -> 125 us; in the engine +0.5 %, +0.8 %, -0.6 %, +0.2 % on the four tests, and within 1 % in each of the tuner's three runs | no gain in the engine; our reading (not measured): with the split nearly every layer has a list, so the pool does not idle that long |
 | `FNX_CPU_SHARE` with the fp32 path (no `FNX_CPU_EXACT`) | one run each, file A, tok/s fresh and edits: 58.9 / 108.7 / 112.5 with `70,75` and 32 threads against 58.6 / 109.5 / 118.3 without | no gain at the exact path's shares; a share nearer 100 was not searched |
 | `FNX_PREFETCH_WANT=1`, `FNX_CPU_MIN_T=3` beside the split | one guess a row: within 1.5 % on every test; no CPU below 3 rows: -1.5 % to +0.2 % (the mean of the tests) in the tuner's three runs | under 3 % on every test |
@@ -309,12 +327,14 @@ Decoding an expert half to fp16 is about 715 us of the one-core time and did not
   expert half costs 236 us on the first and 122 on the second; the CPU's time is the same for both), and a layer waits
   for the slower card. Estimated from the by-rows report, not built: about an eighth off a 16-row window's time for its
   misses. It needs the cards' slot maps to differ, or the faster link's copies to be ordered ahead.
-- **Both cards on x16.** Not measured (we have no such machine at hand). The copies are then twice as fast on the card
-  that limits us, so the CPU's best share is smaller; `tune.py` finds it. The one rejected idea that may pay there: only
-  the down weights copied and the card doing SwiGLU and down (on our x16 card the down weights were there 988 us after a
+- **Both cards on x16 with fast CPUs.** Not measured. The maintainer's box has both cards on x16 and slow CPUs, and
+  there the path loses at every share tried ("Verified"). With fast CPUs the copies are twice as fast on the card that
+  limits us, so the CPU's best share is smaller; `tune.py` finds it. The one rejected idea that may pay there: only the
+  down weights copied and the card doing SwiGLU and down (on our x16 card the down weights were there 988 us after a
   16-row list arrived, the CPU's whole list after 1,542).
 - **The decode** is now the larger part of a list of few rows (715 of 1,173 us an expert half for one row on one core).
-  Two ways to make it cheaper were measured and lost (the table above); none is known that keeps the bits and wins.
+  Two ways to make it cheaper were built into the engine and lost (tables, a cache: the table above); none is known
+  that keeps the bits and wins.
 - **AVX-512**: twice the lanes a step. No machine here; the kernels are AVX2/FMA/F16C only.
 - **Prompts** (reading) do not use the CPU path: it is for decode windows.
 - The measuring switches (`FNX_CPU_GCOPY`, `FNX_CPU_POST_ROWS`, `FNX_CPU_HB_DIRECT`, `FNX_CPU_DNPROBE`, `FNX_CPU_REUSE`)

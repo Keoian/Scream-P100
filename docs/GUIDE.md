@@ -1341,15 +1341,19 @@ programs (`split_cpu_exact_test`, and `split_cpu_exact_gpu_test 0` and `1` with 
 `-DSTRATA_BUILD_TESTS=ON`) check the CPU's step against an integer oracle and the card's operations and kernels against
 the CPU's. Here: `FNX_CPU_CHECK=1` found 0 values that are not the card's bits in 3.2 million rows a card on bitlamas'
 file and 3.3 million on UD-Q4_K_XL; `bench.py`'s 27 first-token logits were the cards-only run's byte for byte in each
-of three rounds on each file; HumanEval's 164 greedy answers were the cards-only run's, text for text, on both. On
-bitlamas' file also: the decode-path yardstick's file, eight greedy answers under `FNX_VRAM_CHURN=600`, the picture
-sequence with `--vram-elastic`, and the check with a control vector (`FNX_CVEC`).
+of three rounds on each file; HumanEval's 164 greedy answers were the cards-only run's, text for text, on both, and so
+were eight greedy answers under `FNX_VRAM_CHURN=600` and the picture sequence with `--vram-elastic`; the check with a
+control vector (`FNX_CVEC`) found 0 values on both; and on bitlamas' file the decode-path yardstick's file was the
+cards-only run's.
 
 **Limits.** What `FNX_CPU_EXPERTS` needs (above), and gate|up Q4_K or Q5_K with down IQ4_NL, Q5_1 or Q8_0
 (UD-Q4_K_XL's types and bitlamas' Q4_K_XL-IQ4NL's), `FNX_ROW_G` 1, 2, 4 or 8 and `FNX_ROWS_G2` unset, as the profiles
-have them; otherwise the engine says why at the load and keeps the fp32 path. Slower than the fp32 path. Measured on one
-machine; with both cards on x16 the copies are faster and the CPU's best share smaller, which `tune.py` would find,
-and it may be that nothing is left to gain there.
+have them; otherwise the engine says why at the load and keeps the fp32 path. Slower than the fp32 path. And it pays
+only on a machine like the one above: on the maintainer's (both cards on x16, 2 x Xeon Bronze 3106 with 8 cores a
+socket at 1.7 GHz; their measurement of 24 Nov 2026) it gives the cards' bits too (`FNX_CPU_CHECK=1` 0 values, the
+logits byte for byte) and is slower than the cards alone at every share tried: 41.9 tok/s of fresh text with
+`FNX_CPU_SHARE=25,40`, 37.3 with `40,40` and 28.9 with `60,60` against 51.8-54.8. `tune.py` keeps the path only where
+it gains, so there it leaves the profile as it was. A machine with both cards on x16 and fast CPUs is not measured.
 
 ## Benchmark and compare
 
