@@ -338,6 +338,12 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
 
 ## 📰 News
 
+- **24 Nov 2026 (morning):** 🦑 **Inkling 2 Mini reads 3 % faster on every load** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#two-cards-on-the-one-card-sources-the-exchange-by-numa-node-p38-p41-24-nov)
+  (p38-p41, the same bits). On a two-socket server with a card on each, the reading exchange's page-locked buffers landed on
+  whichever NUMA node the loading thread ran on, and reading 4k / 30k prompts was 947 / 828 or up to 984 / 851 tok/s by the
+  load; the engine now allocates each card's buffers on that card's node (`INK2_NUMA`, it prints where they landed): 980-984 /
+  851 on every load. Writing with drafts after a 30k prompt is 1.7 % faster (a draft window's attention rows side by side),
+  and two cards now run on the one-card build's sources with every expert in VRAM.
 - **24 Nov 2026:** 🦑 **Inkling 2 Mini: several chats at once** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#several-conversations-at-once-ink2_tpb-ink2_pp-24-nov),
   two test builds. Until now the engine wrote for one request at a time, and a second agent waited for the first answer.
   `ink2_tpb` keeps production's layout and gives each conversation a slot of its own on both cards; the writing pieces of
