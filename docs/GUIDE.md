@@ -1035,6 +1035,13 @@ same one.
   positions: with IQ3_S's 512k profile 333,120 instead of 524,544 (at 262,144 positions, 542,016 stay). A conversation
   already holding more than that when a picture comes: the engine refuses the VRAM command and the server starts the
   encoder anyway, which may not fit.
+- A conversation that grows past that while the encoder is up is refused where the pool now ends, as it would be at
+  the pool's normal end: a prompt that does not fit is answered `ERR GEN: the K/V pool is full: the request needs N more
+  pages, M are free` and the lane keeps what it had read; a reply that outgrows the pool while it decodes ends with
+  `the K/V pool is full with one lane decoding`. The held pages come back with the encoder's idle stop
+  (`elastic_idle_s`) or the server's next `VRAM 0`; the same request fits after that. The conversation is not damaged,
+  but nothing gives the pages back earlier. (With UD-Q4_K_XL's 512k profile the pool ends near 380k positions while
+  lent instead of 571k, the maintainers' run.) Read from the code (`ensure_pages_of`, sfnx's admission), not run.
 - A Stop while the encoder starts (the first picture) holds the next request until the start is done (5.7 s in our test);
   Stops after it, and the follow-ups that read the stopped picture, behave as with the CPU encoder.
 - Strata v0.2.9's server prints "on a layer split the expert cache cannot make room for the image encoder (the engine
