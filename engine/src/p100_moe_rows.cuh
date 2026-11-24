@@ -134,7 +134,7 @@ struct RowArgs {
     const uint4* X;
     float* Y;
     int ldx_u, N, K;
-    int phase;   // 0 every job; 1 the jobs not marked (w >= 0); 2 the marked ones (w = ~expert)
+    int phase;   // 0 every job; 1 the jobs not marked (w >= 0); 2 the marked ones (w = ~expert; not the CPU's, ~(expert + JOB_CPU))
     int ldcg;    // FNX_ROWS_LDCG: the weights read past L1 (ld.global.cg)
     // split 2 (perexp_patch.py), phase 2 only: the copier's words for this part, the list's number, the list (cache_list), the layer
     const unsigned* wdone;
@@ -274,6 +274,7 @@ __global__ void __launch_bounds__(BT) k_moe_rows(RowArgs a) {
     if (a.phase == 2) {
         if (we_i >= 0) return;
         we_i = ~we_i;
+        if (we_i >= JOB_CPU) return;   // FNX_CPU_SHARE: an expert on the CPU's list
         if (a.wdone && tid == 0) {   // split 2: this expert's part, by its place in the list (the stage_tabs barrier holds the block)
             const int n = min(a.wlist[0], MAXT * TOPK), g = a.wlayer * NEXP + we_i;
             int k = 0;

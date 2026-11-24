@@ -21,6 +21,9 @@ struct Job {
     int y[MAXT];        // activation rows (q8_1)
     int out[MAXT];      // output rows
 };
+// FNX_CPU_SHARE (a window's misses shared between the copy engine and the CPU): the job of an expert on the CPU's list gets
+// w = ~(expert + JOB_CPU), which neither phase of the row kernels takes (a copied expert's job gets w = ~expert, the second phase's)
+constexpr int JOB_CPU = 1 << 16;
 
 // the prompt path's expert jobs: up to PF_JOB rows of one expert (64: four 16-token tiles per job; 128: eight, the expert's weight tile is then
 // dequantized once for twice the tokens; a build option, STRATA_SPLIT_PF_JOB)
@@ -292,6 +295,10 @@ struct RouteTail {
     const unsigned* keep = nullptr;   // FNX_EXPERT_MASK (maska_patch.py): the layer's kept experts, a bit each (null: every one)
     int cpu = 0;                      // FNX_CPU_EXPERTS (p100_cpu.cuh): the plan lists the layer's misses and gives them no slot
     void* cpu_dev = nullptr;          // and the router's last block numbers the list for the wait (CpuDev's seq and want) and marks its jobs
+    // cpu 2 (FNX_CPU_SHARE below 100): cpu_share per cent of the misses (to the nearest whole expert; those with the fewest rows) listed in cpu_list
+    // for the CPU; the others take slots as without the CPU path (list, and box: the copy engine's mailbox)
+    int* cpu_list = nullptr;
+    int cpu_share = 100;
 };
 void router_route(const uint16_t* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec = nullptr, int layer = -1, int* list = nullptr, const Q8S* sh_gu = nullptr,

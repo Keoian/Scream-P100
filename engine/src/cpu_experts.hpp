@@ -66,12 +66,14 @@ float f16_to_f32(uint16_t h);
 // the card's sum of one row with the oracle's steps: gate|up (Q4_K/Q5_K, n values, `lanes` parts) times x; down times h (fp16 values)
 float gu_row_card_ref(uint32_t type, const uint8_t* row, int n, const uint16_t* x, int lanes);
 float dn_row_card_ref(uint32_t type, const uint8_t* row, int n, const uint16_t* h);
-// the AVX2 fp16 FMA of the exact kernels on 8 values (w * x exact in fp32): for the test; false without AVX2
-bool fma16_x8(const float* w, const float* x, const float* c, float* out);
-// the chains' fast form on 8 values, and each lane's flag (not 0: its run is done again with the exact form): for the test
-bool fma16f_x8(const float* w, const float* x, const float* c, float* out, uint32_t* flag);
+// the AVX2 fp16 FMA of the exact kernels on 8 values (w * x exact in fp32), in its rounding mode: for the test; false without AVX2
+bool fma16z_x8(const float* w, const float* x, const float* c, float* out);
+// runs of the exact kernels' chains that left fp16's range and were done again by the oracle, since the start
+uint64_t exact_ref_runs();
 // gate|up rows [j0, j1) of the card's ffs: h[k][j] for the expert's tokens; then down rows [i0, i1): out[k][i]
 void gu_chunk(const Work& w, const Expert& e, int j0, int j1);
+// FNX_CPU_EXACT only: rows [r0, r1) of the expert's 2 * ffs gate|up rows (the gate rows, then the up rows): the pool's chunks
+void gu_rows_exact(const Work& w, const Expert& e, int r0, int r1);
 void down_chunk(const Work& w, const Expert& e, int i0, int i1);
 
 // gu_chunk and down_chunk multiply straight from the blocks where there is an AVX2 kernel for the type (gate|up: Q4_K, Q5_K; down:
@@ -93,6 +95,12 @@ public:
     };
     // workers that came to a finished round while the next was being set up, since the last call (they are turned away)
     unsigned long long late();
+    // since the last call: the chunks' own time added over the threads, the rounds' time (set-up to the last chunk done), the time
+    // from a round's set-up to the first chunk a worker began (added over the rounds), the chunks and the rounds
+    struct Stat {
+        unsigned long long busy_ns = 0, wall_ns = 0, first_ns = 0, chunks = 0, rounds = 0;
+    };
+    Stat stats();
     void run(Work& w, const Rows* rows = nullptr);
     // the two halves of run() alone (FNX_CPU_EXACT: the card's SwiGLU comes between them)
     void run_gu(Work& w, const Rows* rows = nullptr);
@@ -105,6 +113,12 @@ private:
 
 // the CPUs of one NUMA node's cores, one logical CPU a core (its first sibling), from sysfs; empty when it cannot be read
 std::vector<int> node_cores(int node);
+// the other logical CPUs of cpu's core (its hyperthreads), from sysfs
+std::vector<int> core_siblings(int cpu);
+// FNX_CPU_WARM: the pool's waiting threads (and whoever calls warm256 while it waits) run 256-bit FMAs: a list after a pause of
+// some milliseconds then starts at full speed
+void keep_warm(bool on);
+void warm256();
 
 }  // namespace cpux
 }  // namespace fnx
