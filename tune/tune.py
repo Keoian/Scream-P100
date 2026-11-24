@@ -2,7 +2,8 @@
 """Measures the exact switches on your machine and writes the fastest profile it found: each candidate on a freshly loaded
 engine, through Strata's server and a shortened bench/bench.py, against your own baseline.
 
-    python3 tune/tune.py --data /data/flash-next                       # DATA/profile.json as the start, about 2-3 hours
+    python3 tune/tune.py --data /data/flash-next                       # DATA/profile.json as the start, about 4-5 hours
+    python3 tune/tune.py --data /data/flash-next --only cpu_exact      # only the exact CPU path: about 2.5 hours
     python3 tune/tune.py --data /data/flash-next --only prefetch,dma --screen
     python3 tune/tune.py --data /data/flash-next --memory-max 58G      # inside a memory cgroup, as a smaller machine would be
     python3 tune/tune.py --data /data/flash-next --dry-run             # the plan, nothing loaded
@@ -28,6 +29,14 @@ Groups (--only):
   stage     FNX_PF_STAGE_MIB / FNX_PF_TAIL_MIB (the prompt path's staging buffers and lent slots); not in the default set,
             as ours are at the size of the largest layer already and smaller ones were slower on ours
   convcache --conversation-cache-mib, only when the baseline came close to swapping (it changes RAM, not speed)
+  cpu_exact the exact CPU path: FNX_CPU_EXPERTS=1 with FNX_CPU_EXACT=1 (docs/GUIDE.md, "The exact CPU path"). The CPU computes a
+            part of a window's missing experts with the cards' own arithmetic while the copy engine brings the others, so the
+            answers are the starting profile's bit for bit and the group needs no option. It finds FNX_CPU_SHARE=A,B (the CPU's
+            per cent of the misses in a window of 1 row and of 16): A of 50, 30, 70 with check.py's guess for B, then B ±15,
+            then A ±10; then FNX_CPU_WARM=1, FNX_CPU_MIN_T=3 and FNX_CPU_THREADS on both hyperthreads (alone, and with B +15:
+            more threads pay only when the CPU has more to do), each kept only if it gains. Last in the default set. A second
+            run from the tuned profile goes on from where the first stopped. A profile that keeps it is loaded once more with FNX_CPU_CHECK=1 (every row the
+            CPU computed against the card's own, on both cards) and is written only if no value differed in a bit
 FNX_ROUTE_PRIOR (lossy: other answers) is tried only with --allow-lossy, and the logits then differ by design.
 FNX_CPU_EXPERTS=1 (the experts that are not in VRAM computed on the CPU; docs/GUIDE.md, "Missing experts on the CPU") is
 tried only with --allow-cpu-experts, last, on top of what the exact groups kept: it is for a machine whose cards
@@ -69,11 +78,22 @@ import bench  # noqa: E402
 
 METRICS = {"fresh": ("fresh",), "edit": ("edit_py", "edit_md"), "long": ("long_read", "long_write"), "medium": ("medium",)}
 MIN_GAIN = {"fresh": 4.0, "long_write": 4.0}   # clock-sensitive; the others take --min-gain
-GROUPS = ("prefetch", "dma", "experts", "ple", "convcache")
+GROUPS = ("prefetch", "dma", "experts", "ple", "convcache", "cpu_exact")
 # the only switches it changes: output effect "none" in docs/SWITCHES.md; the two below only with their options
 INEXACT = {"FNX_ROUTE_PRIOR": "allow_lossy", "FNX_CPU_EXPERTS": "allow_cpu_experts"}
 EXACT = {"FNX_PREFETCH", "FNX_PREFETCH_WANT", "FNX_PREFETCH_MIN_T", "FNX_PREFETCH_FILE", "FNX_DMA_SPLIT", "FNX_EXPERT_DYN_GIB",
-         "FNX_EXPERT_RAM_GIB", "FNX_PF_STAGE_MIB", "FNX_PF_TAIL_MIB", "FNX_PLE_RAM", "--conversation-cache-mib"}
+         "FNX_EXPERT_RAM_GIB", "FNX_PF_STAGE_MIB", "FNX_PF_TAIL_MIB", "FNX_PLE_RAM", "--conversation-cache-mib",
+         "FNX_CPU_EXACT", "FNX_CPU_MIN_T", "FNX_CPU_MAX_T", "FNX_CPU_SHARE", "FNX_CPU_THREADS", "FNX_CPU_CHECK", "FNX_CPU_WARM"}
+CPU_EXACT_ON = {"FNX_CPU_EXPERTS": "1", "FNX_CPU_EXACT": "1"}   # together: the CPU computes with the cards' own arithmetic (exact)
+
+
+def cpu_is_exact(changes):
+    """FNX_CPU_EXPERTS=1 is exact (the cards' bits) when FNX_CPU_EXACT=1 goes with it"""
+    return str(changes.get("FNX_CPU_EXPERTS", "0")) in ("0", "") or str(changes.get("FNX_CPU_EXACT", "0")) == "1"
+
+
+def cpu_on(changes):
+    return str(changes.get("FNX_CPU_EXPERTS", "0")) == "1"
 
 
 class Stop(Exception):
@@ -247,7 +267,8 @@ class Tuner:
         """load, run the tests (or the screen), stop; returns the result dict (metrics, or error)"""
         if (self.work / "STOP").exists():
             raise Stop("STOP")
-        bad = [k for k in changes if k not in EXACT and not (k in INEXACT and getattr(self.a, INEXACT[k]))]
+        bad = [k for k in changes if k not in EXACT and not (k in INEXACT and getattr(self.a, INEXACT[k]))
+               and not (k == "FNX_CPU_EXPERTS" and cpu_is_exact(changes))]
         if bad:
             raise RuntimeError(f"not an exact switch: {bad}")   # a guard against a plan that grew past docs/SWITCHES.md
         need = self.holds_gib(changes)
@@ -310,7 +331,50 @@ class Tuner:
         (self.work / "results.json").write_text(json.dumps({"noise": self.noise, "arms": self.results}, indent=1, default=str) + "\n")
 
     # ------------------------------------------------------------------ the plan
-    def plan(self, groups, suggestion):
+    def plan_cpu_exact(self, e, hint):
+        """The exact CPU path (FNX_CPU_EXPERTS=1 with FNX_CPU_EXACT=1; docs/GUIDE.md, "The exact CPU path"): six groups, each measured
+        against what the one before kept. FNX_CPU_SHARE=A,B is the per cent of a window's missing experts the CPU computes (the
+        copy engine brings the others at the same time), A in a window of 1 row and B in one of 16. The two ends are found one
+        after the other because they hardly meet: A decides fresh writing and writing after a read (windows of 2-4 rows), B the
+        edits (16 rows). Then the path's other knobs. The later groups run only when the first kept the path at all; their
+        candidates are worked out from what was kept (a function of it)."""
+        on = dict(CPU_EXACT_ON)
+        b0 = int(hint.get("share", 70))   # check.py's guess from its kernel bench and the copy rates
+        first = [dict(on, FNX_CPU_SHARE=f"{a},{b0}") for a in (50, 30, 70)]
+
+        def cur(best):
+            a, _, b = str(best.get("FNX_CPU_SHARE", "100")).partition(",")
+            return int(a), int(b or a)
+
+        def wide(best):   # the 16-row end
+            if not cpu_on(best):
+                return []
+            a, b = cur(best)
+            return [{"FNX_CPU_SHARE": f"{a},{v}"} for v in (b - 15, b + 15) if 0 < v <= 100]
+
+        def small(best):  # the 1-row end, between the first group's steps
+            if not cpu_on(best):
+                return []
+            a, b = cur(best)
+            return [{"FNX_CPU_SHARE": f"{v},{b}"} for v in (a - 10, a + 10) if 0 <= v <= 100]
+
+        def warm(best):   # the pool's waiting threads kept at speed between lists
+            return [{"FNX_CPU_WARM": "1"}] if cpu_on(best) else []
+
+        def rows(best):   # no CPU below 3 rows: the copies alone there
+            return [{"FNX_CPU_MIN_T": 3}] if cpu_on(best) else []
+
+        def threads(best):   # the pool on both hyperthreads of its cores, where the machine has them; alone, and with a larger
+            n = (hint.get("threads") or 0)   # 16-row share (the threads pay only when the CPU has more to do than its cores did)
+            if not (cpu_on(best) and n and (os.cpu_count() or 0) >= 4 * n):
+                return []
+            a, b = cur(best)
+            return [{"FNX_CPU_THREADS": 2 * n}] + ([{"FNX_CPU_THREADS": 2 * n, "FNX_CPU_SHARE": f"{a},{b + 15}"}] if b + 15 <= 100 else [])
+
+        return [("cpu_exact", first), ("cpu_exact_wide", wide), ("cpu_exact_small", small), ("cpu_exact_warm", warm), ("cpu_exact_rows", rows),
+                ("cpu_exact_threads", threads)]
+
+    def plan(self, groups, suggestion, hint=None):
         e = self.base["env"]
         out = []   # (group, [changes, ...])
         if "prefetch" in groups and e.get("FNX_PREFETCH") == "1":
@@ -336,6 +400,12 @@ class Tuner:
         if "stage" in groups:
             s, t = int(e.get("FNX_PF_STAGE_MIB", 384)), int(e.get("FNX_PF_TAIL_MIB", 2450))
             out.append(("stage", [{"FNX_PF_STAGE_MIB": s // 2, "FNX_PF_TAIL_MIB": t - s}, {"FNX_PF_TAIL_MIB": t + 512}]))
+        if "cpu_exact" in groups:
+            why = self.cpu_experts_unfit(e)
+            if why:
+                self.log(f"cpu_exact: FNX_CPU_EXACT not tried: {why}")
+            else:
+                out += self.plan_cpu_exact(e, hint or {})
         if self.a.allow_cpu_experts:
             why = self.cpu_experts_unfit(e)
             if why:
@@ -360,8 +430,9 @@ class Tuner:
             return f"the processor lacks {', '.join(sorted(missing))}"
         return None
 
-    def cpu_experts_ran(self, name):
-        """the engine's own word in the arm's log: True (the path ran on both cards), or the reason it stayed off"""
+    def cpu_experts_ran(self, name, exact=False):
+        """the engine's own word in the arm's log: True (the path ran on both cards; with exact, in its exact form), or the reason it
+        stayed off"""
         try:
             log = (self.work / "logs" / f"{name}.log").read_text(errors="replace")
         except OSError:
@@ -369,7 +440,12 @@ class Tuner:
         off = re.search(r"fnx: FNX_CPU_EXPERTS: off on card \d+: (.*)", log)
         if off:
             return off.group(1).strip()
-        return True if len(re.findall(r"fnx: FNX_CPU_EXPERTS: card \d+ \(NUMA node", log)) >= 2 else "the engine did not report the path on both cards"
+        if len(re.findall(r"fnx: FNX_CPU_EXPERTS: card \d+ \(NUMA node", log)) < 2:
+            return "the engine did not report the path on both cards"
+        if exact and len(re.findall(r"fnx: FNX_CPU_EXPERTS: card \d+ \(NUMA node.*FNX_CPU_EXACT: the card's own arithmetic", log)) < 2:
+            m = re.search(r"fnx: FNX_CPU_EXACT: (?:off|not)[^\n]*", log)
+            return m.group(0) if m else "the engine ran the fp32 CPU path, not the exact one"
+        return True
 
     # ------------------------------------------------------------------ screening FNX_PREFETCH_WANT in one load
     def screen_prefetch(self, best_changes, values):
@@ -423,6 +499,28 @@ class Tuner:
             return False, f"in the noise (mean {100 * (g - 1):+.1f} %)"
         return True, ", ".join(f"{k} {100 * (r - 1):+.1f} %" for k, r in ups) + f" (mean {100 * (g - 1):+.1f} %)"
 
+    def cpu_exact_check(self, best):
+        """One more load of the chosen profile with FNX_CPU_CHECK=1: the copy engine and the cards compute every window as without
+        the CPU path and each of the CPU's rows is compared with the card's own. (True, text) when the engine counted rows on both
+        cards and none of their values differed in a bit; else (False, why). The speed of this arm means nothing."""
+        r = self.arm("cpucheck", dict(best, FNX_CPU_CHECK="1"))
+        try:
+            log = (self.work / "logs" / "cpucheck.log").read_text(errors="replace")
+        except OSError:
+            return False, "no engine log of the check run"
+        rows, bad = {}, {}
+        for card, n, diff in re.findall(r"fnx: FNX_CPU_CHECK, card (\d+): (\d+) rows compared.*?(\d+) values not bit for bit", log):
+            rows[card] = rows.get(card, 0) + int(n)
+            bad[card] = bad.get(card, 0) + int(diff)
+        r["check"] = {"rows": rows, "differ": bad}
+        if "error" in r:
+            return False, f"the check run failed: {r['error']}"
+        if len(rows) < 2 or min(rows.values()) == 0:
+            return False, f"the check compared no rows on both cards ({rows or 'no report lines'})"
+        if any(bad.values()):
+            return False, "values that are not the cards' bits: " + ", ".join(f"card {c}: {v} in {rows[c]} rows" for c, v in sorted(bad.items()))
+        return True, ", ".join(f"card {c}: {n} rows, 0 values differ" for c, n in sorted(rows.items()))
+
     def threshold(self, k):
         return max(MIN_GAIN.get(k, self.a.min_gain), self.noise.get(k, 0)) / 100
 
@@ -431,7 +529,8 @@ class Tuner:
         a = self.a
         groups = [g for g in a.only.split(",") if g] if a.only else list(GROUPS)
         self.log(f"tune.py: {a.config}, tests {','.join(self.tests)}, groups {','.join(groups)}, work {self.work}")
-        info = check.inspect(argparse.Namespace(data=a.data, models=None, seconds=3, no_copy=a.no_copy, force_copy=False, no_disk=False, gpu=None),
+        info = check.inspect(argparse.Namespace(data=a.data, models=None, seconds=3, no_copy=a.no_copy, force_copy=False, no_disk=False, gpu=None,
+                                                no_exact=a.no_kernel_bench or "cpu_exact" not in groups),
                              log=lambda *x: self.log(" ", *x))
         (self.work / "check.md").write_text(info["report"] + "\n")
         for line in info["report"].split("### Verdict", 1)[-1].strip().splitlines():
@@ -443,9 +542,11 @@ class Tuner:
         if info["profile"].get("cpu_experts") and not a.allow_cpu_experts:
             self.log("check.py: a card receives its experts slowly and the CPUs have cores for them: FNX_CPU_EXPERTS=1 may pay here. "
                      "It is not bit-exact, so it is not tried by default: run again with --allow-cpu-experts to measure it")
-        plan = self.plan(groups, suggestion)
-        self.log("plan: " + "; ".join(f"{g}: " + " | ".join(fmt(c) for c in cs) for g, cs in plan))
-        n = 2 + sum(len(cs) for _, cs in plan) + 1
+        plan = self.plan(groups, suggestion, info["profile"].get("cpu_exact"))
+        self.log("plan: " + "; ".join(f"{g}: " + (" | ".join(fmt(c) for c in cs) if isinstance(cs, list) else "from what the groups before kept")
+                                      for g, cs in plan))
+        late = {"cpu_exact_wide": 2, "cpu_exact_small": 2}
+        n = 2 + sum(len(cs) if isinstance(cs, list) else late.get(g, 1) for g, cs in plan) + 1 + (1 if any(g == "cpu_exact" for g, _ in plan) else 0)
         self.log(f"about {n} loads of 8-12 minutes each: {n * 10 // 60} h {n * 10 % 60} min (fewer with --screen)")
         if a.dry_run:
             return "dry-run"
@@ -482,6 +583,9 @@ class Tuner:
                 cands = [c for c in cands if c.get("FNX_PREFETCH_WANT") in kept] + [c for c in cands if "FNX_PREFETCH" in c]
             if group == "convcache":
                 continue
+            if callable(cands):   # the exact CPU path's later groups: worked out from what is kept so far
+                cands = cands(self.env_of(best))
+                self.log(f"{group}: " + (" | ".join(fmt(c) for c in cands) if cands else "nothing to try (the path was not kept)"))
             if group == "prefetch_min_t" and self.env_of(best).get("FNX_PREFETCH") == "0":
                 continue   # prefetch is off: its window size means nothing
             winner = None
@@ -499,10 +603,10 @@ class Tuner:
                 r["logits"] = self.same_logits("base1", name)
                 if ok and group not in ("lossy", "cpu") and r["logits"] is False:
                     ok, why = False, "its logits differ from the baseline's (not exact)"
-                if group == "cpu":
-                    ran = self.cpu_experts_ran(name)
+                if group == "cpu" or group.startswith("cpu_exact"):
+                    ran = self.cpu_experts_ran(name, exact=group != "cpu")
                     if ran is not True:
-                        ok, why = False, f"the engine left FNX_CPU_EXPERTS off: {ran}"
+                        ok, why = False, f"the engine left the CPU path off: {ran}"
                 r["verdict"] = ("kept " if ok else "not kept: ") + why
                 self.log(f"{name}: {r['verdict']}")
                 if ok and (winner is None or geo(r["metrics"], best_m) > geo(winner[1], best_m)):
@@ -528,8 +632,16 @@ class Tuner:
             held, why = self.better(final["metrics"], base)
             final["verdict"] = f"{'faster' if held else 'not faster'} than the baseline: {why}"
             self.log(f"final: {final['verdict']}")
-        inexact = any(k in best for k in INEXACT)
+        inexact = any(k in best for k in INEXACT) and not cpu_is_exact(self.env_of(best))
         chosen = best if held and (same is not False or inexact) else {}
+        self.cpu_check = None
+        if chosen and cpu_on(self.env_of(chosen)) and not inexact:   # the exact CPU path is written only with its bit check passed here
+            ok, text = self.cpu_exact_check(chosen)
+            self.cpu_check = ("passed: " if ok else "FAILED: ") + text
+            self.log(f"FNX_CPU_CHECK on the chosen profile: {self.cpu_check}")
+            if not ok:
+                self.write({}, best, base, final, same)
+                return "error-cpu-check"
         self.write(chosen, best, base, final, same)
         if same is False and not inexact:
             return "error-logits"
@@ -584,7 +696,13 @@ class Tuner:
             L.append("**Against the baseline:** " + ", ".join(f"{k} {100 * (v / base[k] - 1):+.1f} %" for k, v in final["metrics"].items() if base.get(k)))
         L.append("**First-token logits of the written profile against the baseline:** "
                  + {True: "the same bit for bit", False: "DIFFERENT", None: "not compared (no final run)"}[same])
-        if "FNX_CPU_EXPERTS" in best:
+        if getattr(self, "cpu_check", None):
+            L.append(f"**FNX_CPU_CHECK=1 on the chosen profile** (every row the CPU computed against the card's own): {self.cpu_check}.")
+        if "FNX_CPU_EXPERTS" in best and cpu_is_exact(best):
+            L.append("**The written profile computes a part of the missing experts on the CPU with FNX_CPU_EXACT=1**: the cards' own "
+                     "arithmetic, so its answers are the starting profile's bit for bit (the logits line and the check above are that "
+                     "claim measured on this machine; docs/GUIDE.md, \"The exact CPU path\").")
+        elif "FNX_CPU_EXPERTS" in best:
             L.append("**The written profile has FNX_CPU_EXPERTS=1** (asked for with --allow-cpu-experts): its answers are NOT the same "
                      "bits as the starting profile's, and not the same bits from one run to the next (docs/GUIDE.md, \"Missing experts "
                      "on the CPU\"). The starting profile is the exact one.")
@@ -714,6 +832,9 @@ def main():
                     help="also try FNX_CPU_EXPERTS=1: the experts that are not in VRAM computed on the CPU (for a slow PCIe link and a CPU "
                          "with cores to spare; NOT bit-exact, not repeatable run to run)")
     ap.add_argument("--no-copy", action="store_true", help="check.py without its copy test")
+    ap.add_argument("--no-kernel-bench", action="store_true",
+                    help="check.py without its bench of the exact CPU kernels (it builds a test program and loads a card's cores for some "
+                         "seconds; the cpu_exact group then starts from a default share)")
     ap.add_argument("--dry-run", action="store_true", help="print the check and the plan; load nothing")
     a = ap.parse_args()
     a.config = a.config or str(Path(a.data) / "profile.json")
@@ -726,9 +847,9 @@ def main():
         sys.exit(f"no Strata server in {a.strata} (--strata)")
     if not a.allow_lossy and float(json.loads(Path(a.config).read_text())["env"].get("FNX_ROUTE_PRIOR", "0")) > 0:
         sys.exit("the starting profile has FNX_ROUTE_PRIOR > 0 (lossy): logits would not compare; start from FNX_ROUTE_PRIOR=0")
-    if json.loads(Path(a.config).read_text())["env"].get("FNX_CPU_EXPERTS", "0") not in ("0", ""):
-        sys.exit("the starting profile has FNX_CPU_EXPERTS=1 (not bit-exact, not repeatable): logits would not compare; start from "
-                 "the profile without it and give --allow-cpu-experts")
+    if not cpu_is_exact(json.loads(Path(a.config).read_text())["env"]):
+        sys.exit("the starting profile has FNX_CPU_EXPERTS=1 without FNX_CPU_EXACT=1 (not bit-exact, not repeatable): logits would not "
+                 "compare; start from the profile without it and give --allow-cpu-experts")
     t = Tuner(a)
     result = "error"
     def stop(*_):

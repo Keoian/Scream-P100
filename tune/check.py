@@ -34,6 +34,7 @@ import random
 import re
 import shutil
 import subprocess
+from struct import error as struct_error
 import sys
 import threading
 import time
@@ -469,6 +470,81 @@ def disk_tests(paths, seconds, log):
 
 
 # ------------------------------------------------------------------ the host
+# ------------------------------------------------------------------ the exact CPU kernels (FNX_CPU_EXACT)
+EXACT_SAMPLES = ((10, 7), (30, 200))   # two routed experts; any would do (their types can differ from layer to layer)
+EXACT_LINE = re.compile(r"^(exact|fp32)\s+a real expert half \((\S+) / (\S+)\), (\d+) token\(s\), (\d+) thread\(s\): ([\d.]+) us", re.M)
+
+
+def pool_cpus(node):
+    """the logical CPUs the engine's pool takes at a card on this NUMA node: one a core, the node's first two cores left out, 16 at most
+    (engine/src/p100_cpu.cuh)"""
+    cpus = sorted(node_cpus(node)) or sorted(os.sched_getaffinity(0))
+    cores, seen = [], set()
+    for n in cpus:
+        sib = rd(f"/sys/devices/system/cpu/cpu{n}/topology/thread_siblings_list")
+        key = min(parse_cpus(sib)) if sib else n
+        if key not in seen:
+            seen.add(key)
+            cores.append(n)
+    if len(cores) > 4:
+        cores = cores[2:]
+    return cores[:16]
+
+
+def exact_bench(h, p100, gguf, log, reps=20):
+    """FNX_CPU_EXACT's kernels on this machine: engine/tools/cpu_exact_test.cpp built with the host compiler (no CUDA), one card's
+    half of two experts taken out of the model's files (tune/sample_expert.py), each timed on one core and on the pool the engine
+    would take at the first card's CPU, for windows of 1 and 2 rows. {"threads", "experts": [{"layer", "expert", "types", "bytes",
+    "one": {rows: [exact us, fp32 us]}, "pool": {...}}]}, or {"skipped": why}. About a minute, most of it the compiler."""
+    import tempfile
+    import sample_expert
+    if not {"avx2", "fma", "f16c"} <= set(h.get("isa") or ()):
+        return {"skipped": "the processor lacks AVX2, FMA or F16C: the exact kernels would run their scalar steps"}
+    cxx = os.environ.get("CXX") or next((c for c in ("g++", "c++", "clang++") if shutil.which(c)), None)
+    src = [RELEASE / "engine/tools/cpu_exact_test.cpp", RELEASE / "engine/src/cpu_experts.cpp"]
+    if not cxx or not all(p.exists() for p in src):
+        return {"skipped": "no C++ compiler (g++) or no engine sources here: the engine's own split_cpu_exact_test has the same bench"}
+    if not gguf:
+        return {"skipped": "no model files to take an expert from (--data or --models)"}
+    work = Path(tempfile.mkdtemp(prefix="fnx-check-"))
+    exe = work / "cpu_exact_test"
+    try:
+        r = subprocess.run([cxx, "-std=c++17", "-O3", "-DNDEBUG", f"-I{RELEASE / 'engine/src'}", *map(str, src), "-o", str(exe), "-lpthread"],
+                           capture_output=True, text=True, timeout=900)
+        if r.returncode:
+            return {"skipped": f"{cxx} could not build the test program: {r.stderr.strip().splitlines()[-1][:200] if r.stderr.strip() else r.returncode}"}
+        try:
+            files = sample_expert.sample([str(p) for p in gguf], str(work), EXACT_SAMPLES, 0, log=lambda m: log("  " + m))
+        except (ValueError, OSError, struct_error) as e:
+            return {"skipped": f"no expert taken from the model files: {e}"}
+        cpus = pool_cpus(p100[0]["numa_node"] if p100 else -1)
+        out = {"threads": len(cpus), "cpus": cpus, "experts": []}
+
+        def run(fg, fd, rows, threads):
+            pin = set(cpus[:1] if threads == 1 else cpus)
+            r = subprocess.run([str(exe), "real", fg, fd, str(rows), str(threads), str(reps)], capture_output=True, text=True, timeout=600,
+                               preexec_fn=lambda: os.sched_setaffinity(0, pin))
+            got = {m.group(1): float(m.group(6)) for m in EXACT_LINE.finditer(r.stdout)}
+            if "exact" not in got or "fp32" not in got:
+                raise RuntimeError((r.stdout + r.stderr).strip()[-200:])
+            return [got["exact"], got["fp32"]]
+
+        for (layer, expert), (fg, fd, tg, td) in zip(EXACT_SAMPLES, files):
+            e = {"layer": layer, "expert": expert, "types": f"{tg} / {td}", "bytes": os.path.getsize(fg) + os.path.getsize(fd), "one": {}, "pool": {}}
+            for rows in (1, 2):
+                e["one"][rows] = run(fg, fd, rows, 1)
+                e["pool"][rows] = run(fg, fd, rows, len(cpus))
+            log(f"  layer {layer} expert {expert} ({e['types']}): one core {e['one'][1][0]:.0f} us for 1 row, {e['one'][2][0]:.0f} for 2 (fp32 "
+                f"{e['one'][1][1]:.0f}, {e['one'][2][1]:.0f}); {len(cpus)} cores {e['pool'][1][0]:.0f} and {e['pool'][2][0]:.0f} us "
+                f"(fp32 {e['pool'][1][1]:.0f}, {e['pool'][2][1]:.0f})")
+            out["experts"].append(e)
+        return out
+    except (OSError, RuntimeError, subprocess.SubprocessError) as e:
+        return {"skipped": f"the bench failed: {str(e)[:200]}"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def host():
     mi = meminfo()
     cpu = {}
@@ -568,7 +644,53 @@ def cpu_experts_hint(h, p100, copies, model, prof, add):
             "not repeatable run to run, so it is never tried or written without that option", basis)
 
 
-def judge(h, cs, copies, disk, model, data_free, pair=None):
+CPU_EXACT_BASIS = ("[measured] on one machine (one card on Gen3 x8, the other on x16, 2 x 18 cores at 2.3 GHz, a card a CPU): docs/GUIDE.md, "
+                   "\"The exact CPU path\"; [unmeasured] on any other")
+
+
+def cpu_exact_hint(p100, copies, exact, prof, add):
+    """FNX_CPU_EXPERTS=1 with FNX_CPU_EXACT=1 (docs/GUIDE.md, "The exact CPU path") computes the experts that are not in VRAM on the
+    CPU with the cards' own arithmetic: the same bits as without it, so tune.py measures it as an exact group. What decides it is
+    what a missing expert costs either way: the bench's time for one on the pool against the copy of its bytes over each card's
+    link. Leaves both in prof["cpu_exact"] for tune.py (where its search of FNX_CPU_SHARE starts)."""
+    if not exact:
+        return
+    if exact.get("skipped"):
+        add("note", f"the exact CPU kernels were not timed: {exact['skipped']}",
+            "the cpu_exact group of tune.py still measures FNX_CPU_EXACT (exact: the answers do not change)", "")
+        return
+    ex = exact["experts"]
+    cpu = sum(x["pool"][1][0] for x in ex) / len(ex)
+    one = sum(x["one"][1][0] for x in ex) / len(ex)
+    size = sum(x["bytes"] for x in ex) / len(ex)
+    copy = {}
+    for c in p100:
+        r = (copies or {}).get(c["index"], {})
+        rate = r.get("h2d_1mib") or r.get("h2d")
+        if rate:
+            copy[c["index"]] = size / (rate * 1e9) * 1e6
+    prof["cpu_exact"] = {"pool_us": round(cpu), "one_core_us": round(one), "threads": exact["threads"], "copy_us": {k: round(v) for k, v in copy.items()}}
+    what = (f"FNX_CPU_EXACT's kernels: an expert's half ({size / 1e6:.2f} MB) for one row in {one / 1e3:.2f} ms on one core, {cpu:.0f} us on "
+            f"{exact['threads']} cores of a card's CPU")
+    if not copy:
+        add("note", what + "; the copies were not measured, so there is nothing to hold it against",
+            "the cpu_exact group of tune.py measures the exact CPU path (exact: the answers do not change)", CPU_EXACT_BASIS)
+        return
+    what += "; a copy of the same bytes: " + ", ".join(f"{v:.0f} us to card {k}" for k, v in copy.items())
+    slowest = max(copy.values())
+    prof["cpu_exact"]["share"] = max(20, min(90, 10 * round(10 * slowest / (slowest + cpu))))
+    if cpu < 3 * slowest:
+        add("note", what,
+            "the CPU can take a part of a window's missing experts while the copy engine brings the others: the cpu_exact group of "
+            "tune.py finds the shares and the window sizes (FNX_CPU_SHARE, FNX_CPU_MIN_T) and keeps it only if it gains. It is exact: "
+            "the answers are the cards' own bit for bit, so no option is needed", CPU_EXACT_BASIS)
+    else:
+        add("note", what,
+            "on these numbers the copies win at every window size; the cpu_exact group of tune.py still measures it (exact: the "
+            "answers do not change) and keeps nothing that does not gain", CPU_EXACT_BASIS)
+
+
+def judge(h, cs, copies, disk, model, data_free, pair=None, exact=None):
     """the profile to use and the findings: a list of (level, what, advice, basis); level is stop (does not run), slow
     (costs speed), warn (something breaks or needs a change) or note"""
     found = []
@@ -717,6 +839,7 @@ def judge(h, cs, copies, disk, model, data_free, pair=None):
         if v["mem_gib"] is not None and v["mem_gib"] < 1 and any(c["numa_node"] == n for c in p100):
             add("slow", f"NUMA node {n} carries a card but has no memory", "fill that CPU's memory channels too", "[unmeasured]")
     cpu_experts_hint(h, p100, copies, model, prof, add)
+    cpu_exact_hint(p100, copies, exact, prof, add)
     if copies is None:
         add("note", "copies not measured", "run with the cards free (or --force-copy) for the most telling number", "")
 
@@ -750,7 +873,7 @@ def judge(h, cs, copies, disk, model, data_free, pair=None):
 
 
 # ------------------------------------------------------------------ report
-def report(h, cs, copies, disk, dinfo, folder, model, prof, found):
+def report(h, cs, copies, disk, dinfo, folder, model, prof, found, exact=None):
     L = ["## Machine report (tune/check.py)", "", "| | |", "|---|---|",
          f"| OS, kernel | {h['os']}, {h['kernel']} |",
          f"| CPU | {h['cpu']} x {h['sockets']} ({h['threads']} threads; {' '.join(h.get('isa') or []) or 'no AVX'}), NUMA nodes: " +
@@ -780,6 +903,13 @@ def report(h, cs, copies, disk, dinfo, folder, model, prof, found):
         L.append(f"| Disk | {dinfo.get('device')} {dinfo.get('fs')}{' (rotational)' if dinfo.get('rotational') else ''}: "
                  f"{disk['seq_gbs']} GB/s in a row, {disk['rand_ops']} random 128 KiB reads/s"
                  f"{'' if disk['seq_direct'] and disk['rand_direct'] else ' (no O_DIRECT)'} |")
+    if exact and exact.get("experts"):
+        for e in exact["experts"]:
+            L.append(f"| Exact CPU kernels, layer {e['layer']} expert {e['expert']} ({e['types']}) | one core: {e['one'][1][0]:.0f} us for 1 row, "
+                     f"{e['one'][2][0]:.0f} for 2 (the fp32 kernels {e['one'][1][1]:.0f}, {e['one'][2][1]:.0f}); {exact['threads']} cores: "
+                     f"{e['pool'][1][0]:.0f} and {e['pool'][2][0]:.0f} us (fp32 {e['pool'][1][1]:.0f}, {e['pool'][2][1]:.0f}) |")
+    elif exact:
+        L.append(f"| Exact CPU kernels | not timed: {exact.get('skipped')} |")
     L.append(f"| Model files | {model or 'not found'}{f' in {folder}' if folder else ''} |")
     L += ["", f"Ours for comparison: {OURS['h2d']} GB/s to each card (Gen3 x16, iommu=pt), 185 W, 96 GB, disk {OURS['disk_seq']} GB/s.", "",
           "### Verdict", "", f"- **Profile:** {prof['why']}." + (f" Set up with `{prof['setup']}`." if prof["setup"] else "")]
@@ -833,11 +963,20 @@ def inspect(a, log=print):
             log(f"  failed: {e}")
     elif not paths:
         log("disk: no model files found (--data or --models)")
+    exact = None
+    if getattr(a, "no_exact", False):
+        log("exact CPU kernels: skipped (--no-exact)")
+    else:
+        gguf = paths or (sorted(Path(folder).glob("*.gguf")) if folder and Path(folder).is_dir() else [])
+        log("exact CPU kernels (FNX_CPU_EXACT): the test program built with the host compiler, two experts from the model files")
+        exact = exact_bench(h, p100, gguf, log)
+        if exact.get("skipped"):
+            log(f"  not timed: {exact['skipped']}")
     data_free = shutil.disk_usage(a.data).free / 1e9 if a.data and os.path.isdir(a.data) else None
-    prof, found = judge(h, cs, copies, disk, model, data_free, p100)
-    text = report(h, cs, copies, disk, dinfo, folder, model, prof, found)
+    prof, found = judge(h, cs, copies, disk, model, data_free, p100, exact)
+    text = report(h, cs, copies, disk, dinfo, folder, model, prof, found, exact)
     return {"host": h, "cards": cs, "copies": copies, "disk": disk, "disk_device": dinfo, "model": model,
-            "profile": prof, "findings": found, "report": text}
+            "profile": prof, "findings": found, "report": text, "exact": exact}
 
 
 def write_profile(base, prof, out):
@@ -857,6 +996,7 @@ def main():
     ap.add_argument("--no-copy", action="store_true", help="skip the copy test")
     ap.add_argument("--force-copy", action="store_true", help="run the copy test on cards that are in use")
     ap.add_argument("--no-disk", action="store_true", help="skip the disk test")
+    ap.add_argument("--no-exact", action="store_true", help="skip the bench of FNX_CPU_EXACT's kernels (it builds a test program with g++)")
     ap.add_argument("--out", help="write the report (Markdown) here")
     ap.add_argument("--json", help="write everything measured as JSON here")
     ap.add_argument("--write-profile", metavar="OUT", help="DATA/profile.json with the suggested switches, written to OUT")
