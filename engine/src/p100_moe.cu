@@ -633,6 +633,7 @@ void p100_moe(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int 
 #include "p100_moe_rows.cuh"
 #include "p100_attn.cuh"
 #include "p100_dma.cuh"
+#include "p100_cpu.cuh"
 
 namespace fnx {
 namespace {

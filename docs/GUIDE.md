@@ -463,7 +463,9 @@ KL 0.024, 59 of 64, and only +10 % fresh, +29 % edits).
 
 **What did not help.** Computing the missing experts on the CPU (`FNX_CPU_EXPERTS`, a patch we did not publish) made
 every test 1-2 % slower and writing after a long read 21 % slower on our Xeon Bronze 3106; with the mask and λ almost
-every expert a token needs is on the cards already. λ above 1.0 was no faster.
+every expert a token needs is on the cards already. (That was the experiment now on branch `cpu-experts`. The switch as it
+is in this release is another implementation: see "Missing experts on the CPU", which has this profile's numbers with
+it from another machine.) λ above 1.0 was no faster.
 
 ## 32 GB of RAM
 
@@ -1054,6 +1056,213 @@ same one.
 - Measured on two P100 (cards 0 and 1). With more (`--gpu A,B`, or `setup.sh`'s pair from two CPUs) the encoder goes on
   the first card of the pair; not run on such a machine.
 
+## Missing experts on the CPU
+
+A Q4 file's routed experts do not fit two 16 GB cards: with UD-Q4_K_XL about a quarter of them is in VRAM, with a
+tighter Q4 about a third. When a decode window picks an expert that is not, the engine copies it from RAM into a slot
+and computes it in a second phase (`FNX_P100_DMA`). On the server this was measured on (below) that copy is most of a window's time: 9 of 37 ms at
+2 rows, 170 of 281 ms at 16 rows (a code edit), and it is bound by the card's PCIe link.
+
+`FNX_CPU_EXPERTS=1` (`setup.sh --model q4_k_xl --cpu-experts`, or `fill_profile.py --cpu-experts`, or the line in an
+existing profile's `"env"`) computes those experts on the CPU instead, from the RAM copies the engine already keeps,
+while the cards compute the ones they hold. Nothing is copied for them and the window has one phase.
+
+```json
+"env": { ..., "FNX_CPU_EXPERTS": "1" }
+```
+
+**Whom it is for.** A machine where the experts that are not in VRAM reach a card slowly and the CPUs can compute them
+sooner: a card on a link of x8 or x4 (or an old PCIe generation, or a shared switch), next to CPUs with AVX2 and cores to
+spare. On the server it was measured on (below) card 0 runs at Gen3 x8 and each card hangs from an 18-core CPU with four
+DDR3-1600 channels: `check.py` measures 6.2 GB/s to that card and 12.4 GB/s to the other, a missing
+expert cost a window 0.1 to 0.2 ms (its copy to both cards and the second phase), and a CPU now computes its half in
+about 0.05 ms beside the card's own work. The switch does not make the link or the memory faster: it trades the link for
+the CPU's cores and memory bandwidth, and that becomes the limit (in a 16-row window the cards wait 25 of 127 ms for the
+CPU). With both cards at x16 a copy takes about half as long, so expect less; with few or slow cores it can turn into a
+loss (the earlier experiment on branch `cpu-experts`, another implementation with 6 threads a card at 1.7 GHz, lost
+4-18 % of fresh writing). Neither is measured with this code. [`tune/check.py`](../tune/README.md) names the case when a
+machine looks like it, and `tune/tune.py --allow-cpu-experts` measures it there (on that server: kept, at fresh +38 %
+and edits +145 % and +159 % in its final run on UD-Q4_K_XL).
+
+It is off by default, and with it off the engine gives the same bits as before (below). It needs the copy engine's
+path (`FNX_P100_DMA=1`, the P100 row kernels: the profiles have both), a CPU with AVX2, FMA and F16C, every routed
+expert's copy in RAM (the 96 GB mode: not `--ram 64` with UD-Q4_K_XL, not `--ram 32`), and expert types its decoders
+know: Q4_K and Q5_K gate|up with IQ4_NL, Q5_1 or Q8_0 down have AVX2 kernels (UD-Q4_K_XL's types, and bitlamas'
+Q4_K_XL-IQ4NL's); Q6_K, Q5_0 and Q4_0 decode more slowly. IQ3_S and Edge0's experts have none: the engine says so at the
+load and runs as without the switch.
+
+**How it works.** The router's last block plans a window's slots; with the switch it lists the layer's misses instead of
+giving them slots, numbers the list and marks their jobs, so the row kernels' first phase skips them. A small kernel on
+the card's third stream writes the window's FFN input rows (fp16, what the row kernels read too), the picks and the list
+to a mailbox in mapped host memory. Each card has a host thread that spins on that mailbox and a pool of worker threads
+pinned to the cores of the socket the card hangs from. For each listed expert and each token that picked it, the pool
+computes this card's half: `h = silu(gate . x) * (up . x)` over the card's 320 rows, then `down . h` for the 2,560
+output values, straight from the file's blocks, with fp32 sums. The rows go back with one copy and a word written into
+VRAM behind it (as the copier's lists do); a kernel waits for that word after the card's own experts are done and puts
+the rows where the second phase would have. The cards' sums and everything after are as before.
+
+Each card's RAM copy of its half of the experts then has to be on that socket's memory: the switch turns
+`FNX_NUMA_EXPERTS` on. There that halves the CPU's time for a list (374 against 691 µs in an early build); the
+socket's memory bandwidth is the bound, about 46 µs for an expert's half of 1.38 MB in the engine.
+
+No expert takes a slot at the plan any more, so the cache no longer follows the text by itself. The next layer's guessed
+experts are still copied ahead while the attention half runs (`FNX_PREFETCH`, 2 a row in the profiles), and that keeps
+the misses low: 3.8 a layer in a 2-row window and 25 in a 16-row one, against 2.0 and 18 when every miss was copied in,
+and 7.6 and 49 with the prefetch off (writing then loses a third: keep it on). More guesses a row lost again (4: edits
+−3 %, 6: −16 %), because the layer waits for those copies.
+
+The prompt path, the draft layer and the placement at the load are untouched. The switches are in
+[SWITCHES.md](SWITCHES.md#missing-experts-on-the-cpu-fnx_cpu_experts).
+
+**Measured** (22 Nov 2026, our server: two Tesla P100 16 GB at a 150 W cap, card 0 at PCIe 3.0 x8, a card on each of
+2 x Xeon E5-2696 v3, 125 GiB of RAM; Strata v0.2.9's server). The model is bitlamas' Q4_K_XL-IQ4NL (Q4_K gate|up, one
+layer Q5_K, IQ4_NL down; 63.5 GiB of experts, 7,778 of 24,576 in VRAM) with our tuned UD-Q4_K_XL settings at 262,144
+positions. Three arms: the build before (`--vram-elastic`'s), this build with the switch off, this build with
+`FNX_CPU_EXPERTS=1`. Three rounds in a Latin square, every run a fresh load, `bench/bench.py`:
+
+| tok/s, mean of three rounds (min-max) | the build before | this build, switch off | `FNX_CPU_EXPERTS=1` | |
+|---|---:|---:|---:|---:|
+| fresh writing | 47.5 (47.5-47.5) | 47.6 (47.5-47.8) | 59.6 (59.0-60.1) | +26 % |
+| edit py | 53.8 (53.5-53.9) | 53.8 (53.8-53.9) | 111.2 (110.0-112.8) | +107 % |
+| edit md | 53.9 (51.9-54.9) | 54.8 (54.8-54.9) | 119.0 (118.3-119.7) | +121 % |
+| a new 38,862-token prompt: reading | 887 (884-889) | 887 (886-888) | 886 (885-887) | −0.1 % |
+| writing after it | 42.2 (41.7-42.5) | 42.5 (42.1-42.8) | 50.1 (46.9-54.1) | +19 % |
+| follow-up reads of 2.0K to 20.2K tokens | 332-815 | 332-816 | 332-812 | −0.5 to +0.4 % |
+| HumanEval, 164 problems: passed | 158 | | 156 | McNemar p = 0.62 |
+| HumanEval: median writing | 43.0 | | 90.0 | +109 % |
+
+Where a window's time goes (`FNX_PROF=1`, one run each of this build, ms a window; 48 routed layers a window):
+
+| rows in the window | switch off: window / its routed experts | on: window / the cards' own experts / the wait for the CPU's rows | the CPU's list a layer: experts, µs |
+|---:|---:|---:|---:|
+| 1 | 23.3 / 9.2 | 22.7 / 4.3 / 4.4 | 2.6, 153 |
+| 2 | 35.7 / 17.0 | 29.9 / 7.4 / 4.6 | 3.8, 187 |
+| 3 | 45.9 / 26.2 | 34.4 / 9.6 / 5.8 | 5.1, 241 |
+| 4 | 60.5 / 38.3 | 41.1 / 11.7 / 8.0 | 7.1, 320 |
+| 8 | 133.1 / 97.9 | 68.2 / 21.5 / 13.4 | 14.0, 590 |
+| 16 | 282.4 / 219.9 | 126.8 / 42.0 / 25.3 | 24.8, 1,145 |
+
+A window of one row is as fast with the switch as without, wider ones are faster, so `FNX_CPU_MIN_T` stays at 1. In
+the wide windows the cards wait for the CPU (25 of 127 ms at 16 rows): a faster CPU or more memory channels would give
+more, a slower one less.
+
+**The switch off is the build before.** In every round the first-token logits of all 27 benchmark requests are
+byte-identical to the build before's, with `FNX_VRAM_CHURN=600` too (682 lends and give-backs: eight greedy answers and
+their logits identical), and the speeds are within its spread.
+
+**Accuracy.** Against llama.cpp on the CPU (the decode path, teacher-forced, 5 x 999 positions of Strata's quality
+texts; top-1 agreement, KL, PPL; llama.cpp's own PPL is 4.017):
+
+| | top-1 agreement | KL | PPL | positions where only one of the two agrees (off / on), sign test |
+|---|---:|---:|---:|---|
+| switch off (windows of 16, 4 or 2 rows: the same table, byte for byte) | 94.39 % | 0.0320 | 4.021 | |
+| on, windows of 16 rows | 94.29 % | 0.0326 | 4.029 | 132 / 127, p = 0.80 |
+| on, windows of 4 rows | 94.03 % | 0.0349 | 3.982 | 135 / 117, p = 0.28 |
+| on, windows of 2 rows | 94.23 % | 0.0276 | 4.010 | 121 / 113, p = 0.65 |
+
+No run is told apart from the switch off: the 95 % intervals of the paired differences in KL and in the target's
+log-probability include zero in all three, and KL and PPL move both ways. Top-1 agreement is 0.1 to 0.4 points lower
+in each, and an earlier build of the day with the same arithmetic gave 93.67 % / 0.0339 / 4.039 at 16 rows (151 / 115,
+p = 0.03): runs with the switch on differ from each other (below), so read it as "no loss shown", not as "equal". For
+scale, two card-only builds of ours that differ in one kernel's rounding are KL 0.035 apart on this yardstick. Per
+expert the CPU's rows are within 7e-7 of the double-precision result from gguf-py's own dequantizer
+(`engine/tools/cpu_experts_real.py`); the cards' own rows differ from the CPU's by up to 0.008 at values up to 15.
+
+The same on Unsloth's UD-Q4_K_XL over twelve times the positions (61 segments of 1,000 tokens: the five above, then
+code, docs, English and 20 other languages cut from text on the machine; llama.cpp on the CPU made the reference for
+this file; the 256k profile, because the 512k one scales the positions and the reference does not; windows of 16 rows):
+
+| 60,939 positions | top-1 agreement | KL | PPL | only one of the two agrees (off / on), sign test |
+|---|---:|---:|---:|---|
+| switch off | 96.84 % | 0.0212 | 1.989 | |
+| on, first run | 96.78 % | 0.0207 | 1.989 | 855 / 817, p = 0.37 |
+| on, second and third run (byte-identical to each other) | 96.81 % | 0.0207 | 1.987 | 838 / 819, p = 0.66 |
+
+The three runs together are 0.04 points under the switch off, with a 95 % interval of −0.16 to +0.08 (a bootstrap over
+the segments); KL is lower with the switch on by 0.0005 (−0.0013 to +0.0003); 24 of the 61 segments agree more often
+with it on, 29 less often, 8 equally (p = 0.58). So the gap of the small set shrinks to a twentieth of a point on the
+large one, no test separates it, and a loss above about 0.2 points of top-1 is excluded at 95 %.
+
+HumanEval (164 problems, thinking off, temperature 0) does not separate the switch from the card-only build. On our
+file, eight full runs: the build before 158; the build before with one rounding-only switch changed (`FNX_ONEHOP=1`,
+`FNX_P100_ATTN_DEC=0`, `FNX_PF_F16ACC=0`) 157, 156, 156; the switch on 156, 157, 155, 158 (means 156.75 and 156.5; a
+permutation test gives p = 1.0). On UD-Q4_K_XL: 158 and 158 (`FNX_ONEHOP=2`) against 156 and 156. Two of the card-only
+controls lose exactly the problems the switch's first run lost. Over the twelve runs 161 of the 164 problems pass at
+least once and three fail every time, so a count of 158 is one draw from a scatter of two or three problems that any
+change of rounding moves.
+
+Where the answers part ways (`diverge.py` in our records: 16 places over six problems, each scored by llama.cpp, the
+cards, two card-only rounding variants and the switch twice): every one is a fork between the two leading candidates,
+under llama.cpp too. There the switch's log-odds are nearer llama.cpp's (RMS distance 0.15-0.18) than the cards' (0.26)
+or the card-only variants' (0.27-0.28); over all 8,505 positions its shift against the cards is what one rounding
+switch gives (0.106 against 0.087-0.107). So it claims no gain in passed problems and concedes no loss: the counts
+carry neither.
+
+**Pictures** with `--vram-elastic` (the profile of "Pictures on a card", two sequences an arm): the chart in 12.2-12.5 s
+against 13.2-15.1 s (5/5 both), the 4K report in 11.7-11.8 s against 13.1-13.2 s (11/12 items both, 2-3 of 3 circles
+against 2), writing while the encoder runs 52.0-56.3 tok/s against 46.9-48.0 and 55.5-55.9 against 50.8-52.3 after its
+idle stop, a 17K-token read with the encoder up 728-863 tok/s against 724-832. The lent slots' experts (1,207 a card)
+are computed on the CPU while the encoder runs. With `FNX_VRAM_CHURN=600` and the switch on: 673 lends and give-backs,
+eight proper answers, no wait timed out.
+
+**Power.** A whole benchmark run (fresh, edits, the long read, the follow-ups) drew 324 W for 293 s with the switch on
+(cards 109 + 113 W, CPU packages 48 + 55 W) against 254 W for 392 s (94 + 98, 26-36 each): 95 kJ against 100 kJ. In
+writing alone the CPUs add about 80 W (two packages) and the cards 20 W each; no sample at the 150 W cap in writing,
+at most 71 C.
+
+**Unsloth's UD-Q4_K_XL with this repository's profile** (`fill_profile.py --model q4_k_xl`, 512k, no pictures; Q5_1 down
+blocks, 71.7 GiB of experts, so fewer of them fit the cards). Three runs an arm, mean (min-max):
+
+| tok/s | the build before | this build, switch off | `FNX_CPU_EXPERTS=1` | |
+|---|---:|---:|---:|---:|
+| fresh writing | 37.5 (37.3-37.7) | 36.4 (33.8-37.8) | 52.8 (52.2-53.6) | +41 % |
+| edit py | 37.5 (37.5-37.5) | 37.1 (36.5-37.5) | 93.4 (93.2-93.6) | +149 % |
+| edit md | 37.6 (37.5-37.8) | 37.6 (37.2-38.0) | 100.2 (99.8-101.0) | +166 % |
+| a new 38,862-token prompt: reading | 856 (770-900) | 851 (754-900) | 896 (895-897) | |
+| writing after it | 34.1 (33.4-34.5) | 34.0 (32.8-34.6) | 40.5 (39.8-41.2) | +19 % |
+
+The window's first two runs (one of each switch-off arm) were slower than every later run: reads 770 and 754 tok/s
+against 895-900, fresh writing 33.8 in one. From the second round on the two switch-off arms are equal (37.6 / 37.5 /
+37.6 against 37.7 / 37.4 / 37.9, both reading at 899), so the reads say nothing about the switch here. Switch off: all
+27 first-token logits byte-identical to the build before in each run. Switch on: the same first token in 27 of 27 in
+each run, KL 0.0021-0.0045 mean, 0.055 at most. Check mode: 2.16 million CPU rows within 0.02 of the cards' own at
+values up to 16. A 2-row window's list (4.5 experts) takes the CPU 256 µs, a 16-row one (29 experts) 1.6-1.7 ms.
+
+**Not bit for bit, and not repeatable.** A CPU-computed expert is the same arithmetic in fp32 where the cards' row
+kernels sum in fp16, so its rows differ from the cards' in the last bits (`FNX_CPU_CHECK=1` runs both and compares: 1.56
+million rows within 0.008 at values up to 15). Which experts are in VRAM at a given window therefore matters for those
+bits, and with the prefetch that differs from run to run (a layer waits for its prefetched copies, so it is not a race
+over a copy; which experts the prefetch has put on the cards is what differs). Two runs of
+the same requests with the switch on are not bit for bit the same: of the 27 benchmark requests' first-token logits 1
+is identical between two runs (on either file), the top token is the same in all, KL against the build before 0.0007 to
+0.0045; eight greedy answers share their first 100-600 characters with the build before's and then go their own way.
+
+Without the prefetch it repeats: with `FNX_CPU_EXPERTS=1` and `FNX_PREFETCH=0` two fresh loads on UD-Q4_K_XL gave
+byte-identical first-token logits in 18 of 18 requests (the plan gives no miss a slot, so nothing else moves an expert
+in decode). That mode costs most of the gain: fresh writing 34.5-36.1 tok/s (37.5 with the switch off, 52.8 with the
+prefetch), edits 53-55 (37.5 off, 93-100 with it). A prefetch whose copies become visible to the plan at a fixed point
+would give both; it is not written. With the switch off the engine is as repeatable as before.
+
+**Limits.**
+- It uses the CPU: 16 threads a card by default (`FNX_CPU_THREADS`), spinning while a request decodes (they sleep between requests).
+- Other work on those cores slows it: a window waits for its slowest chunk. On that server the network card's interrupts
+  land on one of the pool's cores, and a large download beside the engine showed in the timings.
+- Measured on two P100 with a CPU each. Two cards on one socket share its cores (the engine splits them); not run.
+- A control vector (`FNX_CVEC`) works with it: with Strata's experimental-speed-projection vector (`project`, layers 4 to
+  44) the CPU's rows are within 0.0125 of the cards' own over 1.5 million rows, fresh writing is 58.7 tok/s against 47.3
+  and edits 108.9 / 118.5 against 54.0 / 53.8, and pictures on demand work. The first token is the same in 18 of 18
+  requests, but the two paths are further apart with the vector than without (KL 0.008 against 0.001): the projected
+  state reacts more to the last bits.
+- With the lossy fast profile (`--fast`) it gains little, as nearly every expert a token needs is on the cards already:
+  fresh writing 73.0 against 72.0 tok/s, edits 124.6 / 128.3 against 117.4 / 123.9, writing after a long read 73.3
+  against 62.0 (one run an arm). With a route prior the picks depend on what is in the slots, which the switch changes,
+  so there the two paths differ by more than rounding (first token the same in 27 of 27, KL 0.020).
+- `--batch 2` works with it: two requests at a time wrote 43-53 tok/s together against 27-29 without the switch (16
+  replies an arm, none failed). That profile's tight settings leave no VRAM for a second slot's graphs, with or without the
+  switch: both arms ran with `FNX_ARENA_RESERVE_MIB=1536`.
+- Not for `FNX_SSD_EXPERTS` (the low-RAM engine: its experts' copies are not all in RAM), `FNX_LATENT` (Edge0) or types
+  without a decoder; the switch says why and stays off. Not built on HIP (this repository builds for CUDA only); the new code uses the driver calls `p100_dma.cuh` uses.
+
 ## Benchmark and compare
 
 With the server running:
@@ -1172,6 +1381,9 @@ python3 tune/tune.py --data /data/flash-next --screen           # 2-3 hours, one
   checks the RAM before each load, stops when the machine keeps swapping, compares every arm's first-token logits with
   your starting profile's, and writes `DATA/profile.tuned.json`. `FNX_ROUTE_PRIOR` is tried only with `--allow-lossy`;
   `--coder`'s expert mask is never changed.
+  `FNX_CPU_EXPERTS=1` (see "Missing experts on the CPU") is tried only with `--allow-cpu-experts`: `check.py` names the
+  machines it is for (a card on a link of x8 or x4, or otherwise slow to copy to, and CPUs with AVX2 and cores to spare),
+  and it is not bit-exact, so nothing tries or writes it unasked.
 - **On our machine** (13 Nov 2026, a test window, the IQ3_S 512k profile at `FNX_ROUTE_PRIOR=0`, engine `c213636c`):
   `check.py` measured 12.3 GB/s to each card, the same from the other CPU's memory and with both cards at once, Gen3 x16
   while copying, and found no bottleneck. `tune.py --screen --only prefetch,dma` took 7 loads (about 70 minutes): the

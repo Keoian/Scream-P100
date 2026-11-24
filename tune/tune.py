@@ -29,6 +29,10 @@ Groups (--only):
             as ours are at the size of the largest layer already and smaller ones were slower on ours
   convcache --conversation-cache-mib, only when the baseline came close to swapping (it changes RAM, not speed)
 FNX_ROUTE_PRIOR (lossy: other answers) is tried only with --allow-lossy, and the logits then differ by design.
+FNX_CPU_EXPERTS=1 (the experts that are not in VRAM computed on the CPU; docs/GUIDE.md, "Missing experts on the CPU") is
+tried only with --allow-cpu-experts, last, on top of what the exact groups kept: it is for a machine whose cards
+receive those experts slowly (a link of x8 or x4) and whose CPUs have the cores to compute them (check.py says when a
+machine looks like that). It is NOT bit-exact and not repeatable run to run, so its logits differ by design too.
 
 Safety: it refuses to start beside another engine, with the cards in use or with something answering on --port; before
 each load it checks the RAM available against what the profile holds; it stops the whole run when swap use grows by
@@ -45,6 +49,7 @@ import copy
 import json
 import math
 import os
+import re
 import signal
 import socket
 import struct
@@ -65,7 +70,8 @@ import bench  # noqa: E402
 METRICS = {"fresh": ("fresh",), "edit": ("edit_py", "edit_md"), "long": ("long_read", "long_write"), "medium": ("medium",)}
 MIN_GAIN = {"fresh": 4.0, "long_write": 4.0}   # clock-sensitive; the others take --min-gain
 GROUPS = ("prefetch", "dma", "experts", "ple", "convcache")
-# the only switches it changes: output effect "none" in docs/SWITCHES.md (FNX_ROUTE_PRIOR only with --allow-lossy)
+# the only switches it changes: output effect "none" in docs/SWITCHES.md; the two below only with their options
+INEXACT = {"FNX_ROUTE_PRIOR": "allow_lossy", "FNX_CPU_EXPERTS": "allow_cpu_experts"}
 EXACT = {"FNX_PREFETCH", "FNX_PREFETCH_WANT", "FNX_PREFETCH_MIN_T", "FNX_PREFETCH_FILE", "FNX_DMA_SPLIT", "FNX_EXPERT_DYN_GIB",
          "FNX_EXPERT_RAM_GIB", "FNX_PF_STAGE_MIB", "FNX_PF_TAIL_MIB", "FNX_PLE_RAM", "--conversation-cache-mib"}
 
@@ -241,7 +247,7 @@ class Tuner:
         """load, run the tests (or the screen), stop; returns the result dict (metrics, or error)"""
         if (self.work / "STOP").exists():
             raise Stop("STOP")
-        bad = [k for k in changes if k not in EXACT and not (self.a.allow_lossy and k == "FNX_ROUTE_PRIOR")]
+        bad = [k for k in changes if k not in EXACT and not (k in INEXACT and getattr(self.a, INEXACT[k]))]
         if bad:
             raise RuntimeError(f"not an exact switch: {bad}")   # a guard against a plan that grew past docs/SWITCHES.md
         need = self.holds_gib(changes)
@@ -330,9 +336,40 @@ class Tuner:
         if "stage" in groups:
             s, t = int(e.get("FNX_PF_STAGE_MIB", 384)), int(e.get("FNX_PF_TAIL_MIB", 2450))
             out.append(("stage", [{"FNX_PF_STAGE_MIB": s // 2, "FNX_PF_TAIL_MIB": t - s}, {"FNX_PF_TAIL_MIB": t + 512}]))
+        if self.a.allow_cpu_experts:
+            why = self.cpu_experts_unfit(e)
+            if why:
+                self.log(f"cpu: FNX_CPU_EXPERTS not tried: {why}")
+            else:   # as the profile is, and with the prefetch the path was measured with (2 guesses a row: more made it slower)
+                out.append(("cpu", [{"FNX_CPU_EXPERTS": "1"}, {"FNX_CPU_EXPERTS": "1", "FNX_PREFETCH": "1", "FNX_PREFETCH_WANT": 2}]))
         if self.a.allow_lossy:
             out.append(("lossy", [{"FNX_ROUTE_PRIOR": "0.15"}]))
         return out
+
+    @staticmethod
+    def cpu_experts_unfit(e):
+        """why FNX_CPU_EXPERTS=1 cannot run with this profile on this machine (None: it can be tried)"""
+        if e.get("FNX_P100_DMA") != "1":
+            return "the profile does not use the copy engine (FNX_P100_DMA=1), whose path it is"
+        if e.get("FNX_SSD_EXPERTS") == "1":
+            return "a low-RAM profile (FNX_SSD_EXPERTS=1): not every expert's copy is in RAM"
+        if e.get("FNX_LATENT"):
+            return "Edge0's latent experts have no CPU decoder"
+        missing = {"avx2", "fma", "f16c"} - set(check.host().get("isa") or ())
+        if missing:
+            return f"the processor lacks {', '.join(sorted(missing))}"
+        return None
+
+    def cpu_experts_ran(self, name):
+        """the engine's own word in the arm's log: True (the path ran on both cards), or the reason it stayed off"""
+        try:
+            log = (self.work / "logs" / f"{name}.log").read_text(errors="replace")
+        except OSError:
+            return "no engine log"
+        off = re.search(r"fnx: FNX_CPU_EXPERTS: off on card \d+: (.*)", log)
+        if off:
+            return off.group(1).strip()
+        return True if len(re.findall(r"fnx: FNX_CPU_EXPERTS: card \d+ \(NUMA node", log)) >= 2 else "the engine did not report the path on both cards"
 
     # ------------------------------------------------------------------ screening FNX_PREFETCH_WANT in one load
     def screen_prefetch(self, best_changes, values):
@@ -403,6 +440,9 @@ class Tuner:
             self.log("the starting profile routes through an expert mask (--coder, lossy against the full model): kept as it is; "
                      "every comparison is against the same mask")
         suggestion = info["profile"].get("env")
+        if info["profile"].get("cpu_experts") and not a.allow_cpu_experts:
+            self.log("check.py: a card receives its experts slowly and the CPUs have cores for them: FNX_CPU_EXPERTS=1 may pay here. "
+                     "It is not bit-exact, so it is not tried by default: run again with --allow-cpu-experts to measure it")
         plan = self.plan(groups, suggestion)
         self.log("plan: " + "; ".join(f"{g}: " + " | ".join(fmt(c) for c in cs) for g, cs in plan))
         n = 2 + sum(len(cs) for _, cs in plan) + 1
@@ -445,15 +485,24 @@ class Tuner:
             if group == "prefetch_min_t" and self.env_of(best).get("FNX_PREFETCH") == "0":
                 continue   # prefetch is off: its window size means nothing
             winner = None
+            tried = []
             for i, c in enumerate(cands):
                 name = f"{group}{i + 1}"
+                key = {k: str(v) for k, v in self.env_of(dict(best, **c)).items()}
+                if key in tried:
+                    continue   # the same settings as an arm of this group already (the cpu group's second candidate)
+                tried.append(key)
                 r = self.arm(name, dict(best, **c))
                 if "metrics" not in r:
                     continue
                 ok, why = self.better(r["metrics"], best_m)
                 r["logits"] = self.same_logits("base1", name)
-                if ok and group != "lossy" and r["logits"] is False:
+                if ok and group not in ("lossy", "cpu") and r["logits"] is False:
                     ok, why = False, "its logits differ from the baseline's (not exact)"
+                if group == "cpu":
+                    ran = self.cpu_experts_ran(name)
+                    if ran is not True:
+                        ok, why = False, f"the engine left FNX_CPU_EXPERTS off: {ran}"
                 r["verdict"] = ("kept " if ok else "not kept: ") + why
                 self.log(f"{name}: {r['verdict']}")
                 if ok and (winner is None or geo(r["metrics"], best_m) > geo(winner[1], best_m)):
@@ -479,9 +528,10 @@ class Tuner:
             held, why = self.better(final["metrics"], base)
             final["verdict"] = f"{'faster' if held else 'not faster'} than the baseline: {why}"
             self.log(f"final: {final['verdict']}")
-        chosen = best if held and (same is not False or "FNX_ROUTE_PRIOR" in best) else {}
+        inexact = any(k in best for k in INEXACT)
+        chosen = best if held and (same is not False or inexact) else {}
         self.write(chosen, best, base, final, same)
-        if same is False and "FNX_ROUTE_PRIOR" not in best:
+        if same is False and not inexact:
             return "error-logits"
         return "ok" if chosen or not best else "ok-no-gain"
 
@@ -534,6 +584,10 @@ class Tuner:
             L.append("**Against the baseline:** " + ", ".join(f"{k} {100 * (v / base[k] - 1):+.1f} %" for k, v in final["metrics"].items() if base.get(k)))
         L.append("**First-token logits of the written profile against the baseline:** "
                  + {True: "the same bit for bit", False: "DIFFERENT", None: "not compared (no final run)"}[same])
+        if "FNX_CPU_EXPERTS" in best:
+            L.append("**The written profile has FNX_CPU_EXPERTS=1** (asked for with --allow-cpu-experts): its answers are NOT the same "
+                     "bits as the starting profile's, and not the same bits from one run to the next (docs/GUIDE.md, \"Missing experts "
+                     "on the CPU\"). The starting profile is the exact one.")
         arms = [r for r in self.results if "logits" in r]
         differ = [r["name"] for r in arms if r["logits"] is False]
         L.append(f"**Every arm against base1:** {sum(r['logits'] is True for r in arms)} of {len(arms)} the same bit for bit"
@@ -656,6 +710,9 @@ def main():
     ap.add_argument("--swap-mib", type=float, default=512, help="stop when swap use grows by this much while an arm's tests run")
     ap.add_argument("--swap-load-mib", type=float, default=2048, help="stop when swap use grows by this much during a load")
     ap.add_argument("--allow-lossy", action="store_true", help="also try FNX_ROUTE_PRIOR=0.15 (other answers)")
+    ap.add_argument("--allow-cpu-experts", action="store_true",
+                    help="also try FNX_CPU_EXPERTS=1: the experts that are not in VRAM computed on the CPU (for a slow PCIe link and a CPU "
+                         "with cores to spare; NOT bit-exact, not repeatable run to run)")
     ap.add_argument("--no-copy", action="store_true", help="check.py without its copy test")
     ap.add_argument("--dry-run", action="store_true", help="print the check and the plan; load nothing")
     a = ap.parse_args()
@@ -669,6 +726,9 @@ def main():
         sys.exit(f"no Strata server in {a.strata} (--strata)")
     if not a.allow_lossy and float(json.loads(Path(a.config).read_text())["env"].get("FNX_ROUTE_PRIOR", "0")) > 0:
         sys.exit("the starting profile has FNX_ROUTE_PRIOR > 0 (lossy): logits would not compare; start from FNX_ROUTE_PRIOR=0")
+    if json.loads(Path(a.config).read_text())["env"].get("FNX_CPU_EXPERTS", "0") not in ("0", ""):
+        sys.exit("the starting profile has FNX_CPU_EXPERTS=1 (not bit-exact, not repeatable): logits would not compare; start from "
+                 "the profile without it and give --allow-cpu-experts")
     t = Tuner(a)
     result = "error"
     def stop(*_):

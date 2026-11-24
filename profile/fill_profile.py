@@ -20,6 +20,13 @@
              picture lends that much of each card's expert slots to the driver and starts the encoder (a few seconds); 120 s
              after the last one the encoder stops and the slots come back (docs/GUIDE.md, "Pictures on a card"). Needs
              --vision-exe, the default 96 GB mode
+--cpu-experts FNX_CPU_EXPERTS=1: a decode window's routed experts that are not in VRAM computed on the CPU from their RAM copies
+             while the cards compute the ones that are, instead of copied to the cards first (docs/GUIDE.md, "Missing experts
+             on the CPU"). --model q4_k_xl in the default 96 GB mode only: the CPU path decodes that file's expert types
+             (Q4_K, Q5_K, Q5_1, Q8_0; IQ4_NL too), and needs every expert's copy in RAM. Each card's copies then sit on the
+             memory of the CPU the card hangs from (FNX_NUMA_EXPERTS). NOT BIT-EXACT: the CPU sums in fp32 where the
+             cards' kernels sum in fp16, so the answers are not the same bits as without it, and two runs with it are
+             not the same bits as each other
 --route-prior FNX_ROUTE_PRIOR: 0 (default) is exact; 0.15 is our production setting, faster and lossy (README)
 --draft-vocab another draft vocabulary than engine/data/draft_vocab_sl.bin, e.g. engine/data/draft_vocab_en.bin
 --exe        the engine, if build.sh was run with another build directory (default build/split/strata-split-2; with
@@ -76,6 +83,9 @@ def main():
     ap.add_argument("--pictures-gpu", action="store_true",
                     help="the picture encoder on the first card of --gpu only while pictures come (--vram-elastic; docs/GUIDE.md, "
                          "\"Pictures on a card\")")
+    ap.add_argument("--cpu-experts", action="store_true",
+                    help="FNX_CPU_EXPERTS=1: a window's experts that are not in VRAM computed on the CPU (--model q4_k_xl, 96 GB mode; "
+                         "not bit-exact, and not repeatable run to run; docs/GUIDE.md, \"Missing experts on the CPU\")")
     ap.add_argument("--logs", default="/var/tmp")
     ap.add_argument("--route-prior", default="0")
     ap.add_argument("--draft-vocab", help="another draft vocabulary (default engine/data/draft_vocab_sl.bin)")
@@ -176,6 +186,14 @@ def main():
         cfg["args"][cfg["args"].index("--conversation-cache-mib") + 1] = "2000"
         for k in ("FNX_ROPE_SCALE", "FNX_YARN_ORIG_CTX"):
             cfg["env"].pop(k)
+    if a.cpu_experts:
+        # 22 Nov 2026 (docs/GUIDE.md, "Missing experts on the CPU"): the engine turns FNX_NUMA_EXPERTS on with it
+        if a.model != "q4_k_xl":
+            sys.exit("--cpu-experts: with --model q4_k_xl only (the CPU path has decoders for Q4_K, Q5_K, Q5_1, Q8_0 and IQ4_NL experts, "
+                     "not for IQ3_S or Edge0's)")
+        if low or a.ram != "96":
+            sys.exit("--cpu-experts: the default 96 GB mode only (it needs every routed expert's copy in RAM)")
+        cfg["env"]["FNX_CPU_EXPERTS"] = "1"
     if a.coder or a.fast:
         cfg["env"]["FNX_EXPERT_MASK"] = str(RELEASE / "engine" / "data" / "coder_mask.txt")
     if a.fast:
@@ -214,7 +232,8 @@ def main():
     print(f"wrote {a.out} ({a.model}, FNX_ROUTE_PRIOR={cfg['env']['FNX_ROUTE_PRIOR']}, pictures {('on card ' + str(cfg['vision'].get('cuda_device', 0)) + ' while they come' if cfg['vision'].get('elastic') else 'on') if 'vision' in cfg else 'off'}, "
           f"{a.ram} GB of RAM{f' (a RAM tier of at most {a.ssd_ram_gib:g} GiB a card)' if low else ''}"
           f"{', the Coder experts' if a.coder and not a.fast else ''}"
-          f"{', FAST (lossy: Coder mask, λ 1.0, FNX_ONEHOP=2)' if a.fast else ''})")
+          f"{', FAST (lossy: Coder mask, λ 1.0, FNX_ONEHOP=2)' if a.fast else ''}"
+          f"{', CPU EXPERTS (FNX_CPU_EXPERTS=1: not bit-exact, not repeatable run to run)' if a.cpu_experts else ''})")
 
 
 if __name__ == "__main__":

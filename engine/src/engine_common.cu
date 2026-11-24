@@ -480,6 +480,7 @@ Engine::~Engine() {
     for (CardBuf* b : cb_) {
         cudaSetDevice(b->dev);
         cudaDeviceSynchronize();
+        if (b->cpux) p100_cpu_stop(b->cpux), b->cpux = nullptr;
         if (b->dma) p100_dma_stop(b->dma), b->dma = nullptr;
         for (auto* slots : {&b->win_graphs, &b->mtp_graphs, &b->batch_graphs})
             for (CardBuf::GraphSlot& s : *slots)

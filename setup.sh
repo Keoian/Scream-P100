@@ -33,6 +33,13 @@
 #   --pictures-gpu   the picture encoder on the first of the two cards only while pictures come (the engine's --vram-elastic;
 #                    docs/GUIDE.md, "Pictures on a card"): a 4K picture in seconds instead of on the CPU, each card lends
 #                    1.6 GiB of expert slots while the encoder runs. The default 96 GB mode only
+#   --cpu-experts    FNX_CPU_EXPERTS=1 in the profile (--model q4_k_xl, the default 96 GB mode; docs/GUIDE.md, "Missing experts
+#                    on the CPU"): a decode window's experts that are not in VRAM are computed on the CPU from their RAM
+#                    copies while the cards compute the ones that are. For a machine with a card on a narrow or slow
+#                    PCIe link (x8, x4) and CPUs with AVX2 and cores to spare (16 threads a card by default): tune/check.py
+#                    says whether yours looks like one, tune/tune.py --allow-cpu-experts measures it. NOT BIT-EXACT: the CPU sums
+#                    in fp32 where the cards sum in fp16, so the answers are not the same bits as without it, and two
+#                    runs with it are not the same bits as each other. Without this option the profile is the exact one
 #   --route-prior X  FNX_ROUTE_PRIOR in the profile: 0 (default) is exact; 0.15 is our production setting, faster, lossy
 #   --ram 64         the 64 GB mode in the profile; default 96. IQ3_S: 262,144 positions, the lookup table from the disk.
 #                    UD-Q4_K_XL (exact, not with --fast; docs/GUIDE.md, "UD-Q4_K_XL on 64 GB"): 524,288 positions, no expert
@@ -85,10 +92,10 @@ declare -A SHA=([${IQ3_S[0]}]=4c1eb2ceb4915e1192f4f386021897bde56a97f40a0bb78bb8
                 [${EDGE0_FILES[3]}]=ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06
                 [$MMPROJ]=b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0)
 
-[ $# -ge 1 ] && [ "${1#-}" = "$1" ] || die "usage: bash setup.sh DATA [--model iq3_s|q4_k_xl|edge0] [--models DIR] [--strata DIR] [--no-pictures] [--pictures-gpu] [--route-prior X] [--ram 96|64|32] [--coder] [--fast] [--gpu A,B] [--check]"
+[ $# -ge 1 ] && [ "${1#-}" = "$1" ] || die "usage: bash setup.sh DATA [--model iq3_s|q4_k_xl|edge0] [--models DIR] [--strata DIR] [--no-pictures] [--pictures-gpu] [--cpu-experts] [--route-prior X] [--ram 96|64|32] [--coder] [--fast] [--gpu A,B] [--check]"
 DATA=$1
 shift
-MODEL=iq3_s MODELS='' STRATA='' PICTURES=1 PICTURES_GPU=0 PRIOR=0 RAM=96 CODER=0 FAST=0 CHECK=0 GPU=''
+MODEL=iq3_s MODELS='' STRATA='' PICTURES=1 PICTURES_GPU=0 CPU_EXPERTS=0 PRIOR=0 RAM=96 CODER=0 FAST=0 CHECK=0 GPU=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) MODEL=${2:?--model iq3_s, q4_k_xl or edge0}; case "$MODEL" in iq3_s|q4_k_xl|edge0) ;; *) die "--model: iq3_s, q4_k_xl or edge0" ;; esac; shift 2 ;;
@@ -96,6 +103,7 @@ while [ $# -gt 0 ]; do
     --strata) STRATA=${2:?--strata DIR}; shift 2 ;;
     --no-pictures) PICTURES=0; shift ;;
     --pictures-gpu) PICTURES_GPU=1; shift ;;
+    --cpu-experts) CPU_EXPERTS=1; shift ;;
     --route-prior) PRIOR=${2:?--route-prior X}; shift 2 ;;
     --ram) RAM=${2:?--ram 96, 64 or 32}; [ "$RAM" = 96 ] || [ "$RAM" = 64 ] || [ "$RAM" = 32 ] || die "--ram: 96, 64 or 32"; shift 2 ;;
     --coder) CODER=1; shift ;;
@@ -112,6 +120,8 @@ done
   die "--ram 32: only with --model q4_k_xl and --coder or --fast (docs/GUIDE.md, \"32 GB of RAM\")"
 [ "$CODER" = 0 ] || [ "$MODEL" != edge0 ] || die "--coder: not with --model edge0 (the Coder's list names Flash-Next's experts, not Edge0's)"
 [ "$PICTURES_GPU" = 0 ] || [ "$PICTURES" = 1 ] || die "--pictures-gpu: not with --no-pictures"
+[ "$CPU_EXPERTS" = 0 ] || { [ "$MODEL" = q4_k_xl ] && [ "$RAM" = 96 ]; } ||
+  die "--cpu-experts: with --model q4_k_xl in the default 96 GB mode only (docs/GUIDE.md, \"Missing experts on the CPU\")"
 [ "$PICTURES_GPU" = 0 ] || [ "$RAM" = 96 ] || die "--pictures-gpu: the default 96 GB mode only (docs/GUIDE.md, \"Pictures on a card\")"
 [ "$FAST" = 0 ] || [ "$MODEL" = q4_k_xl ] || die "--fast: only with --model q4_k_xl (the settings were measured on UD-Q4_K_XL only)"
 [ "$FAST" = 0 ] || [ "$PRIOR" = 0 ] || die "--fast sets FNX_ROUTE_PRIOR=1.0 itself: leave --route-prior out"
@@ -364,6 +374,7 @@ else
   vis=()
   [ "$PICTURES" = 1 ] && vis=(--vision-exe "$VISION")
   [ "$PICTURES_GPU" = 1 ] && vis+=(--pictures-gpu)
+  [ "$CPU_EXPERTS" = 1 ] && vis+=(--cpu-experts)
   coder=()
   [ "$CODER" = 1 ] && coder=(--coder)
   [ "$FAST" = 1 ] && coder+=(--fast)

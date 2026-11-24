@@ -343,8 +343,10 @@ struct Up {
             return tmp.data();
         }
         void* hp = nullptr;
-        // FNX_NUMA_EXPERTS=1 (numa_patch.py): on the card's own socket (MPOL_BIND while the node has room, else MPOL_PREFERRED)
-        static const bool numa = env_int("FNX_NUMA_EXPERTS", 0) != 0;
+        // FNX_NUMA_EXPERTS=1 (numa_patch.py): on the card's own socket (MPOL_BIND while the node has room, else MPOL_PREFERRED).
+        // FNX_CPU_EXPERTS=1 (p100_cpu.cuh) turns it on unless FNX_NUMA_EXPERTS=0 is set: that socket's pool computes from these copies,
+        // and reads them twice as fast from its own node (2 x Xeon E5-2696 v3: 374 us a list against 691)
+        static const bool numa = env_int("FNX_NUMA_EXPERTS", env_int("FNX_CPU_EXPERTS", 0) != 0 ? 1 : 0) != 0;
         const int node = numa && !store ? card_numa_node(c.dev) : -1;
         if (node >= 0 && node < 64) {
             const unsigned long mask = 1ul << node;

@@ -64,6 +64,7 @@ is what the design implies. The second kind has not been tried on another machin
 | the IOMMU translates the cards' DMA | `iommu=pt` (or VT-d off) | [measured] 7.6-8 GB/s instead of 11.9 on ours |
 | a card's link below Gen3 x16 while copying, or a narrower bridge above it | slot wiring, riser, BIOS slot speed | [measured] ours run Gen3 x16 |
 | below about 10 GB/s to a card (x8, Gen2, a shared switch uplink) | start `tune.py` from fewer guessed next-layer copies: `FNX_PREFETCH_WANT` 2-3, `FNX_PREFETCH_MIN_T` 2 | **[unmeasured]** rule. It comes from UD-Q4_K_XL on ours, where PCIe was the limit: 6 guesses a row → 2 gave edits +15-20 % |
+| a card below about 10 GB/s or on a link of x8 or x4, with UD-Q4_K_XL in the 96 GB mode, and CPUs with AVX2, FMA, F16C and 10 or more cores at each card | measure `FNX_CPU_EXPERTS=1` with `tune.py --allow-cpu-experts`: the experts that are not in VRAM computed on the CPU instead of copied over that link ([GUIDE.md](../docs/GUIDE.md#missing-experts-on-the-cpu)). NOT bit-exact and not repeatable run to run, so only a note, and never tried without the option | [measured] on one machine: one card on Gen3 x8, 2 x 18 cores at 2.3 GHz with four DDR3-1600 channels each: UD-Q4_K_XL fresh writing +41 %, code edits 2.5x, reads unchanged. **[unmeasured]** anywhere else; the 10 cores are a guess (the pool leaves two free and ran with 16 threads a card there). With fewer cores the note says it may lose |
 | both cards at once much slower than each alone | slots on different root ports or CPUs | [unmeasured] threshold; a user's machine with two cards behind one switch wrote 45 tok/s there, 58 with one card per CPU |
 | more than two P100, the pair from one CPU or behind one switch while another pair is not | `setup.sh --gpu A,B` with that pair | [measured] on that user's machine (above) |
 | the other CPU's memory slower than the card's own | nothing: the engine pins each card's thread to its CPU; `FNX_NUMA_EXPERTS=1` also places the RAM copies (same bits) | [measured] the same on ours, `FNX_NUMA_EXPERTS=1` in the noise |
@@ -105,6 +106,22 @@ It starts from `DATA/profile.json` (the profile `setup.sh` wrote, at `FNX_ROUTE_
 
 All of these give the same bits ("none" under output effect in [docs/SWITCHES.md](../docs/SWITCHES.md)).
 `FNX_ROUTE_PRIOR` (lossy) is tried only with `--allow-lossy`.
+
+`FNX_CPU_EXPERTS=1` is tried only with `--allow-cpu-experts`, as the last group and on top of what the exact groups
+kept: once as the profile is and once with the prefetch it was measured with (`FNX_PREFETCH=1`, 2 guesses a row; more
+made it slower where it was measured). It is for a machine whose cards receive the experts that are not in VRAM slowly (a link of x8
+or x4) and whose CPUs have cores to spare; `check.py` says when a machine looks like that, and `tune.py` then tells you
+the option exists. It is not bit-exact and not repeatable from run to run, so its arms' logits differ from the
+baseline's by design, the engine's log is read to see that the path really ran on both cards, and the summary says in
+so many words when the written profile has it. It is skipped, with the reason, for a profile it cannot run with (no
+copy engine, a low-RAM mode, Edge0) or a processor without AVX2, FMA and F16C. `tune.py` refuses a starting profile
+that already has it: start from the exact one.
+
+On the one machine it has run on (22 Nov 2026: one card on Gen3 x8 at 6.2 GB/s, the other on x16 at 12.4, 2 x 18
+cores; UD-Q4_K_XL, the 512k profile; `--only convcache --allow-cpu-experts`): four loads in 34 minutes. The two
+baselines agreed within 0.4 % in writing (11 % in the long read: the first load of the file reads slower); the arm
+was kept at fresh +43 %, edits +155 % and +166 %, writing after the long read +68 %; the final run confirmed fresh
++38 %, edits +145 % and +159 %, +31 % after the long read, and the summary carried the notice above.
 
 **Safety.** It refuses to start beside another engine, with the cards in use, or with something answering on its port
 (18097, `--port`). Before each load it compares the RAM available with what the profile holds (README's numbers) and
