@@ -100,6 +100,8 @@ summed from every request's `timings`: `llamacpp:prompt_tokens_total` (prompt to
 cache), `llamacpp:prompt_seconds_total`, `llamacpp:prompt_tokens_cached_total` (from checkpoints and parked conversations),
 `llamacpp:tokens_predicted_total`, `llamacpp:tokens_predicted_seconds_total`, `llamacpp:n_drafted_total`,
 `llamacpp:n_drafted_accepted_total`, and the gauge `llamacpp:requests_processing`.
+`GET /slots` gives `id_task`, the request's number (24 Nov), so a client that watches the slot tells back-to-back requests
+apart (without it, our node counted 5-8 short requests in a row as one request of 12-18 s).
 Checked from a clean clone of this branch on our machine (22 Nov, CUDA 12.4, `HOST_CXX=g++-13`): `build.sh` in 3.5 min
 (llama.cpp downloaded and built anew), `setup.sh`, then for each option `run.sh`, `tools/picture_check.py` and `tools/bench.py`;
 in the morning with the pictures and the 512k option, at noon again with p19's faster reading (the same clone, `build.sh`
@@ -428,6 +430,11 @@ layers' rows stay where they are, they are kept by position). The server tells t
 start; the engine takes a checkpoint at the last of them, at earlier ones 4,096 tokens apart, every 16,384 tokens of a long
 read and before the prompt's last token. A request goes back to the latest checkpoint its prompt still shares. Taking one
 costs 15-30 ms (~150 ms the first time a buffer is page-locked), going back 30 ms.
+Since 24 Nov the answer's own head (the `<|message_model|>` two tokens before the prompt's end) is no longer such a start,
+so the last one is the last message's: a new chat with the same long system part (a router's pick, a sub-agent) goes
+back to its end and reads only its own message. Profile picks of ~1,585 tokens at 512k: 2.28 s -> 0.11-0.16 s, the
+same answers, and the engine's RAM no longer grows by the parked conversation of every pick (17 -> 23 GB after ten
+requests before, 17 -> 18 GB now).
 
 **Parked conversations.** When a request shares less than half of the conversation on the cards, that conversation's full
 layers' rows (32.8 KB a token for both cards, its int8 rows and scales in the 512k mode) go to RAM with its tokens and its

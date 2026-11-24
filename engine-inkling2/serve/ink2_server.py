@@ -656,7 +656,8 @@ class H(BaseHTTPRequestHandler):
                                     "modalities": {"vision": bool(A.mmproj and A.vis), "audio": False}})
         if path == "/slots":
             st = STATE
-            return self._send(200, [{"id": 0, "n_ctx": A.ctx, "is_processing": st["busy"], "n_prompt_tokens": st["n_prompt"],
+            return self._send(200, [{"id": 0, "id_task": st["requests"], "n_ctx": A.ctx, "is_processing": st["busy"],   # p42
+                                     "n_prompt_tokens": st["n_prompt"],
                                      "next_token": [{"n_decoded": st["n_decoded"], "has_next_token": st["busy"]}]}])
         if path == "/metrics":   # Prometheus' text format, llama-server's names
             with TOTALS_MUTEX:
@@ -701,7 +702,7 @@ class H(BaseHTTPRequestHandler):
         mx = max(1, min(mx, A.ctx - len(ids) - 1))
         stream = bool(body.get("stream"))
         req = {"stop": [EOS], "mtp": int(body.get("mtp", MTP)), "lookup": int(body.get("lookup", LOOKUP)), **img_req,
-               "ckpt": starts[-4096:]}
+               "ckpt": [x for x in starts if x < len(ids) - 8][-4096:]}   # p42: not the answer's own head (n - 1 is checkpointed)
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(t0)
         if not LOCK.acquire(blocking=False):
