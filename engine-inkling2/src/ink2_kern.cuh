@@ -17,8 +17,14 @@ constexpr int N = 2304, NH = 24, NKV = 8, HD = 128, NQ = NH * HD, NKVD = NKV * H
 constexpr int NE = 128, TOPK = 8, FF = 1152, NV = 201024, NVU = 200058;
 constexpr int NPHYS = 24, LS = 6, LE = 18, NPASS = 3, NCORE = LE - LS, NSLOT = NPHYS + (NPASS - 1) * NCORE, BLK = 6;
 constexpr int RANK = 64, NCONV = 4, SWA = 1024, MAXT = 16, MAXB = 4;
-constexpr int RING = 4096;   // window slots: rows by position modulo RING (an MAXT window or a prompt chunk overwrites no row it still reads)
-constexpr int NC = 2, NH_C = NH / NC, NKV_C = NKV / NC, QC = NH_C * HD, KVC = NKV_C * HD, FF_C = FF / NC, NV_C = NV / NC;
+#ifndef INK2_RING
+#define INK2_RING 4096
+#endif
+constexpr int RING = INK2_RING;   // window slots: rows by position modulo RING (an MAXT window or a prompt chunk overwrites no row it still reads)
+#ifndef INK2_NC
+#define INK2_NC 2
+#endif
+constexpr int NC = INK2_NC, NH_C = NH / NC, NKV_C = NKV / NC, QC = NH_C * HD, KVC = NKV_C * HD, FF_C = FF / NC, NV_C = NV / NC;
 constexpr int KC = 128;      // keys a block of the attention (k_attn_part)
 
 static void ck(cudaError_t e, const char* what, int line) {
@@ -542,7 +548,8 @@ __global__ void k_job_perm(const EJob* jobs, int nj, int* perm) {
 template <bool FP4>
 __global__ void __launch_bounds__(256) k_exp_rows(const uint8_t* __restrict__ W, size_t estride, const __half* __restrict__ Dq, size_t dstride,
                                                   int rows, int cols, const float* x, int ldx, int xbyjob, const float* escale,
-                                                  const EJob* jobs, float* y, int ldy, const int* perm = nullptr) {
+                                                  const EJob* jobs, float* y, int ldy, const int* perm = nullptr,
+                                                  const uint8_t* const* ET = nullptr) {   // p30: expert bases (Q8: rows, then scales)
     extern __shared__ float xs[];
     __shared__ float tab[16];   // the E2M1 table in shared memory: lanes reading different entries of __constant__ memory serialize
     const int jy = perm ? perm[blockIdx.y] : blockIdx.y;   // p11: blocks by expert, outputs by job
@@ -555,7 +562,7 @@ __global__ void __launch_bounds__(256) k_exp_rows(const uint8_t* __restrict__ W,
     if (r >= rows) return;
     float acc = 0;
     if (FP4) {
-        const uint8_t* row = W + (size_t) jb.e * estride + (size_t) r * (cols / 64) * 36;
+        const uint8_t* row = (ET ? ET[jb.e] : W + (size_t) jb.e * estride) + (size_t) r * (cols / 64) * 36;
         const int nsub = cols / 16;
         for (int s = lane; s < nsub; s += 32) {
             const uint8_t* blk = row + (size_t) (s >> 2) * 36;
@@ -571,8 +578,8 @@ __global__ void __launch_bounds__(256) k_exp_rows(const uint8_t* __restrict__ W,
             acc += a * d;
         }
     } else {
-        const int8_t* row = (const int8_t*) W + (size_t) jb.e * estride + (size_t) r * cols;
-        const __half* dr = Dq + (size_t) jb.e * dstride + (size_t) r * (cols / 32);
+        const int8_t* row = (const int8_t*) (ET ? ET[jb.e] : W + (size_t) jb.e * estride) + (size_t) r * cols;
+        const __half* dr = (ET ? (const __half*) (ET[jb.e] + estride) : Dq + (size_t) jb.e * dstride) + (size_t) r * (cols / 32);
         for (int c = lane * 16; c < cols; c += 512) {
             const int4 w4 = __ldg((const int4*) (row + c));
             const int8_t* w = (const int8_t*) &w4;
@@ -618,6 +625,26 @@ __global__ void k_add(float* y, const float* a, const float* b, size_t n) {   //
 __global__ void k_softcap(float* x, int n, float cap) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = tanhf(x[i] / cap) * cap;
+}
+// p36: the softcap of nr rows of ld logits, then with invT > 0 logit / T + Gumbel noise (row r predicts position pos0 + r, column j
+// is vocabulary index col0 + j): the argmax is then a sample of softmax(logits / T)
+__device__ __forceinline__ unsigned long long mix64(unsigned long long z) {
+    z += 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+__global__ void k_softcap_g(float* x, int ld, int nr, float cap, float invT, unsigned long long seed, int pos0, int col0) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ld * nr) return;
+    float v = tanhf(x[i] / cap) * cap;
+    if (invT > 0.0f) {
+        const int r = i / ld, j = i % ld;
+        const unsigned long long h = mix64(seed ^ mix64((unsigned long long) (pos0 + r) * 0x100000000ull + (unsigned long long) (col0 + j)));
+        const float u = ((float) (h >> 40) + 0.5f) * (1.0f / 16777216.0f);
+        v = v * invT - logf(-logf(u));
+    }
+    x[i] = v;
 }
 // the cross-card sum (Hy4 v1): page-locked mapped buffers, a flag a card; each card writes its part and adds the other's
 __global__ void k_xput(const float* y, int n, float* out, volatile unsigned* flag, unsigned seq) {
@@ -925,6 +952,100 @@ __global__ void k_xget2(float* y, int n, const volatile float* in, const volatil
 }
 
 
+// p32: the writing path's cache of RAM experts (one card), see ink2_v1.cu place_experts
+struct ECache {
+    int S = 0;                            // slots
+    size_t eb = 0, gb = 0;                // an expert's bytes (gate_up, then down) and its gate_up part
+    uint8_t* mem = nullptr;               // S x eb
+    int* slot_of = nullptr;               // [NE] the expert's slot or -1
+    int* exp_of = nullptr;                // [S] the slot's expert or -1
+    unsigned* used = nullptr;             // [S] the stamp (forward counter) of the last forward that picked it
+    const char* host = nullptr;           // [NE] 1 = the expert lives in RAM
+    const uint8_t* const* hb = nullptr;   // [NE] the experts' RAM bases (whole expert)
+    int* fill = nullptr;                  // [2 x MAXT * TOPK] (expert, destination) to copy (p34: destination < 0: scratch byte offset -1 - off / 16)
+    int* nfill = nullptr;
+    uint8_t* scr = nullptr;               // p34: the scratch shared by all layers, scr_bytes
+    size_t scr_bytes = 0;
+    int* scr_list = nullptr;              // p34: [MAXT * TOPK] this layer's experts the tables point at the scratch for, nscr of them
+    int* nscr = nullptr;
+};
+__global__ void k_cache_assign(ECache c, const int* topi, int nj, const unsigned* stamp, const uint8_t** gt, const uint8_t** dt) {
+    if (threadIdx.x || blockIdx.x) return;
+    const unsigned st = *stamp;
+    int nf = 0;
+    if (c.nscr) {   // p34: the last forward's scratch picks get their RAM bases back
+        for (int i = 0; i < *c.nscr; ++i) {
+            const int e = c.scr_list[i];
+            gt[e] = c.hb[e];
+            dt[e] = c.hb[e] + c.gb;
+        }
+        *c.nscr = 0;
+    }
+    size_t soff = 0;
+    int ns = 0;
+    for (int i = 0; i < nj; ++i) {
+        const int e = topi[i];
+        if (!c.host[e]) continue;
+        const int s = c.slot_of[e];
+        if (s >= 0) {
+            c.used[s] = st;
+            continue;
+        }
+        int v = -1;
+        unsigned best = 0xffffffffu;
+        for (int k = 0; k < c.S; ++k) {   // an empty slot, else the least recently picked one this forward did not pick
+            const unsigned u = c.used[k];
+            if (u == st) continue;
+            if (c.exp_of[k] < 0) {
+                v = k;
+                break;
+            }
+            if (u < best) {
+                best = u;
+                v = k;
+            }
+        }
+        if (v < 0) {   // p34: no slot: the scratch, once for the whole window
+            bool seen = false;
+            for (int k = 0; k < ns; ++k) seen |= c.scr_list[k] == e;
+            if (seen || !c.scr || soff + c.eb > c.scr_bytes) continue;
+            gt[e] = c.scr + soff;
+            dt[e] = c.scr + soff + c.gb;
+            c.scr_list[ns++] = e;
+            c.fill[2 * nf] = e;
+            c.fill[2 * nf + 1] = -1 - (int) (soff / 16);
+            ++nf;
+            soff += c.eb;
+            continue;
+        }
+        const int old = c.exp_of[v];
+        if (old >= 0) {
+            c.slot_of[old] = -1;
+            gt[old] = c.hb[old];
+            dt[old] = c.hb[old] + c.gb;
+        }
+        c.exp_of[v] = e;
+        c.slot_of[e] = v;
+        c.used[v] = st;
+        gt[e] = c.mem + (size_t) v * c.eb;
+        dt[e] = c.mem + (size_t) v * c.eb + c.gb;
+        c.fill[2 * nf] = e;
+        c.fill[2 * nf + 1] = v;
+        ++nf;
+    }
+    *c.nfill = nf;
+    if (c.nscr) *c.nscr = ns;
+}
+__global__ void __launch_bounds__(256) k_cache_fill(ECache c) {   // block (x, j): a share of fill j's bytes, 16 at a time
+    const int j = blockIdx.y;
+    if (j >= *c.nfill) return;
+    const uint4* src = (const uint4*) c.hb[c.fill[2 * j]];
+    const int d = c.fill[2 * j + 1];
+    uint4* dst = (uint4*) (d >= 0 ? c.mem + (size_t) d * c.eb : c.scr + (size_t) (-1 - d) * 16);
+    const size_t n16 = c.eb / 16;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += (size_t) gridDim.x * blockDim.x) dst[i] = src[i];
+}
+
 // planar NVFP4 rows (p4d): a row of NBLK blocks stored as all 32-byte code runs, then all 4-byte scale words (the same 36 bytes a
 // block), so lane l can read block l's codes as two aligned 16-byte loads and its scales as one word, neighbouring lanes neighbours
 static void fp4_to_planar(const uint8_t* src, uint8_t* dst, size_t rows, int nblk, int nexp) {   // per expert: codes, then scales
@@ -942,7 +1063,8 @@ static void fp4_to_planar(const uint8_t* src, uint8_t* dst, size_t rows, int nbl
 // k_fp4_rows6: k_fp4_rows3's tiles (R rows a warp, lane l the blocks l, l + 32, ... of the tile) on planar rows
 template <int NBLK, int R>
 __global__ void __launch_bounds__(128) k_fp4_rows6(const uint8_t* __restrict__ W, size_t estride, int rows, const float* x, int ldx,
-                                                   int xbyjob, const float* escale, const EJob* jobs, float* y, int ldy, const int* perm = nullptr) {
+                                                   int xbyjob, const float* escale, const EJob* jobs, float* y, int ldy, const int* perm = nullptr,
+                                                   const uint8_t* const* ET = nullptr) {   // p30: expert bases
     static_assert(NBLK * R == 288, "a warp's tile is 9 blocks a lane");
     constexpr int COLS = NBLK * 64, WPB = 4;
     __shared__ float xs[NBLK * 65];
@@ -958,8 +1080,9 @@ __global__ void __launch_bounds__(128) k_fp4_rows6(const uint8_t* __restrict__ W
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row0 = (blockIdx.x * WPB + warp) * R;
     if (row0 >= rows) return;
-    const uint8_t* codes = W + (size_t) jb.e * estride + (size_t) row0 * NBLK * 32;
-    const uint32_t* scales = (const uint32_t*) (W + (size_t) jb.e * estride + (size_t) rows * NBLK * 32) + (size_t) row0 * NBLK;
+    const uint8_t* EB = ET ? ET[jb.e] : W + (size_t) jb.e * estride;   // p30
+    const uint8_t* codes = EB + (size_t) row0 * NBLK * 32;
+    const uint32_t* scales = (const uint32_t*) (EB + (size_t) rows * NBLK * 32) + (size_t) row0 * NBLK;
 #pragma unroll 3
     for (int k = 0; k < 9; ++k) {
         const int gb = k * 32 + lane, bl = gb % NBLK;
@@ -1001,7 +1124,8 @@ __global__ void __launch_bounds__(128) k_fp4_rows6(const uint8_t* __restrict__ W
 // partial sums: more blocks an SM); TPB threads a block
 template <int NBLK, int LPR, int TPB>
 __global__ void __launch_bounds__(TPB) k_fp4_rows7(const uint8_t* __restrict__ W, size_t estride, int rows, const float* x, int ldx,
-                                                   int xbyjob, const float* escale, const EJob* jobs, float* y, int ldy, const int* perm = nullptr) {
+                                                   int xbyjob, const float* escale, const EJob* jobs, float* y, int ldy, const int* perm = nullptr,
+                                                   const uint8_t* const* ET = nullptr) {   // p30: expert bases
     constexpr int COLS = NBLK * 64, BPL = NBLK / LPR, RPW = 32 / LPR;
     __shared__ float xs[NBLK * 65];
     __shared__ float tab[16], sct[256];
@@ -1015,8 +1139,9 @@ __global__ void __launch_bounds__(TPB) k_fp4_rows7(const uint8_t* __restrict__ W
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row = (blockIdx.x * (TPB / 32) + warp) * RPW + lane / LPR;
     if (row >= rows) return;
-    const uint8_t* codes = W + (size_t) jb.e * estride + (size_t) row * NBLK * 32;
-    const uint32_t* scales = (const uint32_t*) (W + (size_t) jb.e * estride + (size_t) rows * NBLK * 32) + (size_t) row * NBLK;
+    const uint8_t* EB = ET ? ET[jb.e] : W + (size_t) jb.e * estride;   // p30
+    const uint8_t* codes = EB + (size_t) row * NBLK * 32;
+    const uint32_t* scales = (const uint32_t*) (EB + (size_t) rows * NBLK * 32) + (size_t) row * NBLK;
     float acc = 0;
 #pragma unroll 3
     for (int k = 0; k < BPL; ++k) {
@@ -1071,9 +1196,11 @@ __global__ void __launch_bounds__(1024) k_xchg_conv(const float* y, const float*
                 v = y[i];
             }
             own[j] = v;
-            out[i] = v;
+            if (NC > 1) out[i] = v;
         }
     }
+    __shared__ __align__(16) float oth[NC > 1 ? N : 4];
+    if (NC > 1) {   // p30: one card (NC = 1) has nothing to exchange
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -1083,17 +1210,17 @@ __global__ void __launch_bounds__(1024) k_xchg_conv(const float* y, const float*
     __syncthreads();
     __threadfence_system();
     // p6e: the other card's part through shared memory, read by float4 (576 threads, one load each, all issued at once)
-    __shared__ __align__(16) float oth[N];
     if (threadIdx.x < N / 4) {
         const float4 v4 = __ldcv((const float4*) (const float*) in + threadIdx.x);   // not cached: the other card wrote it
         *(float4*) (oth + threadIdx.x * 4) = v4;
     }
     __syncthreads();
+    }
 #pragma unroll
     for (int j = 0; j < 3; ++j) {
         const int i = threadIdx.x + 1024 * j;
         if (i >= N) continue;
-        const float a = card == 0 ? own[j] + oth[i] : oth[i] + own[j];
+        const float a = NC == 1 ? own[j] : card == 0 ? own[j] + oth[i] : oth[i] + own[j];
         const float s0 = st[i], s1 = st[N + i], s2 = st[2 * N + i];
         float o = 0.0f;
         o += s0 * w[i * 4 + 0];
@@ -1241,12 +1368,13 @@ __global__ void k_route_jobs(const float* logits, const float* bias, float wscal
 constexpr int KC2 = 64, GQ = NH / NKV;
 template <int KCB, bool Q8>
 __global__ void __launch_bounds__(128) k_attn_dec(const float* q, const float* R, const float* B, const float* sink, const __half* kc,
-                                                  const __half* vc, const int* pos, int window, float* part, int nparts, KV8 q8, int poff) {
+                                                  const __half* vc, const int* pos, int window, float* part, int nparts, KV8 q8, int poff,
+                                                  int nt = 1) {   // p38: nt rows of a window side by side in grid x
     __shared__ float qs[GQ][HD];
     __shared__ float rs[GQ][NREL];
     __shared__ float sc[GQ][KCB];
     __shared__ float red[GQ][4];
-    const int g = blockIdx.y, p = blockIdx.x + poff, tid = threadIdx.x, t = blockIdx.z;   // p5a: token t of a window (grid z); p18: parts from poff
+    const int g = blockIdx.y, p = (int) blockIdx.x / nt + poff, tid = threadIdx.x, t = (int) blockIdx.x % nt + (int) blockIdx.z;   // p38   // p5a: token t of a window (grid z); p18: parts from poff
     const int P = pos[t];
     q += (size_t) t * QC;
     R += (size_t) t * NH_C * NREL;
@@ -1648,6 +1776,7 @@ __global__ void __launch_bounds__(1024) k_xchg_convT(const float* y, const float
         for (int kk = 0; kk < TOPK; ++kk) v += ey[((size_t) t * TOPK + kk) * N + i] * topw[t * TOPK + kk];
         return v;
     };
+    if (NC > 1) {   // p30: one card (NC = 1) has nothing to exchange
     for (int e = threadIdx.x; e < T * N; e += 1024) out[e] = own(e);
     __threadfence_system();
     __syncthreads();
@@ -1663,13 +1792,14 @@ __global__ void __launch_bounds__(1024) k_xchg_convT(const float* y, const float
         ((float4*) scratch)[e4] = v4;
     }
     __syncthreads();
+    }
     for (int i = threadIdx.x; i < N; i += 1024) {
         float s0 = st[i], s1 = st[N + i], s2 = st[2 * N + i];
         const float w0 = w[i * 4 + 0], w1 = w[i * 4 + 1], w2 = w[i * 4 + 2], w3 = w[i * 4 + 3];
         for (int t = 0; t < T; ++t) {
             const size_t e = (size_t) t * N + i;
             const float mine = own((int) e);
-            const float a = card == 0 ? mine + scratch[e] : scratch[e] + mine;
+            const float a = NC == 1 ? mine : card == 0 ? mine + scratch[e] : scratch[e] + mine;
             if (hist) hist[e] = a;
             float o = 0.0f;
             o += s0 * w0;

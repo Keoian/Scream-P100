@@ -14,7 +14,10 @@
 
 #include <cublas_v2.h>
 
+#include <pthread.h>   // p41
+#include <sched.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -22,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <climits>
 #include <csignal>
 #include <cstring>
@@ -35,6 +39,7 @@
 
 namespace ink2 {
 
+static FILE* g_rtrace = nullptr;   // p31: INK2_RTRACE
 static std::string g_draft_vocab;   // p13: --draft-vocab FILE (int32 count + token ids), "" = the whole vocabulary
 static double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -50,6 +55,12 @@ struct LW {   // one card's part of a physical layer
     const uint8_t *gu = nullptr, *dn = nullptr;   // NVFP4 rows, or Q8S values
     const __half *gu_d = nullptr, *dn_d = nullptr;
     const float *gu_s = nullptr, *dn_s = nullptr;
+    const uint8_t* const* gu_t = nullptr;   // p30: every expert's base (gate_up, down): in VRAM or in mapped page-locked RAM
+    const uint8_t* const* dn_t = nullptr;
+    int nres = NE;   // p30: experts in VRAM
+    std::vector<char> res;                    // p31: which experts are in VRAM
+    std::vector<const uint8_t*> h_gu, h_dn;   // p31: the bases on the host side (a RAM expert's mapped address)
+    ECache ec;                                // p32: the writing path's cache of this layer's RAM experts
     const float* msg_q = nullptr;   // loop layers 6-17
     const float *c_down[4] = {}, *c_gain[4] = {}, *c_forget[4] = {};
 };
@@ -80,6 +91,11 @@ struct PFB {
         *RB, *tmp, *hx1;
     float **pk = nullptr, **pq, **ps, **pv, **pao;   // p3f: pointer arrays of the window layers' batched attention
     int *pos, *topi, *cnt, *offs, *cursor, *slotrow, *rowtok, *rowexp;
+    uint8_t* stg[2] = {};           // p31: staging buffers of the RAM experts
+    size_t stg_bytes = 0;
+    const uint8_t** d_stab = nullptr;   // p31: a group's expert table (gate_up, down) for each group, device and page-locked host
+    const uint8_t** h_stab = nullptr;
+    cudaEvent_t evS[2], evU[2];     // p31: a staging buffer filled / free again
     float* hbuf[2] = {};   // page-locked: this card's part of an exchange, by parity
     cudaEvent_t ev[2];
     static constexpr int XS_MAX = 4;
@@ -161,7 +177,7 @@ struct Engine {
     int* h_pos = nullptr;
     float* h_tau = nullptr;
     bool graf = getenv("INK2_GRAF") != nullptr;   // p4c: the writing path's forward as a CUDA graph (measured 21. 11.: no gain, off)
-    int pfc = 2048;                           // p3: INK2_PF_CHUNK, tokens a reading chunk
+    int pfc = RING >= 4096 ? 2048 : RING - SWA;   // p3: INK2_PF_CHUNK, tokens a reading chunk (p31: RING - SWA with a smaller ring)
     int pf_min = 31;                          // p3: INK2_PF_MIN, shortest piece that goes the reading path (INK2_PF_OFF: never); p23: 41, was MAXT + 1; p27: 31
     std::atomic<unsigned> pf_rec[NC];         // p3: the exchange each card has recorded
     static constexpr int EB = 16, QS = 256;   // p3: experts dequantized at once; queries per attention block
@@ -176,12 +192,14 @@ struct Engine {
     int qsf_max = getenv("INK2_PF_QSF_MAX") ? atoi(getenv("INK2_PF_QSF_MAX")) : 2048;
     size_t pv_cap = 0;   // p19c: the P.V pieces' room in floats
     bool share_on = getenv("INK2_SHARE") ? atoi(getenv("INK2_SHARE")) != 0 : true;   // p19c: the shared scratch in every mode (0: only int8)
-    static constexpr int KFB = 32768;   // p14: full layers' keys converted to f32 at most this many at a time (longer: in blocks)
+    static constexpr int KFB = NC == 1 ? 8192 : 32768;   // p33: 8k with one card   // p14: full layers' keys converted to f32 at most this many at a time (longer: in blocks)
     static constexpr int PVK = 1024;    // p14b: the full layers' P.V in pieces of this many keys (one batched call, then k_pv_sum)
     bool pv_split = getenv("INK2_PV_SPLIT") ? atoi(getenv("INK2_PV_SPLIT")) != 0 : true;
     static constexpr int DS_RING = 4096, DS_RING1 = 16384, DS_WIN1 = 12288;   // p14: the drafter's caches above 64k (layer 1 sees 12k)
     bool ds_ring = false;   // 21. 11.: 14k 641 -> 695 (2048: 700, +0.7 GB)   // p3d: queries per block in the full layers
     float* h_logits = nullptr;   // page-locked [MAXT][NV]
+    float s_invT = 0.0f;               // p36: 1 / temperature of this request (0: greedy)
+    unsigned long long s_seed = 0;     // p36: its seed
     int n_past = 0;
     int snap_n = -1;   // p8: tokens before the snapshot of the conv states (stsnap), -1 = none
     std::vector<int> processed;   // the tokens whose state the caches hold
@@ -209,7 +227,7 @@ struct Engine {
         unsigned long long use = 0;
     };
     std::vector<Park> parks;
-    size_t park_bytes = 0, park_max = (size_t) (getenv("INK2_PARK_MB") ? std::max(0LL, atoll(getenv("INK2_PARK_MB"))) : 32768LL) << 20;
+    size_t park_bytes = 0, park_max = (size_t) (getenv("INK2_PARK_MB") ? std::max(0LL, atoll(getenv("INK2_PARK_MB"))) : (NC == 1 ? 0LL : 32768LL)) << 20;   // p30
     int park_min = getenv("INK2_PARK_MIN") ? atoi(getenv("INK2_PARK_MIN")) : 1024;   // fewer tokens than this are read again instead
     static constexpr int PARK_CK = 4;
     unsigned long long use_no = 0;
@@ -228,7 +246,7 @@ struct Engine {
     bool quit = false;
 
     std::map<std::string, size_t> vtag[NC];   // p18: VRAM by part (INK2_VRAM_LOG=1 prints it after loading)
-    std::string vt[NC] = {"ostalo", "ostalo"};
+    std::string vt[2] = {"ostalo", "ostalo"};
     void* alloc(Card& K, size_t bytes) {
         void* p = nullptr;
         CK(cudaSetDevice(K.dev));
@@ -357,78 +375,332 @@ struct Engine {
         }
         return m;
     }
-    // this card's part of a layer's experts: gate_up rows [c*FF_C, +FF_C) and [FF + c*FF_C, +FF_C), down columns [c*FF_C, +FF_C)
-    void experts(Card& K, LW& L, int p) {
+    // this card's part of a layer's experts: gate_up rows [c*FF_C, +FF_C) and [FF + c*FF_C, +FF_C), down columns [c*FF_C, +FF_C).
+    // p30: each expert contiguous (NVFP4: planar gate_up, then planar down; Q8: gate_up's int8 rows, their half scales, then down's
+    // rows and scales); the experts with res[e] in one VRAM block, the others in one block of mapped page-locked RAM that the
+    // kernels read over PCIe; L.gu_t / L.dn_t hold every expert's two bases
+    size_t host_exp_bytes[NC] = {}, vram_exp_bytes[NC] = {};   // p40: a card each (the cards place their experts at once)
+    bool q8fp4 = getenv("INK2_1C_Q8_FP4") && atoi(getenv("INK2_1C_Q8_FP4")) != 0;   // p35 (lossy)
+    // p35: rows x cols floats (an expert matrix) to interleaved NVFP4 blocks (rows x cols / 64 x 36 bytes); returns its scale G
+    static float to_nvfp4(const float* v, size_t rows, int cols, uint8_t* out) {
+        static float ue[127];   // UE4M3 raw values of bytes 0..126 (ascending; 0x7F is NaN)
+        static bool init = false;
+        if (!init) {
+            for (int b = 0; b < 127; ++b) {
+                const int e = (b >> 3) & 0xF, m = b & 7;
+                ue[b] = e == 0 ? std::ldexp((float) m, -9) : std::ldexp(1.0f + m / 8.0f, e - 7);
+            }
+            init = true;
+        }
+        static const float E2[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+        auto code = [](float x) {   // nearest E2M1, sign in bit 3
+            const float a = std::fabs(x);
+            const int m = a < 0.25f ? 0 : a < 0.75f ? 1 : a < 1.25f ? 2 : a < 1.75f ? 3 : a < 2.5f ? 4 : a < 3.5f ? 5 : a < 5.0f ? 6 : 7;
+            return (uint8_t) (m | (x < 0 && m ? 8 : 0));
+        };
+        float amax = 0.0f;
+        for (size_t i = 0; i < rows * (size_t) cols; ++i) amax = std::max(amax, std::fabs(v[i]));
+        const float G = amax > 0.0f ? amax / (6.0f * 448.0f) : 1.0f;
+        const int nb = cols / 64;
+        for (size_t r = 0; r < rows; ++r)
+            for (int b = 0; b < nb; ++b) {
+                uint8_t* blk = out + (r * nb + b) * 36;
+                for (int sb = 0; sb < 4; ++sb) {
+                    const float* x = v + r * cols + b * 64 + sb * 16;
+                    float am = 0.0f;
+                    for (int i = 0; i < 16; ++i) am = std::max(am, std::fabs(x[i]));
+                    const float t = am / 6.0f / G;
+                    const int hi = std::min(126, (int) (std::lower_bound(ue + 1, ue + 127, t) - ue));
+                    int best = 0;
+                    float berr = 3.4e38f;
+                    for (int cand : {hi - 1, hi}) {
+                        if (cand < 1 || am == 0.0f) continue;
+                        const float sc = ue[cand] * G;
+                        float err = 0.0f;
+                        for (int i = 0; i < 16; ++i) {
+                            const uint8_t c = code(x[i] / sc);
+                            const float q = (c & 8 ? -1.0f : 1.0f) * E2[c & 7] * sc;
+                            err += (q - x[i]) * (q - x[i]);
+                        }
+                        if (err < berr) {
+                            berr = err;
+                            best = cand;
+                        }
+                    }
+                    blk[sb] = (uint8_t) best;
+                    const float sc = best ? ue[best] * G : 1.0f;
+                    uint8_t* qs = blk + 4 + sb * 8;
+                    for (int i = 0; i < 8; ++i) {
+                        const uint8_t lo = best ? code(x[i] / sc) : 0, hi4 = best ? code(x[i + 8] / sc) : 0;
+                        qs[i] = (uint8_t) (lo | (hi4 << 4));
+                    }
+                }
+            }
+        return G;
+    }
+    size_t expert_bytes(int p) {   // gate_up + down of one expert of layer p, as experts() lays them out
+        const GTensor& gu = g.t("blk." + std::to_string(p) + ".ffn_gate_up_exps.weight");
+        if (gu.type == G_NVFP4 || q8fp4) return (size_t) 2 * FF_C * (N / 64) * 36 + (size_t) N * (FF_C / 64) * 36;
+        return (size_t) 2 * FF_C * N + (size_t) 2 * FF_C * (N / 32) * 2 + (size_t) N * FF_C + (size_t) N * (FF_C / 32) * 2;
+    }
+    void experts(Card& K, LW& L, int p, const std::vector<char>& res) {
         const std::string b = "blk." + std::to_string(p) + ".";
         const GTensor& gu = g.t(b + "ffn_gate_up_exps.weight");
         const GTensor& dn = g.t(b + "ffn_down_exps.weight");
         const int c = K.c;
+        std::vector<uint8_t> hg, hd;   // all experts, one after another
+        size_t gb = 0, db = 0;         // one expert's gate_up / down bytes
         if (gu.type == G_NVFP4) {
             L.fp4 = true;
-            const size_t rbg = gu.row_bytes(), rbd = dn.row_bytes(), cb = (size_t) (FF_C / 64) * 36;   // 1296, 648, 324
-            std::vector<uint8_t> hg((size_t) NE * 2 * FF_C * rbg), hd((size_t) NE * N * cb);
+            const size_t rbg = gu.row_bytes(), rbd = dn.row_bytes(), cb = (size_t) (FF_C / 64) * 36;
+            std::vector<uint8_t> ig((size_t) NE * 2 * FF_C * rbg), id((size_t) NE * N * cb);
             for (int e = 0; e < NE; ++e) {
                 for (int h = 0; h < 2; ++h)
-                    std::memcpy(&hg[((size_t) e * 2 * FF_C + h * FF_C) * rbg], gu.data + ((size_t) e * 2 * FF + h * FF + c * FF_C) * rbg,
+                    std::memcpy(&ig[((size_t) e * 2 * FF_C + h * FF_C) * rbg], gu.data + ((size_t) e * 2 * FF + h * FF + c * FF_C) * rbg,
                                 (size_t) FF_C * rbg);
                 for (int r = 0; r < N; ++r)
-                    std::memcpy(&hd[((size_t) e * N + r) * cb], dn.data + ((size_t) e * N + r) * rbd + (size_t) c * cb, cb);
+                    std::memcpy(&id[((size_t) e * N + r) * cb], dn.data + ((size_t) e * N + r) * rbd + (size_t) c * cb, cb);
             }
-            if (!ilv) {   // p4d: planar experts (codes, then scales)
-                std::vector<uint8_t> t(hg.size());
-                fp4_to_planar(hg.data(), t.data(), (size_t) 2 * FF_C, N / 64, NE);
-                hg.swap(t);
-                t.resize(hd.size());
-                fp4_to_planar(hd.data(), t.data(), (size_t) N, FF_C / 64, NE);
-                hd.swap(t);
-            }
-            void* pg = alloc(K, hg.size());
-            void* pd = alloc(K, hd.size());
-            CK(cudaMemcpy(pg, hg.data(), hg.size(), cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(pd, hd.data(), hd.size(), cudaMemcpyHostToDevice));
-            L.gu = (const uint8_t*) pg;
-            L.dn = (const uint8_t*) pd;
+            hg.resize(ig.size());
+            fp4_to_planar(ig.data(), hg.data(), (size_t) 2 * FF_C, N / 64, NE);
+            hd.resize(id.size());
+            fp4_to_planar(id.data(), hd.data(), (size_t) N, FF_C / 64, NE);
+            gb = hg.size() / NE;
+            db = hd.size() / NE;
             L.gu_s = f32(K, b + "ffn_gate_up_exps.scale");
             L.dn_s = f32(K, b + "ffn_down_exps.scale");
+        } else if (gu.type == G_Q8_0 && q8fp4) {   // p35 (lossy): requantized to NVFP4, then as an NVFP4 layer
+            L.fp4 = true;
+            const size_t rbg = gu.row_bytes(), rbd = dn.row_bytes();
+            const size_t cg = (size_t) 2 * FF_C * (N / 64) * 36, cd = (size_t) N * (FF_C / 64) * 36;
+            std::vector<uint8_t> ig((size_t) NE * cg), id((size_t) NE * cd);
+            std::vector<float> sg(NE), sd(NE);
+            std::vector<std::thread> pool;
+            std::atomic<int> next{0};
+            auto deq = [](const uint8_t* src, int cols, float* dst) {   // a Q8_0 row piece of cols values
+                for (int bb = 0; bb < cols / 32; ++bb) {
+                    uint16_t hb;
+                    std::memcpy(&hb, src + bb * 34, 2);
+                    __half_raw hr;
+                    hr.x = hb;
+                    const float d = __half2float(__half(hr));
+                    for (int j = 0; j < 32; ++j) dst[bb * 32 + j] = d * (float) (int8_t) src[bb * 34 + 2 + j];
+                }
+            };
+            for (int t = 0; t < 16; ++t)
+                pool.emplace_back([&]() {
+                    std::vector<float> w((size_t) 2 * FF_C * N);
+                    for (int e; (e = next.fetch_add(1)) < NE;) {
+                        for (int h = 0; h < 2; ++h)
+                            for (int r = 0; r < FF_C; ++r)
+                                deq(gu.data + ((size_t) e * 2 * FF + h * FF + c * FF_C + r) * rbg, N, &w[((size_t) h * FF_C + r) * N]);
+                        sg[e] = to_nvfp4(w.data(), (size_t) 2 * FF_C, N, &ig[(size_t) e * cg]);
+                        for (int r = 0; r < N; ++r) deq(dn.data + ((size_t) e * N + r) * rbd + (size_t) (c * FF_C / 32) * 34, FF_C, &w[(size_t) r * FF_C]);
+                        sd[e] = to_nvfp4(w.data(), (size_t) N, FF_C, &id[(size_t) e * cd]);
+                    }
+                });
+            for (auto& t : pool) t.join();
+            hg.resize(ig.size());
+            fp4_to_planar(ig.data(), hg.data(), (size_t) 2 * FF_C, N / 64, NE);
+            hd.resize(id.size());
+            fp4_to_planar(id.data(), hd.data(), (size_t) N, FF_C / 64, NE);
+            gb = cg;
+            db = cd;
+            float* a = (float*) alloc(K, NE * 4);
+            float* bsc = (float*) alloc(K, NE * 4);
+            CK(cudaMemcpy(a, sg.data(), NE * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(bsc, sd.data(), NE * 4, cudaMemcpyHostToDevice));
+            L.gu_s = a;
+            L.dn_s = bsc;
         } else if (gu.type == G_Q8_0) {
             L.fp4 = false;
             const size_t rbg = gu.row_bytes(), rbd = dn.row_bytes();
-            std::vector<int8_t> qg((size_t) NE * 2 * FF_C * N), qd((size_t) NE * N * FF_C);
-            std::vector<uint16_t> dg((size_t) NE * 2 * FF_C * (N / 32)), dd((size_t) NE * N * (FF_C / 32));
+            const size_t gq = (size_t) 2 * FF_C * N, dq = (size_t) N * FF_C;
+            gb = gq + (size_t) 2 * FF_C * (N / 32) * 2;
+            db = dq + (size_t) N * (FF_C / 32) * 2;
+            hg.resize((size_t) NE * gb);
+            hd.resize((size_t) NE * db);
             for (int e = 0; e < NE; ++e) {
+                uint8_t* qg = &hg[(size_t) e * gb];
+                uint8_t* dg = qg + gq;
                 for (int h = 0; h < 2; ++h)
                     for (int r = 0; r < FF_C; ++r) {
                         const uint8_t* src = gu.data + ((size_t) e * 2 * FF + h * FF + c * FF_C + r) * rbg;
-                        const size_t row = (size_t) e * 2 * FF_C + h * FF_C + r;
+                        const size_t row = (size_t) h * FF_C + r;
                         for (int bb = 0; bb < N / 32; ++bb) {
-                            std::memcpy(&dg[row * (N / 32) + bb], src + bb * 34, 2);
-                            std::memcpy(&qg[row * N + bb * 32], src + bb * 34 + 2, 32);
+                            std::memcpy(dg + (row * (N / 32) + bb) * 2, src + bb * 34, 2);
+                            std::memcpy(qg + row * N + bb * 32, src + bb * 34 + 2, 32);
                         }
                     }
+                uint8_t* qd = &hd[(size_t) e * db];
+                uint8_t* dd = qd + dq;
                 for (int r = 0; r < N; ++r) {
                     const uint8_t* src = dn.data + ((size_t) e * N + r) * rbd + (size_t) (c * FF_C / 32) * 34;
-                    const size_t row = (size_t) e * N + r;
                     for (int bb = 0; bb < FF_C / 32; ++bb) {
-                        std::memcpy(&dd[row * (FF_C / 32) + bb], src + bb * 34, 2);
-                        std::memcpy(&qd[row * FF_C + bb * 32], src + bb * 34 + 2, 32);
+                        std::memcpy(dd + ((size_t) r * (FF_C / 32) + bb) * 2, src + bb * 34, 2);
+                        std::memcpy(qd + (size_t) r * FF_C + bb * 32, src + bb * 34 + 2, 32);
                     }
                 }
             }
-            void* a = alloc(K, qg.size());
-            void* bq = alloc(K, qd.size());
-            void* cdg = alloc(K, dg.size() * 2);
-            void* cdd = alloc(K, dd.size() * 2);
-            CK(cudaMemcpy(a, qg.data(), qg.size(), cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(bq, qd.data(), qd.size(), cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(cdg, dg.data(), dg.size() * 2, cudaMemcpyHostToDevice));
-            CK(cudaMemcpy(cdd, dd.data(), dd.size() * 2, cudaMemcpyHostToDevice));
-            L.gu = (const uint8_t*) a;
-            L.dn = (const uint8_t*) bq;
-            L.gu_d = (const __half*) cdg;
-            L.dn_d = (const __half*) cdd;
         } else {
             throw std::runtime_error(b + "ffn_gate_up_exps: type " + std::to_string(gu.type));
         }
+        int nres = 0;
+        for (int e = 0; e < NE; ++e) nres += res[e] != 0;
+        const size_t eb = gb + db;
+        uint8_t* vblk = nres ? (uint8_t*) alloc(K, (size_t) nres * eb) : nullptr;
+        uint8_t *hblk = nullptr, *hdev = nullptr;
+        if (nres < NE) {
+            CK(cudaSetDevice(K.dev));
+            CK(cudaHostAlloc((void**) &hblk, (size_t) (NE - nres) * eb, cudaHostAllocMapped | cudaHostAllocPortable));
+            CK(cudaHostGetDevicePointer((void**) &hdev, hblk, 0));
+            host_exp_bytes[K.c] += (size_t) (NE - nres) * eb;
+        }
+        vram_exp_bytes[K.c] += (size_t) nres * eb;
+        std::vector<const uint8_t*> tg(NE), td(NE);
+        int iv = 0, ih = 0;
+        for (int e = 0; e < NE; ++e) {
+            const uint8_t* base;
+            if (res[e]) {
+                uint8_t* d = vblk + (size_t) iv++ * eb;
+                CK(cudaMemcpy(d, &hg[(size_t) e * gb], gb, cudaMemcpyHostToDevice));
+                CK(cudaMemcpy(d + gb, &hd[(size_t) e * db], db, cudaMemcpyHostToDevice));
+                base = d;
+            } else {
+                std::memcpy(hblk + (size_t) ih * eb, &hg[(size_t) e * gb], gb);
+                std::memcpy(hblk + (size_t) ih * eb + gb, &hd[(size_t) e * db], db);
+                base = hdev + (size_t) ih++ * eb;
+            }
+            tg[e] = base;
+            td[e] = base + gb;
+        }
+        void* t1 = alloc(K, NE * sizeof(void*));
+        void* t2 = alloc(K, NE * sizeof(void*));
+        CK(cudaMemcpy(t1, tg.data(), NE * sizeof(void*), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(t2, td.data(), NE * sizeof(void*), cudaMemcpyHostToDevice));
+        L.gu_t = (const uint8_t* const*) t1;
+        L.dn_t = (const uint8_t* const*) t2;
+        L.nres = nres;
+        L.res = res;   // p31
+        L.h_gu = tg;
+        L.h_dn = td;
+        L.gu = L.dn = nullptr;
+        L.gu_d = L.dn_d = nullptr;
+    }
+    // p30: which experts stay in VRAM, after every other allocation: what is free less INK2_1C_MARGIN_MB (400), at most
+    // INK2_1C_EXP_MB, in INK2_1C_PLAN's order (lines "layer expert", the most used first; test/rstat_plan.py writes it), then
+    // expert by expert over the layers in turn; an expert that does not fit is skipped and the next ones are tried
+    void place_experts(Card& K) {
+        CK(cudaSetDevice(K.dev));
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        const long long margin = (getenv("INK2_1C_MARGIN_MB") ? atoll(getenv("INK2_1C_MARGIN_MB")) : NC == 1 ? 400LL : 150LL) << 20;   // p39: 150 with two cards
+        long long budget = (long long) fr - margin - (long long) NPHYS * 2 * NE * 8;
+        if (getenv("INK2_1C_EXP_MB")) budget = std::min(budget, atoll(getenv("INK2_1C_EXP_MB")) << 20);
+        long long all = 0;   // p39: every expert fits: no cache, no scratch (nothing in RAM)
+        for (int lp = 0; lp < NPHYS; ++lp) all += (long long) expert_bytes(lp) * NE;
+        const bool fits = all <= budget;
+        const long long cache = fits ? 0 : std::min(budget, (getenv("INK2_1C_CACHE_MB") ? atoll(getenv("INK2_1C_CACHE_MB")) : 1024LL) << 20);   // p32
+        budget -= cache;
+        const long long scratch = fits ? 0 : std::min(budget, (getenv("INK2_1C_SCRATCH_MB") ? atoll(getenv("INK2_1C_SCRATCH_MB")) : 256LL) << 20);   // p34
+        budget -= scratch;
+        std::vector<std::vector<double>> wt(NPHYS, std::vector<double>(NE, 1.0));   // p32: the plan's weights (1 without)
+        std::vector<std::vector<char>> res(NPHYS, std::vector<char>(NE, 0)), seen(NPHYS, std::vector<char>(NE, 0));
+        std::vector<std::pair<int, int>> order;
+        if (getenv("INK2_1C_PLAN")) {
+            FILE* f = std::fopen(getenv("INK2_1C_PLAN"), "r");
+            if (!f) throw std::runtime_error(std::string("INK2_1C_PLAN: ") + getenv("INK2_1C_PLAN"));
+            char line[256];
+            while (std::fgets(line, sizeof line, f)) {
+                int lp, le;
+                double w = 1.0;
+                const int k = std::sscanf(line, "%d %d %lf", &lp, &le, &w);
+                if (k >= 2 && lp >= 0 && lp < NPHYS && le >= 0 && le < NE && !seen[lp][le]) {
+                    seen[lp][le] = 1;
+                    order.push_back({lp, le});
+                    if (k == 3) wt[lp][le] = w;
+                }
+            }
+            std::fclose(f);
+        }
+        for (int e = 0; e < NE; ++e)
+            for (int lp = 0; lp < NPHYS; ++lp)
+                if (!seen[lp][e]) order.push_back({lp, e});
+        long long used = 0;
+        for (auto [lp, e] : order) {
+            const long long eb = (long long) expert_bytes(lp);
+            if (used + eb <= budget) {
+                res[lp][e] = 1;
+                used += eb;
+            }
+        }
+        for (int lp = 0; lp < NPHYS; ++lp) {
+            vt[K.c] = lp >= NPHYS - 4 ? "strokovnjaki-q8" : (lp >= LS && lp < LE ? "strokovnjaki-zanka" : "strokovnjaki-fp4");
+            experts(K, K.L[lp], lp, res[lp]);
+        }
+        // p32: the cache, split over the layers by the weight they leave in RAM, at most a slot a RAM expert
+        double mwt = 0;
+        std::vector<double> mw(NPHYS, 0.0);
+        for (int lp = 0; lp < NPHYS; ++lp)
+            for (int e = 0; e < NE; ++e)
+                if (!res[lp][e]) mw[lp] += wt[lp][e];
+        for (double x : mw) mwt += x;
+        size_t cache_bytes = 0;
+        std::string slots;
+        vt[K.c] = "predpomnilnik";
+        uint8_t* scr = scratch > 0 ? (uint8_t*) alloc(K, (size_t) scratch) : nullptr;   // p34
+        for (int lp = 0; lp < NPHYS; ++lp) {
+            LW& L = K.L[lp];
+            ECache& c = L.ec;
+            c.eb = expert_bytes(lp);
+            c.gb = (size_t) (L.h_dn[0] - L.h_gu[0]);
+            c.S = mwt > 0 ? std::min(NE - L.nres, (int) ((double) cache * mw[lp] / mwt / (double) c.eb)) : 0;
+            slots += " " + std::to_string(c.S);
+            if (L.nres == NE) continue;   // p34: a layer with RAM experts gets the assign kernel even with no slot (the scratch)
+            c.S = std::max(c.S, 0);
+            c.scr = scr;
+            c.scr_bytes = (size_t) std::max(0LL, scratch);
+            c.scr_list = (int*) alloc(K, (size_t) MAXT * TOPK * 4);
+            c.nscr = (int*) alloc(K, 4);
+            CK(cudaMemset(c.nscr, 0, 4));
+            c.mem = c.S ? (uint8_t*) alloc(K, (size_t) c.S * c.eb) : nullptr;
+            cache_bytes += (size_t) c.S * c.eb;
+            c.slot_of = (int*) alloc(K, NE * 4);
+            CK(cudaMemset(c.slot_of, 0xFF, NE * 4));
+            c.exp_of = (int*) alloc(K, (size_t) std::max(c.S, 1) * 4);
+            CK(cudaMemset(c.exp_of, 0xFF, (size_t) std::max(c.S, 1) * 4));
+            c.used = (unsigned*) alloc(K, (size_t) std::max(c.S, 1) * 4);
+            CK(cudaMemset(c.used, 0, (size_t) std::max(c.S, 1) * 4));
+            std::vector<char> h(NE);
+            for (int e = 0; e < NE; ++e) h[e] = !L.res[e];
+            char* dh = (char*) alloc(K, NE);
+            CK(cudaMemcpy(dh, h.data(), NE, cudaMemcpyHostToDevice));
+            c.host = dh;
+            void* hb = alloc(K, NE * sizeof(void*));
+            CK(cudaMemcpy(hb, L.h_gu.data(), NE * sizeof(void*), cudaMemcpyHostToDevice));
+            c.hb = (const uint8_t* const*) hb;
+            c.fill = (int*) alloc(K, (size_t) 2 * MAXT * TOPK * 4);
+            c.nfill = (int*) alloc(K, 4);
+        }
+        vt[K.c] = "ostalo";
+        const std::string who = NC == 1 ? "ink2_1c" : "ink2_v1: kartica " + std::to_string(K.c);   // p40
+        if (NC == 1 || cache_bytes)
+            std::fprintf(stderr, "%s: predpomnilnik strokovnjakov iz RAM-a %.2f GiB, reze po plasteh:%s\n", who.c_str(), cache_bytes / 1073741824.0,
+                         slots.c_str());
+        std::string per;
+        for (int lp = 0; lp < NPHYS; ++lp) per += " " + std::to_string(K.L[lp].nres);
+        std::fprintf(stderr, "%s: strokovnjaki v VRAM %.2f GiB, v RAM-u %.2f GiB (prosto je bilo %.2f GiB, rezerva %lld MiB); po plasteh:%s\n",
+                     who.c_str(), vram_exp_bytes[K.c] / 1073741824.0, host_exp_bytes[K.c] / 1073741824.0, fr / 1073741824.0, margin >> 20,
+                     per.c_str());
+    }
+    template <class F> void each_card(F f) {   // p30: f(c) for every card at once (one card: here)
+        if (NC == 1) {
+            f(0);
+            return;
+        }
+        std::thread t([&]() { f(NC - 1); });
+        f(0);
+        t.join();
     }
 
     void load_card(Card& K) {
@@ -497,9 +769,7 @@ struct Engine {
             L.ffn_norm = f32(K, b + "ffn_norm.weight");
             L.gate_inp = f32(K, b + "ffn_gate_inp.weight");
             L.probs_b = f32(K, b + "exp_probs_b.bias");
-            vt[c] = p >= NPHYS - 4 ? "strokovnjaki-q8" : (p >= LS && p < LE ? "strokovnjaki-zanka" : "strokovnjaki-fp4");
-            experts(K, L, p);
-            vt[c] = "plasti";
+            // p30: the experts come last (place_experts: the VRAM left decides which stay on the card)
             if (p >= LS && p < LE) {
                 L.msg_q = f32(K, b + "loop_msg_query.weight");
                 const char* nm[4] = {"q", "k", "v", "ffn"};
@@ -578,6 +848,7 @@ struct Engine {
         K.ao = dev(K, (size_t) MAXT * QC);
         K.nparts_max = (ctx + KC - 1) / KC + 1;
         K.part_n = (size_t) MAXT * NH_C * (kv8 ? 1 : 2) * K.nparts_max * (HD + 2);   // p4f: parts of 64 keys (p18: int8: half)
+        if (NC == 1) K.part_n = std::max(K.part_n, (size_t) (pfc / QS) * NH_C * QS * (QS + SWA - 1));   // p33: the reading path's S fits
         K.part = dev(K, K.part_n);
         K.ab = dev(K, TN);
         K.A = dev(K, TN);
@@ -604,14 +875,14 @@ struct Engine {
     }
 
     Engine(const std::string& path, int ctx_, const std::string& mtp = "") : g(path), ctx(ctx_) {
-        ds_ring = getenv("INK2_DS_RING") ? atoi(getenv("INK2_DS_RING")) != 0 : ctx > 65536;   // p14
+        ds_ring = getenv("INK2_DS_RING") ? atoi(getenv("INK2_DS_RING")) != 0 : (NC == 1 || ctx > 65536);   // p14 (p33: always with one card)
         kv8 = getenv("INK2_KV8") ? atoi(getenv("INK2_KV8")) != 0 : ctx > 262144;   // p18
         if (getenv("INK2_KV8_F16")) kv8_f16 = std::max(0, atoi(getenv("INK2_KV8_F16")));
         if (getenv("INK2_KV8_ROT")) kv8_rot = atoi(getenv("INK2_KV8_ROT")) != 0;
         if (getenv("INK2_KV8_PART")) kv8_part = atoi(getenv("INK2_KV8_PART")) & 3;
         if (kv8 && (stare || attn_old)) throw std::runtime_error("INK2_KV8 needs the p4f attention (no INK2_STARE / INK2_ATTN_OLD)");
         if (!getenv("INK2_PF_QSF")) {   // p14: the full layers' score matrix 3 x QSF x (ctx + QSF) within the budget
-            const double mb = getenv("INK2_PF_SMB") ? atof(getenv("INK2_PF_SMB")) : (ctx <= 98304 ? 1100.0 : ctx <= 196608 ? 450.0 : 220.0);
+            const double mb = getenv("INK2_PF_SMB") ? atof(getenv("INK2_PF_SMB")) : NC == 1 ? 100.0 : (ctx <= 98304 ? 1100.0 : ctx <= 196608 ? 450.0 : 220.0);   // p31
             while (pf_qs_full > 64 && 3.0 * pf_qs_full * (ctx + pf_qs_full) * 4 > mb * 1048576.0) pf_qs_full /= 2;
         }
         const std::string a = "inkling2_loop.";
@@ -641,9 +912,7 @@ struct Engine {
             cards[c].c = c;
         }
         const double t0 = now_s();
-        std::thread t1([&]() { load_card(cards[1]); });
-        load_card(cards[0]);
-        t1.join();
+        each_card([&](int c) { load_card(cards[c]); });
         for (int c = 0; c < NC; ++c) {
             for (int p = 0; p < 2; ++p) CK(cudaHostAlloc((void**) &X.buf[c][p], (size_t) MAXT * N * 4, cudaHostAllocMapped | cudaHostAllocPortable));
             unsigned* f = nullptr;
@@ -653,6 +922,7 @@ struct Engine {
         }
         CK(cudaHostAlloc((void**) &h_logits, (size_t) MAXT * NV * 4, cudaHostAllocPortable));
         if (getenv("INK2_PF_CHUNK")) pfc = std::max(MAXT, atoi(getenv("INK2_PF_CHUNK")));
+        if (pfc + SWA - 1 > RING) throw std::runtime_error("INK2_PF_CHUNK: a chunk and its window (RING - SWA + 1) do not fit the ring");   // p31
         if (getenv("INK2_PF_MIN")) pf_min = std::max(1, atoi(getenv("INK2_PF_MIN")));
         if (getenv("INK2_PF_OFF")) pf_min = 1 << 30;
         if (!ilv && (pf_deq || stare || rows2 || getenv("INK2_ROWS3")))
@@ -662,9 +932,7 @@ struct Engine {
         CK(cudaHostAlloc((void**) &h_tau, (size_t) std::max(MAXT, pfc) * 4, cudaHostAllocPortable));
         for (int c = 0; c < NC; ++c) pf_rec[c] = 0;
         if (pf_min < (1 << 30)) {
-            std::thread t1([&]() { alloc_pf(cards[1]); });
-            alloc_pf(cards[0]);
-            t1.join();
+            each_card([&](int c) { alloc_pf(cards[c]); });
         }
         if (!mtp.empty()) {   // p6
             dsg = new GgufMin(mtp);
@@ -680,19 +948,15 @@ struct Engine {
                 std::sort(ids.begin(), ids.end());
                 for (int c = 0; c < NC; ++c) dvmap[c].assign(ids.begin() + (size_t) c * n / NC, ids.begin() + (size_t) (c + 1) * n / NC);
             }
-            std::thread t1([&]() { ds_load(cards[1]); });
-            ds_load(cards[0]);
-            t1.join();
+            each_card([&](int c) { ds_load(cards[c]); });
             if (!g_draft_vocab.empty()) {
                 auto pick = [&](int c) {   // own threads: both() needs card 1's worker, which starts after the constructor
                     CK(cudaSetDevice(cards[c].dev));
                     vt[c] = "risar-slovar";
                     cards[c].D.dvout = q8_pick(cards[c], "output.weight", dvmap[c]);
                 };
-                std::thread tp(pick, 1);
-                pick(0);
-                tp.join();
-                std::fprintf(stderr, "ink2_v1: slovar risarja %zu + %zu zetonov (%s)\n", dvmap[0].size(), dvmap[1].size(), g_draft_vocab.c_str());
+                each_card(pick);
+                std::fprintf(stderr, "ink2_v1: slovar risarja %zu + %zu zetonov (%s)\n", dvmap[0].size(), NC > 1 ? dvmap[NC - 1].size() : 0, g_draft_vocab.c_str());
             }
             CK(cudaHostAlloc((void**) &h_amv_pinned, NC * 4, cudaHostAllocPortable));
             CK(cudaHostAlloc((void**) &h_ams_pinned, NC * 4, cudaHostAllocPortable));
@@ -700,21 +964,22 @@ struct Engine {
             CK(cudaHostAlloc((void**) &h_prev_pinned, NC * 4, cudaHostAllocPortable));
             ds_on = true;
         }
+        each_card([&](int c) { place_experts(cards[c]); });   // p30
         if (ck_on) {   // p21
-            const long long mb = getenv("INK2_CKPT_MB") ? atoll(getenv("INK2_CKPT_MB")) : 24576;
+            const long long mb = getenv("INK2_CKPT_MB") ? atoll(getenv("INK2_CKPT_MB")) : (NC == 1 ? 2048 : 24576);   // p30: one card, less RAM
             ck_max = (int) std::max(0LL, mb * 1048576 / (long long) (NC * ck_bytes()));
             std::fprintf(stderr, "ink2_v1: kontrolne tocke pogovora v RAM-u: do %d po %.0f MiB (obe kartici); odlozeni pogovori do %zu MiB\n",
                          ck_max, NC * ck_bytes() / 1048576.0, park_max >> 20);
         }
         if (getenv("INK2_VRAM_LOG"))
-            for (auto& [k, v] : vtag[0]) std::fprintf(stderr, "ink2_v1: VRAM %-20s %8.1f / %8.1f MiB\n", k.c_str(), v / 1048576.0, vtag[1][k] / 1048576.0);
+            for (auto& [k, v] : vtag[0]) std::fprintf(stderr, "ink2_v1: VRAM %-20s %8.1f / %8.1f MiB\n", k.c_str(), v / 1048576.0, vtag[NC - 1][k] / 1048576.0);
         if (kv8)
             std::fprintf(stderr, "ink2_v1: KV polnih plasti int8 od vrstice %d (rot %d, del %d), S %s, Kf/Vf/RB/PV %s\n", std::min(kv8_f16, ctx),
                          kv8_rot, kv8_part, cards[0].P.S == cards[0].part ? "v K.part" : "svoj", cards[0].P.shared ? "v Xg/EY/GU" : "svoji");
         std::fprintf(stderr, "ink2_v1: naloženo v %.1f s, VRAM %.2f / %.2f GiB, ctx %d, kos branja %d\n", now_s() - t0,
-                     cards[0].vram / 1073741824.0, cards[1].vram / 1073741824.0, ctx, pf_min < (1 << 30) ? pfc : 0);
-        w1 = std::thread([this]() {
-            CK(cudaSetDevice(cards[1].dev));
+                     cards[0].vram / 1073741824.0, cards[NC - 1].vram / 1073741824.0, ctx, pf_min < (1 << 30) ? pfc : 0);
+        if (NC > 1) w1 = std::thread([this]() {   // p30: one card needs no worker
+            CK(cudaSetDevice(cards[NC - 1].dev));
             int seen = 0;
             for (;;) {
                 while (go.load(std::memory_order_acquire) == seen) std::this_thread::yield();
@@ -731,6 +996,11 @@ struct Engine {
         if (w1.joinable()) w1.join();
     }
     void both(std::function<void(int)> f) {   // f(0) here and f(1) on card 1's thread, at the same time
+        if (NC == 1) {   // p30
+            CK(cudaSetDevice(cards[0].dev));
+            f(0);
+            return;
+        }
         job = f;
         const int d = done.load();
         go.fetch_add(1, std::memory_order_release);
@@ -814,10 +1084,11 @@ struct Engine {
     void rms(Card& K, const float* x, const float* w, float* y, int T, float e) { k_rms<<<T, 256, 0, K.st>>>(x, N, w, y, N, N, e); }
     void copy(Card& K, float* dst, const float* src, int T) { CK(cudaMemcpyAsync(dst, src, (size_t) T * N * 4, cudaMemcpyDeviceToDevice, K.st)); }
     void xch(Card& K, float* y, int n) {   // p4c: sequence numbers from the card's forward counter (dtok)
+        if (NC == 1) return;   // p30
         const unsigned i = K.xidx++;
-        const int par = i & 1, c = K.c;
+        const int par = i & 1, c = K.c, oc = NC > 1 ? 1 - c : c;
         k_xput2<<<1, 1024, 0, K.st>>>(y, n, X.buf[c][par], X.flag[c], K.dtok, i);
-        k_xget2<<<1, 1024, 0, K.st>>>(y, n, X.buf[1 - c][par], X.flag[1 - c], K.dtok, i, c);
+        k_xget2<<<1, 1024, 0, K.st>>>(y, n, X.buf[oc][par], X.flag[oc], K.dtok, i, c);
     }
     void control(Card& K, const LW& L, int j, const float* x, const float* m, float* out, int T) {
         if (fuse && !stare && !dumping) {   // p4e: the rms of x and m inside the down projection (p6b: T rows)
@@ -856,7 +1127,7 @@ struct Engine {
 
     void layer(Card& K, int p, int slot, bool loop, int T, int nparts) {
         const LW& L = K.L[p];
-        const int c = K.c, T_N = T * N;
+        const int c = K.c, T_N = T * N, oc = NC > 1 ? 1 - c : c;   // p30: oc = the other card (one card: itself, never read)
         const float* xin[3] = {K.cur, K.cur, K.cur};
         const int f2 = fuse && !stare && !dumping ? fuse2 : 0;   // p22: ink2_fuse.cuh's merged launches (a mask)
         if ((f2 & 1) && L.attn_rq && loop) {   // p22: the layer's depth mix and the loop messages' in one launch
@@ -1087,18 +1358,21 @@ struct Engine {
             const int np = big ? nparts : L.full ? 2 * nparts : std::min(2 * nparts, (SWA + MAXT + KC2 - 1) / KC2 + 1);
             // p18: the parts wholly below f0 (f16 rows) by the f16 kernel, as in the 256k profile; the int8 one only from there
             const int kcb = big ? 128 : KC2, npf = !q8k ? np : (q8.k || q8.v) ? std::min(np, q8.f0 / kcb) : np;
-            const dim3 g16(npf, NKV_C, T), g8(np - npf, NKV_C, T);
+            // p38: a window's rows side by side in grid x (they read the same keys at the same time: L2); INK2_ATT_ROWS=0 the old grid
+            static const bool att_rows = !getenv("INK2_ATT_ROWS") || atoi(getenv("INK2_ATT_ROWS")) != 0;
+            const int nt = att_rows ? T : 1;
+            const dim3 g16(npf * nt, NKV_C, T / nt), g8((np - npf) * nt, NKV_C, T / nt);
             if (npf > 0) {
                 if (big)
-                    k_attn_dec<128, false><<<g16, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, 0);
+                    k_attn_dec<128, false><<<g16, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, 0, nt);
                 else
-                    k_attn_dec<64, false><<<g16, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, 0);
+                    k_attn_dec<64, false><<<g16, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, 0, nt);
             }
             if (np > npf) {
                 if (big)
-                    k_attn_dec<128, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf);
+                    k_attn_dec<128, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf, nt);
                 else
-                    k_attn_dec<64, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf);
+                    k_attn_dec<64, true><<<g8, 128, 0, K.st>>>(K.q, K.r, L.rel_bias, K.sink, K.kc[slot], K.vc[slot], K.pos, !L.full, K.part, np, q8, npf, nt);
             }
             k_attn_comb<<<dim3(NH_C, T), 128, 0, K.st>>>(K.part, np, K.gate, K.ao, q8k && q8.rot);
         } else {
@@ -1114,11 +1388,11 @@ struct Engine {
             const unsigned xi = K.xidx++;
             const int par = xi & 1;
             if (T > 1)
-                k_xchg_convT<<<1, 1024, 0, K.st>>>(K.ab, nullptr, nullptr, X.buf[c][par], X.flag[c], X.buf[1 - c][par], X.flag[1 - c], K.dtok, xi,
+                k_xchg_convT<<<1, 1024, 0, K.st>>>(K.ab, nullptr, nullptr, X.buf[c][par], X.flag[c], X.buf[oc][par], X.flag[oc], K.dtok, xi,
                                                    c, K.sa[slot], L.a_pconv, 1.0f / sqrtf(NCONV + 1.0f), K.cur,
                                                    ip % BLK == 0 ? K.B[K.nb++] : nullptr, hk ? hk + (size_t) 2 * MAXT * KVC : nullptr, T, K.F2);
             else
-            k_xchg_conv<<<1, 1024, 0, K.st>>>(K.ab, nullptr, nullptr, X.buf[c][par], X.flag[c], X.buf[1 - c][par], X.flag[1 - c], K.dtok, xi, c,
+            k_xchg_conv<<<1, 1024, 0, K.st>>>(K.ab, nullptr, nullptr, X.buf[c][par], X.flag[c], X.buf[oc][par], X.flag[oc], K.dtok, xi, c,
                                               K.sa[slot], L.a_pconv, 1.0f / sqrtf(NCONV + 1.0f), K.cur,
                                               ip % BLK == 0 ? K.B[K.nb++] : nullptr);
         } else {
@@ -1153,6 +1427,18 @@ struct Engine {
             k_jobs<<<1, MAXT * TOPK, 0, K.st>>>(K.topi, K.jobs, T);
         }
         const int nj = T * TOPK;
+        if (L.ec.nfill) {   // p32: picked RAM experts into the layer's cache (the tables then point there; p34: or the scratch)
+            k_cache_assign<<<1, 32, 0, K.st>>>(L.ec, K.topi, nj, K.dtok, (const uint8_t**) L.gu_t, (const uint8_t**) L.dn_t);
+            k_cache_fill<<<dim3(32, nj), 256, 0, K.st>>>(L.ec);
+        }
+        if (g_rtrace) {   // p31: the writing path's routing, a line a slot: slot T e e e ...
+            CK(cudaStreamSynchronize(K.st));
+            int ti[MAXT * TOPK];
+            CK(cudaMemcpy(ti, K.topi, (size_t) nj * 4, cudaMemcpyDeviceToHost));
+            std::fprintf(g_rtrace, "%d %d", slot, T);
+            for (int i = 0; i < nj; ++i) std::fprintf(g_rtrace, " %d", ti[i]);
+            std::fprintf(g_rtrace, "\n");
+        }
         const int* perm = nullptr;
         if (T > 1 && fz && perm_on) {   // p11: a window's jobs in the kernels' block order by expert
             k_job_perm<<<1, MAXT * TOPK, 0, K.st>>>(K.jobs, nj, K.perm);
@@ -1167,10 +1453,11 @@ struct Engine {
                                                                   K.nmjobs, K.EY, N);
         } else if (L.fp4 && !ilv) {   // p4d: planar experts, gate_up by rows of 4 lanes, down by 288-block tiles
             k_fp4_rows7<36, 4, 256><<<dim3(2 * FF_C / 64, nj), 256, 0, K.st>>>(L.gu, (size_t) 2 * FF_C * (N / 64) * 36, 2 * FF_C, K.FN, N, 0,
-                                                                            L.gu_s, K.jobs, K.GU, 2 * FF_C, perm);
+                                                                            L.gu_s, K.jobs, K.GU, 2 * FF_C, perm, L.gu_t);
             k_situ<<<(nj * FF_C + 255) / 256, 256, 0, K.st>>>(K.GU, K.HH, nj, situ_b, situ_lb);
-            k_fp4_rows6<9, 32><<<dim3(N / 128, nj), 128, 0, K.st>>>(L.dn, (size_t) N * (FF_C / 64) * 36, N, K.HH, FF_C, 1, L.dn_s, K.jobs, K.EY,
-                                                                 N, perm);
+            constexpr int DNB = FF_C / 64, DNR = 288 / DNB;   // p30: down's tile (9 x 32 rows a warp with two cards, 18 x 16 with one)
+            k_fp4_rows6<DNB, DNR><<<dim3(N / (4 * DNR), nj), 128, 0, K.st>>>(L.dn, (size_t) N * (FF_C / 64) * 36, N, K.HH, FF_C, 1, L.dn_s, K.jobs,
+                                                                          K.EY, N, perm, L.dn_t);
         } else if (L.fp4 && !stare && !rows2) {   // p4b: contiguous tiles of 288 blocks a warp (INK2_FP4_ILV)
             k_fp4_rows3<36, 8><<<dim3(2 * FF_C / 32, nj), 128, 0, K.st>>>(L.gu, (size_t) 2 * FF_C * (N / 64) * 36, 2 * FF_C, K.FN, N, 0, L.gu_s,
                                                                        K.jobs, K.GU, 2 * FF_C);
@@ -1191,21 +1478,21 @@ struct Engine {
                                                                     L.dn_s, K.jobs, K.EY, N);
         } else {
             k_exp_rows<false><<<dim3(2 * FF_C / 8, nj), 256, N * 4, K.st>>>(L.gu, (size_t) 2 * FF_C * N, L.gu_d, (size_t) 2 * FF_C * (N / 32),
-                                                                          2 * FF_C, N, K.FN, N, 0, nullptr, K.jobs, K.GU, 2 * FF_C, perm);
+                                                                          2 * FF_C, N, K.FN, N, 0, nullptr, K.jobs, K.GU, 2 * FF_C, perm, L.gu_t);
             k_situ<<<(nj * FF_C + 255) / 256, 256, 0, K.st>>>(K.GU, K.HH, nj, situ_b, situ_lb);
             k_exp_rows<false><<<dim3(N / 8, nj), 256, FF_C * 4, K.st>>>(L.dn, (size_t) N * FF_C, L.dn_d, (size_t) N * (FF_C / 32), N, FF_C,
-                                                                     K.HH, FF_C, 1, nullptr, K.jobs, K.EY, N, perm);
+                                                                     K.HH, FF_C, 1, nullptr, K.jobs, K.EY, N, perm, L.dn_t);
         }
         if (fz) {   // p4e: the experts' weighted sum, the exchange, the post-convolution and the residual in one block
             const unsigned xi = K.xidx++;
             const int par = xi & 1;
             if (T > 1) k_moe_sum<<<(T_N + 255) / 256, 256, 0, K.st>>>(K.EY, K.topw, K.MO, T);   // p6e: the experts' sum in parallel
             if (T > 1)
-                k_xchg_convT<<<1, 1024, 0, K.st>>>(K.MO, nullptr, nullptr, X.buf[c][par], X.flag[c], X.buf[1 - c][par], X.flag[1 - c], K.dtok, xi,
+                k_xchg_convT<<<1, 1024, 0, K.st>>>(K.MO, nullptr, nullptr, X.buf[c][par], X.flag[c], X.buf[oc][par], X.flag[oc], K.dtok, xi,
                                                    c, K.sf[slot], L.f_pconv, 1.0f / sqrtf(NCONV + 1.0f), K.cur, nullptr,
                                                    hk ? hk + (size_t) 2 * MAXT * KVC + (size_t) MAXT * N : nullptr, T, K.F2);
             else
-            k_xchg_conv<<<1, 1024, 0, K.st>>>(nullptr, K.EY, K.topw, X.buf[c][par], X.flag[c], X.buf[1 - c][par], X.flag[1 - c], K.dtok, xi, c,
+            k_xchg_conv<<<1, 1024, 0, K.st>>>(nullptr, K.EY, K.topw, X.buf[c][par], X.flag[c], X.buf[oc][par], X.flag[oc], K.dtok, xi, c,
                                               K.sf[slot], L.f_pconv, 1.0f / sqrtf(NCONV + 1.0f), K.cur, nullptr);
         } else {
             k_moe_sum<<<(T_N + 255) / 256, 256, 0, K.st>>>(K.EY, K.topw, K.MO, T);
@@ -1417,12 +1704,13 @@ struct Engine {
             for (int c = 0; c < NC; ++c) h_prev_pinned[c] = prev;
             both([&](int c) { ds_step(c, i, prev); });
             const int t0 = dvmap[0].empty() ? h_ami_pinned[0] : dvmap[0][h_ami_pinned[0]];   // p13: card 0's ids are the smaller
-            const int t1 = dvmap[1].empty() ? h_ami_pinned[1] + NV_C : dvmap[1][h_ami_pinned[1]];
-            prev = h_amv_pinned[0] >= h_amv_pinned[1] ? t0 : t1;   // the first maximum: card 0's tokens come first
+            const int c1 = NC - 1;   // p30: one card is also the last card
+            const int t1 = dvmap[c1].empty() ? h_ami_pinned[c1] + c1 * NV_C : dvmap[c1][h_ami_pinned[c1]];
+            prev = h_amv_pinned[0] >= h_amv_pinned[c1] ? t0 : t1;   // the first maximum: card 0's tokens come first
             if (ds_pmin > 0.0f) {   // p12: p(top) = 1 / sum over both cards (each card's sum is relative to its own max)
-                const float m0 = softcap * tanhf(h_amv_pinned[0] / softcap), m1 = softcap * tanhf(h_amv_pinned[1] / softcap);
+                const float m0 = softcap * tanhf(h_amv_pinned[0] / softcap), m1 = softcap * tanhf(h_amv_pinned[c1] / softcap);
                 const float m = std::max(m0, m1);
-                const float tot = h_ams_pinned[0] * expf(m0 - m) + h_ams_pinned[1] * expf(m1 - m);
+                const float tot = h_ams_pinned[0] * expf(m0 - m) + (NC > 1 ? h_ams_pinned[c1] * expf(m1 - m) : 0.0f);
                 if (1.0f / tot < ds_pmin) break;
             }
             d.push_back(prev);
@@ -1431,6 +1719,53 @@ struct Engine {
     }
 
     // ------------------------------------------------------------------------------------------------ p3: the reading path
+    // p41: a card's NUMA node (-1 unknown) from its PCI address; NodeBind keeps the calling thread on a node's CPUs while it
+    // lives (page-locked pages land on the node of the thread that faults them in) and does nothing for -1 or a node it cannot read
+    static int card_node(int dev) {
+        char bus[32] = {};
+        if (cudaDeviceGetPCIBusId(bus, sizeof bus, dev) != cudaSuccess) return -1;
+        for (char* q = bus; *q; ++q) *q = (char) std::tolower((unsigned char) *q);
+        FILE* f = std::fopen((std::string("/sys/bus/pci/devices/") + bus + "/numa_node").c_str(), "r");
+        if (!f) return -1;
+        int n = -1;
+        if (std::fscanf(f, "%d", &n) != 1) n = -1;
+        std::fclose(f);
+        return n;
+    }
+    struct NodeBind {
+        cpu_set_t old;
+        bool on = false;
+        explicit NodeBind(int node) {
+            if (node < 0) return;
+            FILE* f = std::fopen(("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist").c_str(), "r");
+            if (!f) return;
+            char line[512] = {};
+            const bool got = std::fgets(line, sizeof line, f) != nullptr;
+            std::fclose(f);
+            if (!got) return;
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            int ncpu = 0;
+            for (char* tok = std::strtok(line, ",\n"); tok; tok = std::strtok(nullptr, ",\n")) {
+                int a = 0, b = 0;
+                const int k = std::sscanf(tok, "%d-%d", &a, &b);
+                if (k < 1) continue;
+                if (k == 1) b = a;
+                for (int c = a; c <= b && c < CPU_SETSIZE; ++c, ++ncpu) CPU_SET(c, &set);
+            }
+            if (!ncpu || pthread_getaffinity_np(pthread_self(), sizeof old, &old)) return;
+            on = pthread_setaffinity_np(pthread_self(), sizeof set, &set) == 0;
+        }
+        ~NodeBind() {
+            if (on) pthread_setaffinity_np(pthread_self(), sizeof old, &old);
+        }
+    };
+    static int page_node(const void* ptr) {   // p41: the node a page is on (-1 unknown)
+        void* pg = (void*) ptr;
+        int st = -1;
+        if (syscall(SYS_move_pages, 0, 1UL, &pg, nullptr, &st, 0) != 0) return -1;
+        return st;
+    }
     void alloc_pf(Card& K) {
         CK(cudaSetDevice(K.dev));
         vt[K.c] = "branje";
@@ -1480,19 +1815,25 @@ struct Engine {
         P.Xg = dev(K, CN * TOPK);
         P.GU = dev(K, C * TOPK * 2 * FF_C);
         P.HH = dev(K, C * TOPK * FF_C);
-        P.EY = dev(K, CN * TOPK);
+        P.EY = dev(K, NC == 1 ? std::max(CN * TOPK, C * NH_C * (EXT + 1)) : CN * TOPK);   // p33: R.B fits with one card
         P.Wf = dev(K, (size_t) K.L[5].cat.rows * N);   // a full layer's concatenated matrix is the largest
         P.Wo = dev(K, (size_t) N * QC);
-        P.Egu = dev(K, (size_t) EB * 2 * FF_C * N);
-        P.Edn = dev(K, (size_t) EB * N * FF_C);
+        if (pf_deq || !q8g || catm) {   // p30: only the paths that use them (510 MB with one card)
+            P.Egu = dev(K, (size_t) EB * 2 * FF_C * N);
+            P.Edn = dev(K, (size_t) EB * N * FF_C);
+        }
         const size_t kfr = (size_t) std::max(std::min(ctx, KFB), (int) C + SWA);   // p3f: a window chunk reads from p0 - (SWA - 1); p14: KFB
         // p18 (int8 mode): the attention's scratch (K / V rows in f32, R.B, the P.V pieces) lives in the MoE's (Xg, EY, GU): a
         // layer's attention and its experts run one after the other on the card's one stream, and every one of these is written
         // before it is read in its phase. ~274 MiB a card at 512k for the f16 rows below kv8_f16
         const bool share = (kv8 || share_on) && 2 * kfr * KVC <= CN * TOPK && (size_t) C * NH_C * (EXT + 1) <= CN * TOPK &&   // p19c: every mode
                            (size_t) 3 * ((ctx + PVK - 1) / PVK) * pf_qs_full * HD <= C * TOPK * 2 * FF_C;
-        P.Kf = share ? P.Xg : dev(K, kfr * KVC);
-        P.Vf = share ? P.Xg + kfr * KVC : dev(K, kfr * KVC);
+        // p33: one card shares part by part
+        const bool sh_kv = share || (NC == 1 && share_on && 2 * kfr * KVC <= CN * TOPK);
+        const bool sh_rb = share || (NC == 1 && share_on);
+        const bool sh_pv = share || (NC == 1 && share_on && (size_t) 3 * ((ctx + PVK - 1) / PVK) * pf_qs_full * HD <= C * TOPK * 2 * FF_C);
+        P.Kf = sh_kv ? P.Xg : dev(K, kfr * KVC);
+        P.Vf = sh_kv ? P.Xg + kfr * KVC : dev(K, kfr * KVC);
         const size_t s_full = (size_t) 3 * pf_qs_full * (ctx + pf_qs_full), s_win = (size_t) (C / QS) * NH_C * QS * (QS + SWA - 1),
                      s_tail = (size_t) 3 * QS * (QS + SWA);
         P.S_n = std::max(s_full, std::max(s_win, s_tail));
@@ -1503,9 +1844,9 @@ struct Engine {
             P.S = dev(K, P.S_n);
         }
         P.pv_nsb = (ctx + PVK - 1) / PVK;   // p14b
-        P.PV = share ? P.GU : dev(K, (size_t) 3 * P.pv_nsb * pf_qs_full * HD);
-        pv_cap = share ? (size_t) C * TOPK * 2 * FF_C : (size_t) 3 * P.pv_nsb * pf_qs_full * HD;   // p19c
-        P.RB = share ? P.EY : dev(K, C * NH_C * (EXT + 1));
+        P.PV = sh_pv ? P.GU : dev(K, (size_t) 3 * P.pv_nsb * pf_qs_full * HD);
+        pv_cap = sh_pv ? (size_t) C * TOPK * 2 * FF_C : (size_t) 3 * P.pv_nsb * pf_qs_full * HD;   // p19c
+        P.RB = sh_rb ? P.EY : dev(K, C * NH_C * (EXT + 1));
         P.shared = share;
         {   // p3f: query block b, head h = g * 3 + a: entry b * NH_C + h; S of a window block QS x (QS + SWA - 1)
             const int nb = (int) C / QS, nk = QS + SWA - 1, n = nb * NH_C;
@@ -1537,15 +1878,34 @@ struct Engine {
         P.slotrow = (int*) alloc(K, C * TOPK * 4);
         P.rowtok = (int*) alloc(K, C * TOPK * 4);
         P.rowexp = (int*) alloc(K, C * TOPK * 4);
-        for (int i = 0; i < 2; ++i) {
-            CK(cudaHostAlloc((void**) &P.hbuf[i], CN * 4, cudaHostAllocPortable));
-            CK(cudaEventCreateWithFlags(&P.ev[i], cudaEventDisableTiming));
-            for (int j = 0; j < PFB::XS_MAX; ++j) CK(cudaEventCreateWithFlags(&P.evd[i][j], cudaEventDisableTiming));
+        {
+            const int numa = getenv("INK2_NUMA") ? atoi(getenv("INK2_NUMA")) : 1;   // p41: 1 the writer's node, 2 the reader's, 0 off
+            const int want = numa == 0 ? -1 : card_node(numa == 2 && NC == 2 ? cards[NC - 1 - K.c].dev : K.dev);
+            NodeBind nb(want);
+            for (int i = 0; i < 2; ++i) {
+                CK(cudaHostAlloc((void**) &P.hbuf[i], CN * 4, cudaHostAllocPortable));
+                CK(cudaEventCreateWithFlags(&P.ev[i], cudaEventDisableTiming));
+                for (int j = 0; j < PFB::XS_MAX; ++j) CK(cudaEventCreateWithFlags(&P.evd[i][j], cudaEventDisableTiming));
+            }
+            if (NC == 2)
+                std::fprintf(stderr, "ink2_v1: kartica %d (vozlisce %d): medpomnilnika izmenjave branja na vozliscu %d %d (INK2_NUMA %d)\n", K.c,
+                             card_node(K.dev), page_node(P.hbuf[0]), page_node(P.hbuf[1]), numa);
         }
         for (int j = 0; j < PFB::XS_MAX; ++j) CK(cudaEventCreateWithFlags(&P.evp[j], cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&P.evh, cudaEventDisableTiming));
         CK(cudaStreamCreateWithFlags(&P.sd, cudaStreamNonBlocking));   // p19d
         CK(cudaStreamCreateWithFlags(&P.sh, cudaStreamNonBlocking));
+        if (NC == 1) {   // p31: the RAM experts' staging (both buffers at least one Q8 gate_up half)
+            P.stg_bytes = (size_t) (getenv("INK2_1C_STAGE_MB") ? atoll(getenv("INK2_1C_STAGE_MB")) : 64LL) << 20;
+            P.stg_bytes = std::max(P.stg_bytes, (size_t) 2 * FF_C * N + (size_t) 2 * FF_C * (N / 32) * 2);
+            for (int i = 0; i < 2; ++i) {
+                P.stg[i] = (uint8_t*) alloc(K, P.stg_bytes);
+                CK(cudaEventCreateWithFlags(&P.evS[i], cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&P.evU[i], cudaEventDisableTiming));
+            }
+            P.d_stab = (const uint8_t**) alloc(K, (size_t) 2 * NE * NE * sizeof(void*));
+            CK(cudaHostAlloc((void**) &P.h_stab, (size_t) 2 * NE * NE * sizeof(void*), cudaHostAllocPortable));
+        }
         P.h_cnt.resize(NE);
         P.h_offs.resize(NE + 1);
     }
@@ -1559,6 +1919,7 @@ struct Engine {
         k_q8s_f32<<<(unsigned) ((n16 + 255) / 256), 256, 0, K.st>>>(m.q, (const __half*) m.d, m.rows, m.cols, out);
     }
     void xch_pf(Card& K, float* y, size_t n) {   // through page-locked RAM by the copy engines; host-side order by pf_rec
+        if (NC == 1) return;   // p30
         PFB& P = K.P;
         const int c = K.c;
         const unsigned sq = P.seq++;
@@ -1578,6 +1939,10 @@ struct Engine {
     // exchange's first slice (so tmp is free: K.st has added the last exchange by then); the other card overwrites the RAM buffer
     // of this parity only after it has added what it read from it (its K.st waits for its sh), as with xch_pf
     template <class F> void xch_pf2(Card& K, float* y, int C, F make) {
+        if (NC == 1) {   // p30: nothing to exchange
+            make(0, C);
+            return;
+        }
         PFB& P = K.P;
         const int c = K.c, ns = xsplit;
         const unsigned sq = P.seq++;
@@ -1755,12 +2120,18 @@ struct Engine {
         k_exp_fill<<<(n + 255) / 256, 256, 0, K.st>>>(P.topi, n, P.offs, P.cursor, P.slotrow, P.rowtok, P.rowexp);
         k_gather_rows<<<(unsigned) (((size_t) n * (N / 4) + 255) / 256), 256, 0, K.st>>>(P.FN, P.rowtok, n, P.Xg);
         const size_t gu_rows = 2 * FF_C, gu_e = gu_rows * N, dn_e = (size_t) N * FF_C;
+        if (L.nres < NE && P.stg[0] && !pf_deq && gemm5 && !ilv && !gemm2 && (L.fp4 || q8g)) {   // p31
+            experts_pf_staged(K, L, C);
+            if (comb) moe_comb(K, L, 0, C);
+            return;
+        }
         if (L.fp4 && !pf_deq && gemm5 && !ilv && !gemm2) {   // p19b: the tile list from the counts the host has already
             const int nt = fp4_tiles(P.h_offs.data(), P.h_tiles.data());
             CK(cudaMemcpyAsync(P.tiles, P.h_tiles.data(), (size_t) nt * sizeof(FTile), cudaMemcpyHostToDevice, K.st));
-            k_fp4_gemm5<<<dim3(gu_rows / F4M, nt), 256, 0, K.st>>>(L.gu, gu_rows * (N / 64) * 36, (int) gu_rows, N, P.tiles, P.Xg, N, P.GU, (int) gu_rows, tile_s);
+            k_fp4_gemm5<<<dim3(gu_rows / F4M, nt), 256, 0, K.st>>>(L.gu, gu_rows * (N / 64) * 36, (int) gu_rows, N, P.tiles, P.Xg, N, P.GU, (int) gu_rows, tile_s,
+                                                                    L.gu_t);
             k_situ_s<<<(n * FF_C + 255) / 256, 256, 0, K.st>>>(P.GU, P.HH, n, P.rowexp, L.gu_s, situ_b, situ_lb);
-            k_fp4_gemm5<<<dim3(N / F4M, nt), 256, 0, K.st>>>(L.dn, (size_t) N * (FF_C / 64) * 36, N, FF_C, P.tiles, P.HH, FF_C, P.EY, N, tile_s);
+            k_fp4_gemm5<<<dim3(N / F4M, nt), 256, 0, K.st>>>(L.dn, (size_t) N * (FF_C / 64) * 36, N, FF_C, P.tiles, P.HH, FF_C, P.EY, N, tile_s, L.dn_t);
             if (comb) moe_comb(K, L, 0, C);
             return;
         }
@@ -1768,10 +2139,10 @@ struct Engine {
             const int nt = fp4_tiles(P.h_offs.data(), P.h_tiles.data());
             CK(cudaMemcpyAsync(P.tiles, P.h_tiles.data(), (size_t) nt * sizeof(FTile), cudaMemcpyHostToDevice, K.st));
             k_q8_gemm5<<<dim3(gu_rows / F4M, nt), 256, 0, K.st>>>((const int8_t*) L.gu, L.gu_d, gu_e, gu_rows * (N / 32), N, P.tiles, P.Xg, N,
-                                                                   P.GU, (int) gu_rows, tile_s);
+                                                                   P.GU, (int) gu_rows, tile_s, L.gu_t);
             k_situ_s<<<(n * FF_C + 255) / 256, 256, 0, K.st>>>(P.GU, P.HH, n, P.rowexp, nullptr, situ_b, situ_lb);
             k_q8_gemm5<<<dim3(N / F4M, nt), 256, 0, K.st>>>((const int8_t*) L.dn, L.dn_d, dn_e, (size_t) N * (FF_C / 32), FF_C, P.tiles, P.HH,
-                                                             FF_C, P.EY, N, tile_s);
+                                                             FF_C, P.EY, N, tile_s, L.dn_t);
             if (comb) moe_comb(K, L, 0, C);
             return;
         }
@@ -1814,6 +2185,88 @@ struct Engine {
                 k_situ_s<<<(n * FF_C + 255) / 256, 256, 0, K.st>>>(P.GU, P.HH, n, P.rowexp, L.fp4 ? L.gu_s : nullptr, situ_b, situ_lb);
         }
         if (comb) moe_comb(K, L, 0, C);
+    }
+    // p31: experts_pf for a layer with experts in RAM (the counts, offsets, gathered rows and rowexp are made). VRAM experts' tiles
+    // first, then the RAM experts with rows in groups of G through the staging buffers: gate_up halves, SITU over all rows, then the
+    // down halves; group g in buffer g & 1, copied on sd while the group before it is multiplied (evS: filled, evU: free again)
+    void experts_pf_staged(Card& K, const LW& L, int C) {
+        PFB& P = K.P;
+        const int n = C * TOPK;
+        const size_t gu_rows = 2 * FF_C, gu_e = gu_rows * N, dn_e = (size_t) N * FF_C;
+        const size_t gb = L.fp4 ? gu_rows * (N / 64) * 36 : gu_e + gu_rows * (N / 32) * 2;
+        const size_t db = L.fp4 ? (size_t) N * (FF_C / 64) * 36 : dn_e + (size_t) N * (FF_C / 32) * 2;
+        std::vector<char> inv(NE, 0);
+        std::vector<int> ram;
+        for (int e = 0; e < NE; ++e)
+            if (P.h_cnt[e]) {
+                if (L.res[e]) inv[e] = 1;
+                else ram.push_back(e);
+            }
+        const int G = std::max(1, (int) (P.stg_bytes / gb)), ng = ((int) ram.size() + G - 1) / G;
+        int nt = 0;
+        auto tiles_of = [&](auto pick) {   // fp4_tiles() for the experts pick(e) chooses: 64-token tiles, then 32s, then 16s
+            const int s = nt;
+            for (int pass = 0; pass < 3; ++pass)
+                for (int e = 0; e < NE; ++e) {
+                    if (!pick(e)) continue;
+                    const int cnt = P.h_offs[e + 1] - P.h_offs[e];
+                    for (int q = 0; q < cnt;) {
+                        const int left = cnt - q, tn = left > 32 ? 64 : left > 16 ? 32 : 16;
+                        if (tn == (pass == 0 ? 64 : pass == 1 ? 32 : 16)) P.h_tiles[nt++] = FTile{e, P.h_offs[e] + q, std::min(tn, left)};
+                        q += tn;
+                    }
+                }
+            return s;
+        };
+        std::vector<int> ts(ng + 2);
+        ts[0] = tiles_of([&](int e) { return inv[e] != 0; });
+        for (int g = 0; g < ng; ++g) {
+            std::vector<char> m(NE, 0);
+            for (int i = g * G; i < std::min((g + 1) * G, (int) ram.size()); ++i) m[ram[i]] = 1;
+            ts[g + 1] = tiles_of([&](int e) { return m[e] != 0; });
+        }
+        ts[ng + 1] = nt;
+        for (int g = 0; g < ng; ++g)   // group g's tables: gate_up at [2g], down at [2g + 1]
+            for (int i = g * G; i < std::min((g + 1) * G, (int) ram.size()); ++i) {
+                const int e = ram[i], j = i - g * G;
+                P.h_stab[(size_t) (2 * g) * NE + e] = P.stg[g & 1] + (size_t) j * gb;
+                P.h_stab[(size_t) (2 * g + 1) * NE + e] = P.stg[g & 1] + (size_t) j * db;
+            }
+        CK(cudaMemcpyAsync(P.tiles, P.h_tiles.data(), (size_t) nt * sizeof(FTile), cudaMemcpyHostToDevice, K.st));
+        if (ng) CK(cudaMemcpyAsync(P.d_stab, P.h_stab, (size_t) 2 * ng * NE * sizeof(void*), cudaMemcpyHostToDevice, K.st));
+        auto stage = [&](int g, bool down) {
+            const int b = g & 1;
+            CK(cudaStreamWaitEvent(P.sd, P.evU[b], 0));
+            for (int i = g * G; i < std::min((g + 1) * G, (int) ram.size()); ++i) {
+                const int e = ram[i], j = i - g * G;
+                CK(cudaMemcpyAsync(P.stg[b] + (size_t) j * (down ? db : gb), down ? L.h_dn[e] : L.h_gu[e], down ? db : gb, cudaMemcpyDefault, P.sd));
+            }
+            CK(cudaEventRecord(P.evS[b], P.sd));
+        };
+        auto gemm = [&](int t0, int t1, bool down, const uint8_t* const* ET) {
+            if (t1 <= t0) return;
+            const dim3 grid(down ? N / F4M : (unsigned) (gu_rows / F4M), t1 - t0);
+            if (L.fp4) {
+                if (down) k_fp4_gemm5<<<grid, 256, 0, K.st>>>(nullptr, 0, N, FF_C, P.tiles + t0, P.HH, FF_C, P.EY, N, tile_s, ET);
+                else k_fp4_gemm5<<<grid, 256, 0, K.st>>>(nullptr, 0, (int) gu_rows, N, P.tiles + t0, P.Xg, N, P.GU, (int) gu_rows, tile_s, ET);
+            } else {
+                if (down) k_q8_gemm5<<<grid, 256, 0, K.st>>>(nullptr, nullptr, dn_e, 0, FF_C, P.tiles + t0, P.HH, FF_C, P.EY, N, tile_s, ET);
+                else k_q8_gemm5<<<grid, 256, 0, K.st>>>(nullptr, nullptr, gu_e, 0, N, P.tiles + t0, P.Xg, N, P.GU, (int) gu_rows, tile_s, ET);
+            }
+        };
+        for (int ph = 0; ph < 2; ++ph) {
+            const bool down = ph == 1;
+            for (int g = 0; g < std::min(ng, 2); ++g) stage(g, down);
+            gemm(ts[0], ts[1], down, down ? L.dn_t : L.gu_t);
+            for (int g = 0; g < ng; ++g) {
+                const int b = g & 1;
+                CK(cudaStreamWaitEvent(K.st, P.evS[b], 0));
+                gemm(ts[g + 1], ts[g + 2], down, (const uint8_t* const*) P.d_stab + (size_t) (2 * g + ph) * NE);
+                CK(cudaEventRecord(P.evU[b], K.st));
+                if (g + 2 < ng) stage(g + 2, down);
+            }
+            if (!down) k_situ_s<<<(n * FF_C + 255) / 256, 256, 0, K.st>>>(P.GU, P.HH, n, P.rowexp, L.fp4 ? L.gu_s : nullptr, situ_b, situ_lb);
+        }
     }
     void layer_pf(Card& K, int p, int slot, bool loop, int p0, int C) {
         const LW& L = K.L[p];
@@ -1970,7 +2423,7 @@ struct Engine {
             mix(K, S, K.out_rq, 1, P.F, 1);
             rms(K, P.F, K.out_norm, P.hx1, 1, eps);
             gemv8_t1(K, K.out, P.hx1, segs({{NV_C, K.logits}}));
-            k_softcap<<<(NV_C + 255) / 256, 256, 0, K.st>>>(K.logits, NV_C, softcap);
+            k_softcap_g<<<(NV_C + 255) / 256, 256, 0, K.st>>>(K.logits, NV_C, 1, softcap, s_invT, s_seed, p0 + C, c * NV_C);   // p36
             CK(cudaMemcpyAsync(h_logits + (size_t) c * NV_C, K.logits, (size_t) NV_C * 4, cudaMemcpyDeviceToHost, K.st));
         }
         CK(cudaStreamSynchronize(K.st));
@@ -2034,7 +2487,7 @@ struct Engine {
         if (nr == 1 && !stare) gemv8_t1(K, K.out, K.hx + (size_t) r0 * N, segs({{NV_C, K.logits}}));
         else if (fuse && !stare && !dumping) gemv8_t1T(K, K.out, K.hx + (size_t) r0 * N, N, segs1(NV_C, K.logits), nr);   // p6c
         else gemv8(K, K.out, K.hx + (size_t) r0 * N, N, K.logits, NV_C, nr);
-        k_softcap<<<(nr * NV_C + 255) / 256, 256, 0, K.st>>>(K.logits, nr * NV_C, softcap);
+        k_softcap_g<<<(nr * NV_C + 255) / 256, 256, 0, K.st>>>(K.logits, NV_C, nr, softcap, s_invT, s_seed, n_past + r0 + 1, c * NV_C);   // p36
         CK(cudaMemcpy2DAsync(h_logits + (size_t) c * NV_C, (size_t) NV * 4, K.logits, (size_t) NV_C * 4, (size_t) NV_C * 4, nr,
                              cudaMemcpyDeviceToHost, K.st));
     }
@@ -2729,6 +3182,11 @@ static int serve(Engine& e, const std::string& path, int eos) {
                 while (!e.parks.empty()) e.park_drop(e.parks.size() - 1);
             }
             g_lhall = json_int(req, "lhall", 0) != 0;
+            {   // p36: sampling (temp_milli 0 = greedy)
+                const long long tm = json_int(req, "temp_milli", 0);
+                e.s_invT = tm > 0 ? 1000.0f / (float) tm : 0.0f;
+                e.s_seed = (unsigned long long) json_int(req, "seed", 0);
+            }
             std::vector<int> hints;   // p21: where the prompt's messages start
             for (long long x : json_ints(req, "ckpt")) hints.push_back((int) x);
             Gen g = generate(e, tok, max, stop, json_int(req, "noeos", 0) ? -1 : eos, (int) json_int(req, "lookup", 0),
@@ -2760,6 +3218,7 @@ static int serve(Engine& e, const std::string& path, int eos) {
 int main(int argc, char** argv) {
     using namespace ink2;
     setenv("CUDA_MODULE_LOADING", "EAGER", 1);
+    if (getenv("INK2_RTRACE")) g_rtrace = std::fopen(getenv("INK2_RTRACE"), "a");   // p31
     signal(SIGPIPE, SIG_IGN);   // p15: a client that left makes write() fail instead of ending the server   // lazy loading can sync a context on a kernel's first launch (a cross-card wait deadlocks)
     std::string model, tokens, dump, sock, logits_out, mtp;   // --mtp F: the DSpark drafter (dspark-Inkling-2-Mini-Q8_0.gguf)   // --logits F: the last row's logits after the prompt (logiti.bin format)
     int gen = 0, ctx = 32768;

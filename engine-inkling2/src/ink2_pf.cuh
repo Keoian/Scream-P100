@@ -523,7 +523,8 @@ __device__ __forceinline__ void fp4_tile_s(const uint8_t* __restrict__ pcodes, c
 // big expert's tiles run side by side instead of one after the other in one block (2048 tokens: up to ~1,500 rows on one expert)
 struct FTile { int e, row0, nk; };
 __global__ void __launch_bounds__(256) k_fp4_gemm5(const uint8_t* __restrict__ W, size_t estride, int rows, int cols, const FTile* tiles,
-                                                   const float* x, int ldx, float* y, int ldy, int small = 1) {   // p24: small = tiles of 8 and 4 tokens
+                                                   const float* x, int ldx, float* y, int ldy, int small = 1,   // p24: small = tiles of 8 and 4 tokens
+                                                   const uint8_t* const* ET = nullptr) {   // p30: expert bases
     __shared__ __align__(16) float ws[F4K][F4M];
     __shared__ __align__(16) float xs[F4K * F4N];
     __shared__ float tab[16];
@@ -531,8 +532,9 @@ __global__ void __launch_bounds__(256) k_fp4_gemm5(const uint8_t* __restrict__ W
     if (threadIdx.x < 16) tab[threadIdx.x] = c_fp4[threadIdx.x];
     const int r0 = blockIdx.x * F4M, dr = threadIdx.x & (F4M - 1);
     const int nblk = cols / 64, nsteps = cols / F4K;
-    const uint8_t* pcodes = W + (size_t) t.e * estride + (size_t) (r0 + dr) * nblk * 32;
-    const uint8_t* pscales = W + (size_t) t.e * estride + (size_t) rows * nblk * 32 + (size_t) (r0 + dr) * nblk * 4;
+    const uint8_t* EB = ET ? ET[t.e] : W + (size_t) t.e * estride;   // p30
+    const uint8_t* pcodes = EB + (size_t) (r0 + dr) * nblk * 32;
+    const uint8_t* pscales = EB + (size_t) rows * nblk * 32 + (size_t) (r0 + dr) * nblk * 4;
     if (t.nk > 32)
         fp4_tile<64>(pcodes, pscales, nsteps, tab, ws, xs, x, ldx, t.row0, t.nk, y, ldy, r0);
     else if (t.nk > 16)
@@ -699,13 +701,15 @@ __device__ __forceinline__ void q8_tile_s(const int8_t* __restrict__ qrow, const
 }
 // Q: int8 [NE][rows][cols], D: half [NE][rows][cols / 32] (qstride / dstride an expert); rows a multiple of F4M, cols of F4K
 __global__ void __launch_bounds__(256) k_q8_gemm5(const int8_t* __restrict__ Q, const __half* __restrict__ D, size_t qstride, size_t dstride,
-                                                  int cols, const FTile* tiles, const float* x, int ldx, float* y, int ldy, int small = 1) {
+                                                  int cols, const FTile* tiles, const float* x, int ldx, float* y, int ldy, int small = 1,
+                                                  const uint8_t* const* ET = nullptr) {   // p30: expert bases (int8 rows, then the scales at + qstride)
     __shared__ __align__(16) float ws[F4K][F4M];
     __shared__ __align__(16) float xs[F4K * F4N];
     const FTile t = tiles[blockIdx.y];
     const int r0 = blockIdx.x * F4M, dr = threadIdx.x & (F4M - 1), nsteps = cols / F4K;
-    const int8_t* qrow = Q + (size_t) t.e * qstride + (size_t) (r0 + dr) * cols;
-    const unsigned short* drow = (const unsigned short*) D + (size_t) t.e * dstride + (size_t) (r0 + dr) * (cols / 32);
+    const int8_t* qrow = (ET ? (const int8_t*) ET[t.e] : Q + (size_t) t.e * qstride) + (size_t) (r0 + dr) * cols;
+    const unsigned short* drow = (ET ? (const unsigned short*) (ET[t.e] + qstride) : (const unsigned short*) D + (size_t) t.e * dstride)
+                                 + (size_t) (r0 + dr) * (cols / 32);
     if (t.nk > 32)
         q8_tile<64>(qrow, drow, nsteps, ws, xs, x, ldx, t.row0, t.nk, y, ldy, r0);
     else if (t.nk > 16)
