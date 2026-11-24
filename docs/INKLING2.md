@@ -17,7 +17,11 @@ them, and code in a prompt is tokenized as written. **Short pieces 18-22 % faste
 `INK2_LOSSY=1`. **Several chats at once** (24 Nov, two test builds, [below](#several-conversations-at-once-ink2_tpb-ink2_pp-24-nov)):
 `INK2_MULTI=tpb` writes for up to 4 agents together, 121 / 134 / 136 tok/s in all for 2 / 3 / 4 instead of ~85 one after another,
 while a single chat stays bit for bit `ink2_v1`; `INK2_MULTI=pp`, a pipeline with half of the layers on each card, reaches
-148 tok/s with 4 and 162-166 with 6. Every conversation's output is the same alone and beside the others.
+148 tok/s with 4 and 162-166 with 6. Every conversation's output is the same alone and beside the others. **Reading 3 % faster
+on every load** (24 Nov, p38-p41, [below](#two-cards-on-the-one-card-sources-the-exchange-by-numa-node-p38-p41-24-nov)): the
+reading exchange's page-locked buffers now sit on the NUMA node of the card that writes them (946 → 980 tok/s on 4k prompts,
+828 → 851 on 30k; before, it depended on where the loading thread ran), and writing with drafts after a 30k prompt is 1.7 %
+faster; the same bits.
 
 Thinking Machines' **Inkling 2 Mini** (26.4B MoE: 24 layers, layers 6-17 run three times for 48 passes, 128 experts of which 8
 per token, a 1,024-token window on most layers, one full-attention layer in six, NVFP4 experts) on the same two P100s as
@@ -130,6 +134,58 @@ coding agent's write / bash tools worked on our machine. **Pictures**: `image_ur
 local path; checked with one picture a message). Limits: **greedy only** (no sampler yet), one request at a time (the [test builds for several chats](#several-conversations-at-once-ink2_tpb-ink2_pp-24-nov) take more). A follow-up turn of a
 conversation reads only the new part, and so does a prompt that parts from the conversation earlier or comes back after
 another one ([checkpoints and parked conversations](#conversations-keep-their-place-p21-p23)).
+
+## Two cards on the one-card sources, the exchange by NUMA node (p38-p41, 24 Nov)
+
+`src/` (`build/ink2_v1`) is now the one-card build's code ([below](#one-p100-ink2_1c-23-nov), p30-p36: every expert in a block
+of its own, the kernels take the experts through a table of addresses) built for two cards, with four changes on top. The
+output is the same bits as p27's: every token and every step's logits hashed, with drafts, at 256k and 512k.
+
+- **p38, a draft window's attention rows side by side:** `k_attn_dec` ran a window's rows one after another in the grid's z;
+  they now sit next to each other in x, so the blocks that read the same KV rows run together and share L2. Writing with
+  drafts after a 30k prompt 63.2 → 64.3 tok/s, short prompts the same. `INK2_ATT_ROWS=0` turns it off.
+- **p39, every expert on the cards:** the one-card placement kept 1 GiB for its cache of RAM experts and 256 MiB of scratch even
+  when everything fits, which with two cards at 512k pushed 2.42 GiB of experts to RAM. When every expert fits there is now
+  no cache and no scratch, and two cards keep a 150 MiB margin (one card 400): 7.36 GiB of experts a card in VRAM at 256k and
+  512k, 15.00 GiB of a card in use at 512k (p27: 15.24).
+- **p40:** the placement is printed a card (the two cards place their experts at once).
+- **p41, the reading exchange's buffers on the writer's node:** our server has two sockets and a card on each
+  (`nvidia-smi topo -m`: GPU0 on NUMA node 0, GPU1 on node 1). On the reading path each card copies its part of every
+  exchange to a page-locked buffer of its own (two of 18 MiB, by parity) and the other card copies it from there. The pages
+  landed on the node of the thread that allocated them, wherever the scheduler had put it, so reading changed from one load to
+  the next. The same build, only the buffers moved:
+
+  | Where the two cards' buffers were | 4 × 4,096-token prompts | 2 × 30,000-token prompts |
+  |---|---|---|
+  | both on node 1 | 949 tok/s | 828 |
+  | both on node 0 | 962 | 840 |
+  | each on the other card's node (`INK2_NUMA=2`) | 977 | 847 |
+  | **each on its own card's node (`INK2_NUMA=1`, default)** | **980 / 984 / 981** (three loads) | **851 / 851 / 851** |
+
+  p27 read at 947 / 828 on 3 of 5 loads (one thread allocated both cards' buffers). The one-card sources built for two cards
+  had looked 3-4 % faster at reading than p27: their two loading threads, one a card, often put each card's buffers on its
+  own node. p41 allocates them from a thread bound to that card's node (`/sys/bus/pci/devices/<card>/numa_node`, the node's
+  CPUs for the allocation only); `INK2_NUMA=0` leaves it to the scheduler as before. The engine prints where they landed:
+
+  ```
+  ink2_v1: kartica 0 (vozlisce 0): medpomnilnika izmenjave branja na vozliscu 0 0 (INK2_NUMA 1)
+  ink2_v1: kartica 1 (vozlisce 1): medpomnilnika izmenjave branja na vozliscu 1 1 (INK2_NUMA 1)
+  ```
+
+  A machine with one socket, or with both cards on one node, gets nothing from it and loses nothing.
+
+Before and after on our machine (512k, the drafter loaded, 24 Nov; p27 on its usual load):
+
+| | p27 | **p41** |
+|---|---|---|
+| Reading 4 × 4,096 / 2 × 30,000-token prompts | 947 / 828 tok/s | **981 / 851** |
+| Writing after them (no drafts, 32 / 64 tokens) | 60.6 / 54.4 | 60.7 / 54.5 |
+| Writing with drafts (MTP 3 + lookup): code, 256 tokens / after a 30k prompt | 78.0 / 63.2 | 78.3 / **64.3** |
+| `tools/bench.py` through the server: fresh / edit / 34.7k read / writing after it | 73.5 / 77.2 / 797 / 57.6 | 73.8 / 78.0 / **807** / 58.4 |
+
+(`bench.py`'s edit was 88.1 tok/s on 23 Nov, before the server's reasoning effort went to low by default: p27 gives 77.2 on
+the same server now. In that run p27's buffers were both on node 0, the middle row above.) The one-card build stays on
+`src-1c/` as it was measured; p38-p41 have not been run on one card.
 
 ## Several conversations at once (`ink2_tpb`, `ink2_pp`, 24 Nov)
 
@@ -645,7 +701,9 @@ RAM for them), `INK2_CKPT_GAP` (4096) / `INK2_CKPT_EVERY` (16384), `INK2_PARK_MB
 off), `INK2_PARK_MIN` (1024, shorter conversations are read again), `INK2_FUSE2` (6, a mask of the merged launches: 2 the
 controllers, 4 the norms and matrices; 1 the depth mixes and 8 the routing measured no gain), `INK2_Q8G` (1, the Q8 experts
 of the reading path by `k_q8_gemm5`; 0 = f32 copies and cuBLAS), `INK2_TILE_S` (1, expert tiles of 8 and 4 tokens),
-`INK2_CATM` (0, see below). Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
+`INK2_CATM` (0, see below), `INK2_ATT_ROWS` (1, p38), `INK2_NUMA` (1, p41: the reading exchange's buffers on the writing
+card's node; 2 the other card's, 0 the scheduler's), `INK2_1C_MARGIN_MB` (150 with two cards, VRAM left after the experts).
+Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
 `--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--logits-all F] [--dump DIR]` for tests (`--logits-all`: every row of the last window).
 
 ## What did not help

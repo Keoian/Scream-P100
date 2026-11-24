@@ -27,7 +27,7 @@ python3 engine-inkling2/tools/multi_bench.py http://127.0.0.1:8080 1,2,4   # wit
 
 | Path | What |
 |---|---|
-| `src/ink2_v1.cu` | the engine: loading and splitting, the writing path, the reading path (2,048-token chunks), drafts, checkpoints and parked conversations, the socket server |
+| `src/ink2_v1.cu` | the engine: loading and splitting, the writing path, the reading path (2,048-token chunks), drafts, checkpoints and parked conversations, the socket server; since 24 Nov the one-card code (`src-1c/`) built for two cards with p38-p41 (the reading exchange's buffers on each card's NUMA node, `INK2_NUMA`) |
 | `src/ink2_fuse.cuh` | merged launches of the writing path (the loop controllers, the norms and Q8 matrices), the same bits |
 | `src/ink2_kern.cuh` | writing kernels: Q8 GEMVs, NVFP4 expert rows, attention by KV head, the fused exchange / convolution kernels |
 | `src/ink2_pf.cuh` | reading kernels: NVFP4 and Q8 expert tile GEMMs, convolutions over a chunk, softmax with the relative bias and sink |
