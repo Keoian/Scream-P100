@@ -379,6 +379,10 @@ inline uint16_t h16_mul_ref(uint16_t a, uint16_t b) { return f16_fma_ref(a, b, 0
 inline uint16_t h16_int(int v) { return f16_from_f32_ref((float) v); }
 }  // namespace
 
+namespace {
+std::atomic<uint64_t> g_ref_runs{0};   // exact_ref_runs
+}  // namespace
+
 uint16_t f16_fma_ref(uint16_t a, uint16_t b, uint16_t c) {
     const H16 x = h16_dec(a), y = h16_dec(b), z = h16_dec(c);
     const int ps = x.sign ^ y.sign;
@@ -651,35 +655,21 @@ FNX_CPUX_SIMD void down_chunk_k(const Work& w, const Expert& e, int i0, int i1) 
 // ---- FNX_CPU_EXACT's kernels: 16 rows at a time, a row a lane of two vectors, each lane's two chains the card's two chains of that row
 FNX_CPUX_SIMD inline __m256 rn16(__m256 v) { return _mm256_cvtph_ps(_mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT)); }
 FNX_CPUX_SIMD inline float rn16s(float f) { return _cvtsh_ss(_cvtss_sh(f, _MM_FROUND_TO_NEAREST_INT)); }
-// fp16(w * x + c) of fp16 values held in floats, w * x exact in fp32 (as every product of two fp16 values): the fp32 sum s, its error e
-// (TwoSum, each step exact), s rounded to odd where e is not 0 (moved one ulp toward the exact sum when its last bit is 0), then to fp16:
-// the correctly rounded result, as the card's HFMA2 gives it. The subtractions as FMAs with 1.0 (the same exact result once rounded):
-// Haswell adds on one port only, FMAs on two
-FNX_CPUX_SIMD inline __m256 fma16(__m256 w, __m256 x, __m256 c) {
-    const __m256 one = _mm256_set1_ps(1.0f);
-    const __m256 p = _mm256_mul_ps(w, x);
-    const __m256 s = _mm256_add_ps(p, c);
-    const __m256 bb = _mm256_fmsub_ps(s, one, p);
-    const __m256 e = _mm256_add_ps(_mm256_fmsub_ps(p, one, _mm256_fmsub_ps(s, one, bb)), _mm256_fmsub_ps(c, one, bb));
-    const __m256i si = _mm256_castps_si256(s), i1 = _mm256_set1_epi32(1);
-    const __m256i inexact = _mm256_castps_si256(_mm256_cmp_ps(e, _mm256_setzero_ps(), _CMP_NEQ_OQ));   // not for NaN (an infinite s)
-    const __m256i even = _mm256_cmpeq_epi32(_mm256_and_si256(si, i1), _mm256_setzero_si256());
-    const __m256i away = _mm256_or_si256(_mm256_srai_epi32(_mm256_xor_si256(si, _mm256_castps_si256(e)), 31), i1);   // +1 away from 0, else -1
-    return rn16(_mm256_castsi256_ps(_mm256_add_epi32(si, _mm256_and_si256(away, _mm256_and_si256(inexact, even)))));
-}
-// the fast form: fp16(fp32(w * x + c)). The product is exact in fp32, so one FMA is the same one rounding as a multiply and an add.
-// Wrong only where the fp32 sum s was rounded (inexact) onto a point exactly halfway between two fp16 values (or onto 65520). `tie`
-// gets every such lane (and a few more), off the chain's dependency path: every fp16 midpoint (normal, subnormal, 65520) has at most
-// 12 significant bits, so its float's low 12 bits are 0; s = p + c is exact when s - p == c and s - c == p (for the larger operand
-// that subtraction is Fast2Sum's, exact). The sum as one FMA, the subtractions as FMAs with 1.0 and the flags as integers: Haswell
-// adds floats on one port only. A run with a flagged lane is done again with fma16
-FNX_CPUX_SIMD inline __m256 fma16f(__m256 w, __m256 x, __m256 c, __m256i& tie) {
-    const __m256 one = _mm256_set1_ps(1.0f);
-    const __m256 p = _mm256_mul_ps(w, x), s = _mm256_fmadd_ps(w, x, c);
-    const __m256i few = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_castps_si256(s), _mm256_set1_epi32(0xfff)), _mm256_setzero_si256());
-    const __m256 inexact = _mm256_or_ps(_mm256_cmp_ps(_mm256_fmsub_ps(s, one, p), c, _CMP_NEQ_OQ), _mm256_cmp_ps(_mm256_fmsub_ps(s, one, c), p, _CMP_NEQ_OQ));
-    tie = _mm256_or_si256(tie, _mm256_and_si256(few, _mm256_castps_si256(inexact)));
-    return rn16(s);
+// fp16(w * x + c) of fp16 values held in floats, as the card's HFMA2 gives it, with MXCSR rounding toward zero (the kernels set it).
+// w * x is exact in fp32, as every product of two fp16 values. a: the fp32 sum, truncated. d = c - a, truncated, is -(w x) exactly
+// when a is the sum, and never otherwise: a miss would need the truncation's error under one fp32 place of w x, but that error is a
+// multiple of w x's last bit, which lies two places higher (the product has at most 22 bits). So e = w x + d is +0 exactly where the
+// sum was exact (never -0: that would need d = -0 with w x = -0, and then a is -0 and d is +0), its bits are not 0 where it was not,
+// and a with its last bit set there is the sum rounded to odd; 24 bits are 11 + 2 and more, so vcvtps2ph (to nearest by its own
+// immediate, whatever MXCSR says) gives the correctly rounded fp16 sum (Boldo, Melquiond). No test and no second pass: 9 vector
+// uops a step where the form with a test took 15 (Haswell runs them on three ports). An infinite operand gives NaN where the card
+// says infinity: a chain meets one only after it left fp16's range, stays NaN to its run's end, and fold_runs does that run again
+// by the oracle. (Comparing d's bits with -(w x)'s instead of the second FMA is two cycles shorter on the chain and one uop more:
+// measured the same within 1-2 %.)
+FNX_CPUX_SIMD inline __m256 fma16z(__m256 w, __m256 x, __m256 c) {
+    const __m256 a = _mm256_fmadd_ps(w, x, c);
+    const __m256i e = _mm256_castps_si256(_mm256_fmadd_ps(w, x, _mm256_sub_ps(c, a)));
+    return rn16(_mm256_castsi256_ps(_mm256_or_si256(_mm256_castps_si256(a), _mm256_min_epu32(e, _mm256_set1_epi32(1)))));
 }
 // lanes where q a + b is exact in fp32 for every integer q < 32: a or b zero, or both normal fp16 values whose exponents differ by at
 // most 7. (q a is a multiple of a's last bit below 2^(ea + 6), b of its own below 2^(eb + 1): the sum spans at most
@@ -747,45 +737,103 @@ FNX_CPUX_SIMD inline __m256i bits16(uint32_t qh) {
     return _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(b, bm), bm), _mm256_set1_epi8(16));
 }
 // a run's 32 weights of 16 rows (W[l][half]) times one token's 32 values: the card's chains (even values, odd values, from +0), folded.
-// The first step's sum is the product (+0 added: exact, one rounding, nothing to test); then the fast form, and when any lane met a
-// midpoint, the run again with fma16
-FNX_CPUX_SIMD inline void chain32(const __m256 (*W)[2], const float* x, __m256* acc) {
+// A run's chains of the 16 rows (v: lo0, lo1, hi0, hi1; lo the even values' chain, 0 and 1 the two vectors of 8 rows), rounding
+// toward zero. The first step's sum is the product (+0 added: exact, one rounding)
+FNX_CPUX_SIMD inline void chain32(const __m256 (*W)[2], const float* x, __m256* v) {
     const __m256 z = _mm256_setzero_ps();
     const __m256 xe0 = _mm256_broadcast_ss(x), xo0 = _mm256_broadcast_ss(x + 1);
     __m256 lo0 = rn16(_mm256_fmadd_ps(W[0][0], xe0, z)), lo1 = rn16(_mm256_fmadd_ps(W[0][1], xe0, z));
     __m256 hi0 = rn16(_mm256_fmadd_ps(W[1][0], xo0, z)), hi1 = rn16(_mm256_fmadd_ps(W[1][1], xo0, z));
-    __m256i tie = _mm256_setzero_si256();
     for (int t = 1; t < 16; ++t) {
         const __m256 xe = _mm256_broadcast_ss(x + 2 * t), xo = _mm256_broadcast_ss(x + 2 * t + 1);
-        lo0 = fma16f(W[2 * t][0], xe, lo0, tie);
-        lo1 = fma16f(W[2 * t][1], xe, lo1, tie);
-        hi0 = fma16f(W[2 * t + 1][0], xo, hi0, tie);
-        hi1 = fma16f(W[2 * t + 1][1], xo, hi1, tie);
+        lo0 = fma16z(W[2 * t][0], xe, lo0);
+        lo1 = fma16z(W[2 * t][1], xe, lo1);
+        hi0 = fma16z(W[2 * t + 1][0], xo, hi0);
+        hi1 = fma16z(W[2 * t + 1][1], xo, hi1);
     }
-    if (__builtin_expect(!_mm256_testz_si256(tie, tie), 0)) {
-        lo0 = lo1 = hi0 = hi1 = z;
-        for (int t = 0; t < 16; ++t) {
-            const __m256 xe = _mm256_broadcast_ss(x + 2 * t), xo = _mm256_broadcast_ss(x + 2 * t + 1);
-            lo0 = fma16(W[2 * t][0], xe, lo0);
-            lo1 = fma16(W[2 * t][1], xe, lo1);
-            hi0 = fma16(W[2 * t + 1][0], xo, hi0);
-            hi1 = fma16(W[2 * t + 1][1], xo, hi1);
-        }
-    }
-    acc[0] = _mm256_add_ps(acc[0], _mm256_add_ps(lo0, hi0));
-    acc[1] = _mm256_add_ps(acc[1], _mm256_add_ps(lo1, hi1));
+    v[0] = lo0, v[1] = lo1, v[2] = hi0, v[3] = hi1;
 }
-// weights fp16(q a + b) of a run, 16 rows: one rounding of the fp32 sum where that sum is exact for every q (decode_plain), else fma16
+// Two runs of the same 16 rows at once (W: run 0's 32 weights, then run 1's; x: their 64 values; v: run 0's four, then run 1's):
+// eight chains in flight. A step is some 25 cycles long and four chains leave the core waiting on it
+FNX_CPUX_SIMD inline void chain64(const __m256 (*W)[2], const float* x, __m256* v) {
+    const __m256 z = _mm256_setzero_ps();
+    __m256 a0, a1, b0, b1, c0, c1, d0, d1;
+    {
+        const __m256 xe = _mm256_broadcast_ss(x), xo = _mm256_broadcast_ss(x + 1), ye = _mm256_broadcast_ss(x + 32), yo = _mm256_broadcast_ss(x + 33);
+        a0 = rn16(_mm256_fmadd_ps(W[0][0], xe, z)), a1 = rn16(_mm256_fmadd_ps(W[0][1], xe, z));
+        b0 = rn16(_mm256_fmadd_ps(W[1][0], xo, z)), b1 = rn16(_mm256_fmadd_ps(W[1][1], xo, z));
+        c0 = rn16(_mm256_fmadd_ps(W[32][0], ye, z)), c1 = rn16(_mm256_fmadd_ps(W[32][1], ye, z));
+        d0 = rn16(_mm256_fmadd_ps(W[33][0], yo, z)), d1 = rn16(_mm256_fmadd_ps(W[33][1], yo, z));
+    }
+    for (int t = 1; t < 16; ++t) {
+        const __m256 xe = _mm256_broadcast_ss(x + 2 * t), xo = _mm256_broadcast_ss(x + 2 * t + 1);
+        a0 = fma16z(W[2 * t][0], xe, a0);
+        a1 = fma16z(W[2 * t][1], xe, a1);
+        b0 = fma16z(W[2 * t + 1][0], xo, b0);
+        b1 = fma16z(W[2 * t + 1][1], xo, b1);
+        const __m256 ye = _mm256_broadcast_ss(x + 32 + 2 * t), yo = _mm256_broadcast_ss(x + 33 + 2 * t);
+        c0 = fma16z(W[32 + 2 * t][0], ye, c0);
+        c1 = fma16z(W[32 + 2 * t][1], ye, c1);
+        d0 = fma16z(W[33 + 2 * t][0], yo, d0);
+        d1 = fma16z(W[33 + 2 * t][1], yo, d1);
+    }
+    v[0] = a0, v[1] = a1, v[2] = b0, v[3] = b1, v[4] = c0, v[5] = c1, v[6] = d0, v[7] = d1;
+}
+// a run's four chains by the oracle, a row at a time: for a run that left fp16's range
+void chain32_ref(const __m256 (*W)[2], const float* x, __m256* v) {
+    alignas(32) float w[32][16], out[4][8];
+    for (int l = 0; l < 32; ++l) std::memcpy(w[l], &W[l][0], 32), std::memcpy(w[l] + 8, &W[l][1], 32);
+    for (int r = 0; r < 16; ++r) {
+        uint16_t lo = 0, hi = 0;
+        for (int t = 0; t < 16; ++t) {
+            lo = f16_fma_ref(f16_from_f32_ref(w[2 * t][r]), f16_from_f32_ref(x[2 * t]), lo);
+            hi = f16_fma_ref(f16_from_f32_ref(w[2 * t + 1][r]), f16_from_f32_ref(x[2 * t + 1]), hi);
+        }
+        out[r < 8 ? 0 : 1][r & 7] = f16_to_f32(lo);
+        out[r < 8 ? 2 : 3][r & 7] = f16_to_f32(hi);
+    }
+    for (int i = 0; i < 4; ++i) std::memcpy(&v[i], out[i], 32);
+    g_ref_runs.fetch_add(1, std::memory_order_relaxed);
+}
+// The chains' ends of nr runs times nt tokens (v[(k nr + r) 4 + i]) into the rows' fp32 sums as the card adds them, s + (lo + hi), a
+// run after the other: in round-to-nearest, so in a function of its own (the compiler knows nothing of MXCSR and may not move these
+// adds among the chains' steps). A run whose sums are not finite left fp16's range on the way: again by the oracle
+FNX_CPUX_SIMD __attribute__((noinline)) void fold_runs(const __m256 (*W)[2], const float* const* x, int col, int nt, int nr, __m256* v, __m256 (*acc)[2], unsigned rn,
+                                                       unsigned rz) {
+    _mm_setcsr(rn);
+    const __m256 z = _mm256_setzero_ps();
+    for (int k = 0; k < nt; ++k)
+        for (int r = 0; r < nr; ++r) {
+            __m256* c = v + ((size_t) k * nr + r) * 4;
+            __m256 s0 = _mm256_add_ps(c[0], c[2]), s1 = _mm256_add_ps(c[1], c[3]);
+            const __m256 bad = _mm256_or_ps(_mm256_cmp_ps(_mm256_sub_ps(s0, s0), z, _CMP_NEQ_UQ), _mm256_cmp_ps(_mm256_sub_ps(s1, s1), z, _CMP_NEQ_UQ));
+            if (__builtin_expect(_mm256_movemask_ps(bad), 0)) {
+                chain32_ref(W + 32 * r, x[k] + col + 32 * r, c);
+                s0 = _mm256_add_ps(c[0], c[2]), s1 = _mm256_add_ps(c[1], c[3]);
+            }
+            acc[k][0] = _mm256_add_ps(acc[k][0], s0);
+            acc[k][1] = _mm256_add_ps(acc[k][1], s1);
+        }
+    _mm_setcsr(rz);
+}
+// nr (1 or 2) runs of the 16 rows from value col on, times the nt tokens
+FNX_CPUX_SIMD inline void runs(const __m256 (*W)[2], const float* const* x, int col, int nt, int nr, __m256 (*acc)[2], unsigned rn, unsigned rz) {
+    __m256 v[16 * 8];
+    if (nr == 2)
+        for (int k = 0; k < nt; ++k) chain64(W, x[k] + col, v + 8 * k);
+    else
+        for (int k = 0; k < nt; ++k) chain32(W, x[k] + col, v + 4 * k);
+    fold_runs(W, x, col, nt, nr, v, acc, rn, rz);
+}
+// weights fp16(q a + b) of a run, 16 rows: one rounding of the fp32 sum where that sum is exact for every q (decode_plain: the same
+// in any rounding mode), else fma16z
 FNX_CPUX_SIMD inline void decode_fma(const uint8_t (*tb)[256], const uint8_t* off, const __m256* a, const __m256* b, __m256 (*W)[2]) {
     for (int hh = 0; hh < 2; ++hh) {
         if (decode_plain(a[hh], b[hh])) {
             for (int l = 0; l < 32; ++l) W[l][hh] = rn16(_mm256_fmadd_ps(codes8(tb[hh] + off[l], false), a[hh], b[hh]));
             continue;
         }
-        __m256i tie = _mm256_setzero_si256();   // the fast form and its test, the exact form where it flags
-        for (int l = 0; l < 32; ++l) W[l][hh] = fma16f(codes8(tb[hh] + off[l], false), a[hh], b[hh], tie);
-        if (__builtin_expect(!_mm256_testz_si256(tie, tie), 0))
-            for (int l = 0; l < 32; ++l) W[l][hh] = fma16(codes8(tb[hh] + off[l], false), a[hh], b[hh]);
+        for (int l = 0; l < 32; ++l) W[l][hh] = fma16z(codes8(tb[hh] + off[l], false), a[hh], b[hh]);
     }
 }
 // 16 gate|up rows (Q4_K, or Q5_K with K5) of n values times nt tokens: res[k * 16 + r]
@@ -795,7 +843,10 @@ FNX_CPUX_SIMD void gu16_exact(const uint8_t* const* rp, int n, int lanes, int nt
     const uint8_t* off = tr_off();
     const __m256i m4 = _mm256_set1_epi8(0x0F), one8 = _mm256_set1_epi8(1);
     alignas(32) uint8_t tb[2][256];
-    __m256 W[32][2], part[8][16][2], As[2][8], Bs[2][8];
+    __m256 W[64][2], part[8][16][2], As[2][8], Bs[2][8];
+    // toward zero from here to the lanes' adds (fma16z); what is rounded on the way is exact in fp32 or rounded by vcvtps2ph's own mode
+    const unsigned rn = _mm_getcsr(), rz = rn | _MM_ROUND_TOWARD_ZERO;
+    _mm_setcsr(rz);
     for (int p = 0; p < lanes; ++p) {
         __m256 acc[16][2];
         for (int k = 0; k < nt; ++k) acc[k][0] = acc[k][1] = _mm256_setzero_ps();
@@ -833,13 +884,13 @@ FNX_CPUX_SIMD void gu16_exact(const uint8_t* const* rp, int n, int lanes, int nt
                     tr8x32(v, tb[hh]);
                 }
                 const __m256 a[2] = {As[0][ib], As[1][ib]}, b[2] = {Bs[0][ib], Bs[1][ib]};
-                decode_fma(tb, off, a, b, W);
-                const int col = g * 256 + ib * 32;
-                for (int k = 0; k < nt; ++k) chain32(W, x[k] + col, acc[k]);
+                decode_fma(tb, off, a, b, W + 32 * (ib & 1));
+                if (ib & 1) runs(W, x, g * 256 + (ib - 1) * 32, nt, 2, acc, rn, rz);   // a group's runs two at a time
             }
         }
         for (int k = 0; k < nt; ++k) part[p][k][0] = acc[k][0], part[p][k][1] = acc[k][1];
     }
+    _mm_setcsr(rn);
     for (int o = 1; o < lanes; o <<= 1)   // the warp's xor shuffles: lane 0 ends with ((s0 + s1) + (s2 + s3)) + ...
         for (int p = 0; p + o < lanes; p += 2 * o)
             for (int k = 0; k < nt; ++k)
@@ -854,9 +905,12 @@ FNX_CPUX_SIMD void dn16_exact(const uint8_t* const* rp, int n, int nt, const flo
     const __m256i m4 = _mm256_set1_epi8(0x0F), kv = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(KV_IQ4NL)));
     alignas(32) float D[16], M[16];
     alignas(32) uint8_t tb[2][256];
-    __m256 W[32][2], acc[16][2];
+    __m256 W[64][2], acc[16][2];
+    const unsigned rn = _mm_getcsr(), rz = rn | _MM_ROUND_TOWARD_ZERO;   // as gu16_exact
+    _mm_setcsr(rz);
     for (int k = 0; k < nt; ++k) acc[k][0] = acc[k][1] = _mm256_setzero_ps();
     for (int b = 0; b < n / 32; ++b) {
+        __m256 (*Wb)[2] = W + 32 * (b & 1);
         for (int hh = 0; hh < 2; ++hh) {
             __m256i v[8];
             for (int r = 0; r < 8; ++r) {
@@ -882,30 +936,32 @@ FNX_CPUX_SIMD void dn16_exact(const uint8_t* const* rp, int n, int nt, const flo
         const __m256 d[2] = {_mm256_load_ps(D), _mm256_load_ps(D + 8)};
         if constexpr (TY == 7) {   // fp16(q d + m)
             const __m256 m[2] = {_mm256_load_ps(M), _mm256_load_ps(M + 8)};
-            decode_fma(tb, off, d, m, W);
+            decode_fma(tb, off, d, m, Wb);
         } else
             for (int l = 0; l < 32; ++l) {   // fp16(v d): the product exact, one rounding
-                W[l][0] = rn16(_mm256_mul_ps(codes8(tb[0] + off[l], true), d[0]));
-                W[l][1] = rn16(_mm256_mul_ps(codes8(tb[1] + off[l], true), d[1]));
+                Wb[l][0] = rn16(_mm256_mul_ps(codes8(tb[0] + off[l], true), d[0]));
+                Wb[l][1] = rn16(_mm256_mul_ps(codes8(tb[1] + off[l], true), d[1]));
             }
-        for (int k = 0; k < nt; ++k) chain32(W, h[k] + b * 32, acc[k]);
+        if (b & 1) runs(W, h, (b - 1) * 32, nt, 2, acc, rn, rz);   // the runs two at a time, a last odd one alone
+        else if (b == n / 32 - 1) runs(W, h, b * 32, nt, 1, acc, rn, rz);
     }
+    _mm_setcsr(rn);
     for (int k = 0; k < nt; ++k) _mm256_storeu_ps(res + 16 * k, acc[k][0]), _mm256_storeu_ps(res + 16 * k + 8, acc[k][1]);
 }
-FNX_CPUX_SIMD void gu_chunk_exact_simd(const Work& w, const Expert& e, int j0, int j1) {
+// rows [r0, r1) of the expert's 2 ffs gate|up rows (the gate rows, then the up rows), 16 at a time (a last short group repeats its last row)
+FNX_CPUX_SIMD void gu_rows_exact_simd(const Work& w, const Expert& e, int r0, int r1) {
     const size_t rb = row_bytes(w.gu_type, w.N);
     const float* x[16];
     for (int k = 0; k < e.n; ++k) x[k] = w.x + (size_t) e.rows[k] * w.x_stride;
     alignas(32) float res[16 * 16];
-    for (int part = 0; part < 2; ++part)   // the gate rows, then the up rows
-        for (int j = j0; j < j1; j += 16) {
-            const uint8_t* rp[16];
-            for (int r = 0; r < 16; ++r) rp[r] = e.gu + (size_t) (part * w.ffs + std::min(j + r, j1 - 1)) * rb;
-            if (w.gu_type == T_Q5_K) gu16_exact<true>(rp, w.N, w.gu_lanes, e.n, x, res);
-            else gu16_exact<false>(rp, w.N, w.gu_lanes, e.n, x, res);
-            for (int k = 0; k < e.n; ++k)
-                for (int r = 0; r < 16 && j + r < j1; ++r) e.gu_out[(size_t) k * 2 * w.ffs + (size_t) part * w.ffs + j + r] = res[16 * k + r];
-        }
+    for (int j = r0; j < r1; j += 16) {
+        const uint8_t* rp[16];
+        for (int r = 0; r < 16; ++r) rp[r] = e.gu + (size_t) std::min(j + r, r1 - 1) * rb;
+        if (w.gu_type == T_Q5_K) gu16_exact<true>(rp, w.N, w.gu_lanes, e.n, x, res);
+        else gu16_exact<false>(rp, w.N, w.gu_lanes, e.n, x, res);
+        for (int k = 0; k < e.n; ++k)
+            for (int r = 0; r < 16 && j + r < r1; ++r) e.gu_out[(size_t) k * 2 * w.ffs + j + r] = res[16 * k + r];
+    }
 }
 FNX_CPUX_SIMD void down_chunk_exact_simd(const Work& w, const Expert& e, int i0, int i1) {
     const size_t rb = row_bytes(w.dn_type, w.ffs);
@@ -926,16 +982,14 @@ FNX_CPUX_SIMD void down_chunk_exact_simd(const Work& w, const Expert& e, int i0,
 
 namespace {
 // without AVX2: the oracle's steps, a row at a time (slow; exact all the same)
-void gu_chunk_exact_ref(const Work& w, const Expert& e, int j0, int j1) {
+void gu_rows_exact_ref(const Work& w, const Expert& e, int r0, int r1) {
     const size_t rb = row_bytes(w.gu_type, w.N);
     std::vector<uint16_t> x16((size_t) e.n * w.N);
     for (int k = 0; k < e.n; ++k)
         for (int c = 0; c < w.N; ++c) x16[(size_t) k * w.N + c] = f16_from_f32_ref(w.x[(size_t) e.rows[k] * w.x_stride + c]);
-    for (int part = 0; part < 2; ++part)
-        for (int j = j0; j < j1; ++j)
-            for (int k = 0; k < e.n; ++k)
-                e.gu_out[(size_t) k * 2 * w.ffs + (size_t) part * w.ffs + j] =
-                    gu_row_card_ref(w.gu_type, e.gu + (size_t) (part * w.ffs + j) * rb, w.N, x16.data() + (size_t) k * w.N, w.gu_lanes);
+    for (int j = r0; j < r1; ++j)
+        for (int k = 0; k < e.n; ++k)
+            e.gu_out[(size_t) k * 2 * w.ffs + j] = gu_row_card_ref(w.gu_type, e.gu + (size_t) j * rb, w.N, x16.data() + (size_t) k * w.N, w.gu_lanes);
 }
 void down_chunk_exact_ref(const Work& w, const Expert& e, int i0, int i1) {
     const size_t rb = row_bytes(w.dn_type, w.ffs);
@@ -947,29 +1001,16 @@ void down_chunk_exact_ref(const Work& w, const Expert& e, int i0, int i1) {
 }
 }  // namespace
 
-bool fma16f_x8(const float* w, const float* x, const float* c, float* out, uint32_t* flag) {
-#if FNX_CPUX_X86
-    if (!cpu_simd()) return false;
-    struct S {
-        FNX_CPUX_SIMD static void run(const float* w, const float* x, const float* c, float* out, uint32_t* flag) {
-            __m256i tie = _mm256_setzero_si256();
-            _mm256_storeu_ps(out, fma16f(_mm256_loadu_ps(w), _mm256_loadu_ps(x), _mm256_loadu_ps(c), tie));
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(flag), tie);
-        }
-    };
-    S::run(w, x, c, out, flag);
-    return true;
-#else
-    (void) w, (void) x, (void) c, (void) out, (void) flag;
-    return false;
-#endif
-}
-bool fma16_x8(const float* w, const float* x, const float* c, float* out) {
+uint64_t exact_ref_runs() { return g_ref_runs.load(std::memory_order_relaxed); }
+bool fma16z_x8(const float* w, const float* x, const float* c, float* out) {
 #if FNX_CPUX_X86
     if (!cpu_simd()) return false;
     struct S {
         FNX_CPUX_SIMD static void run(const float* w, const float* x, const float* c, float* out) {
-            _mm256_storeu_ps(out, fma16(_mm256_loadu_ps(w), _mm256_loadu_ps(x), _mm256_loadu_ps(c)));
+            const unsigned rn = _mm_getcsr();
+            _mm_setcsr(rn | _MM_ROUND_TOWARD_ZERO);
+            _mm256_storeu_ps(out, fma16z(_mm256_loadu_ps(w), _mm256_loadu_ps(x), _mm256_loadu_ps(c)));
+            _mm_setcsr(rn);
         }
     };
     S::run(w, x, c, out);
@@ -980,12 +1021,17 @@ bool fma16_x8(const float* w, const float* x, const float* c, float* out) {
 #endif
 }
 
+void gu_rows_exact(const Work& w, const Expert& e, int r0, int r1) {
+#if FNX_CPUX_X86
+    if (cpu_simd()) return gu_rows_exact_simd(w, e, r0, r1);
+#endif
+    gu_rows_exact_ref(w, e, r0, r1);
+}
 void gu_chunk(const Work& w, const Expert& e, int j0, int j1) {
     if (w.exact) {
-#if FNX_CPUX_X86
-        if (cpu_simd()) return gu_chunk_exact_simd(w, e, j0, j1);
-#endif
-        return gu_chunk_exact_ref(w, e, j0, j1);
+        gu_rows_exact(w, e, j0, j1);
+        gu_rows_exact(w, e, w.ffs + j0, w.ffs + j1);
+        return;
     }
 #if FNX_CPUX_X86
     if (cpu_simd() && w.gu_type == T_Q4_K) return gu_chunk_kq<false>(w, e, j0, j1);
@@ -1025,11 +1071,31 @@ void down_chunk(const Work& w, const Expert& e, int i0, int i1) {
 // ---- the pool
 namespace {
 constexpr int GU_CHUNK = 32, DN_CHUNK = 256;
+// FNX_CPU_EXACT's chunks: one call of gu16_exact (16 of the 2 ffs gate|up rows), four of dn16_exact. Its kernels take the time of
+// the arithmetic, not of the memory, and a short list (an expert or two) has too few of the fp32 path's chunks for 16 threads
+constexpr int GU_ROWS_X = 16, DN_CHUNK_X = 64;
+std::atomic<bool> g_warm{false};
 inline void relax() {
 #if FNX_CPUX_X86
     _mm_pause();
 #endif
+    warm256();
 }
+}  // namespace
+
+// FNX_CPU_WARM: a core that has run no heavy 256-bit work for a few milliseconds leaves the state it runs it in, and the first
+// list after such a pause pays for the way back (measured on a Xeon E5-2696 v3, one expert on 16 threads: 142-158 us after 3 or
+// 10 ms idle against 119-125 back to back; nothing up to 1 ms). A waiting thread that runs two 256-bit FMAs a turn stays there
+// (the same bench: 119-125 after any pause; a 256-bit integer add a turn did not help). vzeroupper after them: the code around
+// is not compiled for AVX. The pool's threads wait this way for 20 ms after a list, then sleep as before
+void keep_warm(bool on) { g_warm.store(on && cpu_simd(), std::memory_order_relaxed); }
+void warm256() {
+#if FNX_CPUX_X86
+    if (g_warm.load(std::memory_order_relaxed))
+        __asm__ __volatile__("vfmadd231ps %%ymm15, %%ymm15, %%ymm15\n\tvfmadd231ps %%ymm14, %%ymm14, %%ymm14\n\tvzeroupper" : : : "xmm14", "xmm15");
+#endif
+}
+namespace {
 }  // namespace
 
 struct Pool::Impl {
@@ -1047,6 +1113,11 @@ struct Pool::Impl {
     std::atomic<uint64_t> ticket{0}, limit{0};
     std::atomic<int> done{0};
     std::atomic<unsigned long long> late{0};   // workers that met a spent ticket and the next round's count: turned away
+    // Pool::stats: the chunks' own time added over the threads, the rounds' time from set-up to the last chunk done, and from a
+    // round's set-up to the first chunk a worker (not the caller) began
+    std::atomic<unsigned long long> busy_ns{0}, wall_ns{0}, first_ns{0}, chunks{0}, rounds{0};
+    std::atomic<long long> round_t0{0};
+    std::atomic<bool> first_seen{true};
     const Work* w = nullptr;
     const Pool::Rows* rows = nullptr;
     int phase = 0, per = 0;   // phase 0: the window's rows; 1: gate|up chunks; 2: down chunks
@@ -1062,11 +1133,14 @@ struct Pool::Impl {
         }
         const Expert& e = w->ex[i / per];
         const int c = i % per;
-        if (phase == 1) gu_chunk(*w, e, c * GU_CHUNK, std::min(w->ffs, (c + 1) * GU_CHUNK));
+        if (phase == 1 && w->exact) gu_rows_exact(*w, e, c * GU_ROWS_X, std::min(2 * w->ffs, (c + 1) * GU_ROWS_X));
+        else if (phase == 1) gu_chunk(*w, e, c * GU_CHUNK, std::min(w->ffs, (c + 1) * GU_CHUNK));
+        else if (w->exact) down_chunk(*w, e, c * DN_CHUNK_X, std::min(w->N, (c + 1) * DN_CHUNK_X));
         else down_chunk(*w, e, c * DN_CHUNK, std::min(w->N, (c + 1) * DN_CHUNK));
     }
+    static long long now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     // take chunks of round r until none is left (or the round is over); true when it did any
-    bool take(uint32_t r) {
+    bool take(uint32_t r, bool worker = true) {
         bool any = false;
         uint64_t t = ticket.load(std::memory_order_acquire);
         for (;;) {
@@ -1079,7 +1153,11 @@ struct Pool::Impl {
             }
             if (i >= (int) (uint32_t) lim) return any;
             if (!ticket.compare_exchange_weak(t, t + 1, std::memory_order_acq_rel, std::memory_order_acquire)) continue;
+            const long long c0 = now_ns();
+            if (worker && !first_seen.exchange(true, std::memory_order_relaxed))
+                first_ns.fetch_add((unsigned long long) (c0 - round_t0.load(std::memory_order_relaxed)), std::memory_order_relaxed);
             chunk(i);
+            busy_ns.fetch_add((unsigned long long) (now_ns() - c0), std::memory_order_relaxed);
             done.fetch_add(1, std::memory_order_release);
             any = true;
             t = ticket.load(std::memory_order_acquire);
@@ -1121,19 +1199,27 @@ struct Pool::Impl {
         w = &work;
         rows = r;
         phase = ph;
-        per = ph == 1 ? (work.ffs + GU_CHUNK - 1) / GU_CHUNK : ph == 2 ? (work.N + DN_CHUNK - 1) / DN_CHUNK : 1;
+        const int guc = work.exact ? GU_ROWS_X : GU_CHUNK, gun = work.exact ? 2 * work.ffs : work.ffs, dnc = work.exact ? DN_CHUNK_X : DN_CHUNK;
+        per = ph == 1 ? (gun + guc - 1) / guc : ph == 2 ? (work.N + dnc - 1) / dnc : 1;
         const int n = ph == 0 ? r->T : work.m * per;
         if (n <= 0) return;
         done.store(0, std::memory_order_release);
         ++round;
+        const long long r0 = now_ns();
+        round_t0.store(r0, std::memory_order_relaxed);
+        first_seen.store(false, std::memory_order_relaxed);
         limit.store((uint64_t) round << 32 | (uint32_t) n, std::memory_order_release);
         ticket.store((uint64_t) round << 32, std::memory_order_release);
         if (asleep.load(std::memory_order_acquire) > 0) {
             std::lock_guard<std::mutex> g(mu);
             cv.notify_all();
         }
-        take(round);
+        take(round, false);
         while (done.load(std::memory_order_acquire) < n) relax();
+        first_seen.store(true, std::memory_order_relaxed);   // a round the caller did alone: no worker's first chunk to note
+        wall_ns.fetch_add((unsigned long long) (now_ns() - r0), std::memory_order_relaxed);
+        chunks.fetch_add((unsigned long long) n, std::memory_order_relaxed);
+        rounds.fetch_add(1, std::memory_order_relaxed);
     }
 };
 
@@ -1150,6 +1236,13 @@ Pool::~Pool() {
 }
 int Pool::threads() const { return (int) p_->th.size(); }
 unsigned long long Pool::late() { return p_->late.exchange(0, std::memory_order_relaxed); }
+Pool::Stat Pool::stats() {
+    Stat s;
+    s.busy_ns = p_->busy_ns.exchange(0, std::memory_order_relaxed), s.wall_ns = p_->wall_ns.exchange(0, std::memory_order_relaxed);
+    s.first_ns = p_->first_ns.exchange(0, std::memory_order_relaxed), s.chunks = p_->chunks.exchange(0, std::memory_order_relaxed);
+    s.rounds = p_->rounds.exchange(0, std::memory_order_relaxed);
+    return s;
+}
 void Pool::run_gu(Work& w, const Rows* rows) {
     if (w.m <= 0) return;
     if (rows && rows->x16) {
@@ -1170,11 +1263,8 @@ void Pool::run(Work& w, const Rows* rows) {
     run_down(w);
 }
 
-std::vector<int> node_cores(int node) {
-    std::vector<int> out;
-    std::ifstream f("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
-    std::string s;
-    if (!f || !std::getline(f, s)) return out;
+namespace {
+std::vector<int> cpu_list(const std::string& s) {   // sysfs: "0-17,36-53"
     std::vector<int> cpus;
     size_t i = 0;
     while (i < s.size()) {
@@ -1186,6 +1276,24 @@ std::vector<int> node_cores(int node) {
         if (j == std::string::npos) break;
         i = j + 1;
     }
+    return cpus;
+}
+}  // namespace
+std::vector<int> core_siblings(int cpu) {
+    std::ifstream t("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings_list");
+    std::string sib;
+    std::vector<int> out;
+    if (t && std::getline(t, sib))
+        for (int c : cpu_list(sib))
+            if (c != cpu) out.push_back(c);
+    return out;
+}
+std::vector<int> node_cores(int node) {
+    std::vector<int> out;
+    std::ifstream f("/sys/devices/system/node/node" + std::to_string(node) + "/cpulist");
+    std::string s;
+    if (!f || !std::getline(f, s)) return out;
+    const std::vector<int> cpus = cpu_list(s);
     std::set<std::string> seen;   // a core by its siblings' list: the first CPU that names it stands for it
     for (int c : cpus) {
         std::ifstream t("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list");

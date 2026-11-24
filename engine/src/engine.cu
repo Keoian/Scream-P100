@@ -277,7 +277,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             b->dense[T] = dalloc<Job>(1);
             ck(cudaMemcpy(b->dense[T], &j, sizeof j, cudaMemcpyHostToDevice), "dense job");
         }
-        if (w.ec.n_slots) b->cache_list = dalloc<int>(1 + P);
+        if (w.ec.n_slots) b->cache_list = dalloc<int>(1 + P), b->cpu_list = dalloc<int>(1 + P);
         b->gu = dalloc<float>((size_t) (P + MAXT) * 2 * ffs);
         b->part = dalloc<float>((size_t) (P + MAXT) * N);
         if (p100_rows_on()) {
@@ -1771,10 +1771,33 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     static const bool cpu_check = p100_cpu_check();
     const bool cpu_any = over && dma && b.cpux && !lat && T >= cpu_min_t && T <= cpu_max_t;
     const bool cpu = cpu_any && !cpu_check, cpu_chk = cpu_any && cpu_check;
+    // FNX_CPU_SHARE: the per cent of a window's misses (to the nearest whole expert) that the CPU computes; the others are copied into slots and
+    // computed by the card's second phase, as without the CPU path, at the same time. One number, or two: "A,B" is A per cent in a
+    // window of 1 row and B in one of 16, in a line between (a copy costs less beside a small window's rows than beside a wide
+    // one's, so the CPU's best share grows with the rows). 100 (the default): every miss to the CPU
+    static const std::pair<int, int> cpu_share = [] {
+        int a = 100, b2 = -1;
+        if (const char* e = std::getenv("FNX_CPU_SHARE"); e && *e) {
+            char* end = nullptr;
+            a = (int) std::strtol(e, &end, 10);
+            if (end && *end == ',') b2 = (int) std::strtol(end + 1, &end, 10);
+            if (end == e || (end && *end)) throw std::runtime_error("FNX_CPU_SHARE: a per cent, or two with a comma (at 1 row, at 16 rows)");
+        }
+        if (b2 < 0) b2 = a;
+        if (a < 0 || a > 100 || b2 > 100) throw std::runtime_error("FNX_CPU_SHARE: 0 to 100, the per cent of a window's missing experts the CPU computes");
+        if ((a < 100 || b2 < 100) && p100_cpu_on())
+            std::fprintf(stderr, "fnx: FNX_CPU_SHARE %d,%d: of a window's missing experts %d per cent (1 row) to %d per cent (16 rows) on the CPU, the others copied "
+                         "into VRAM at the same time\n", a, b2, a, b2);
+        return std::make_pair(a, b2);
+    }();
+    const int cpu_share_t = cpu_share.first + (cpu_share.second - cpu_share.first) * (std::max(1, std::min(T, MAXT)) - 1) / (MAXT - 1);
+    const bool cpu_sp = cpu && cpu_share_t < 100;
     RouteTail rt;
     if (b.ekeep && lyr >= 0 && lyr < NL) rt.keep = b.ekeep + (size_t) lyr * (NEXP / 32);   // FNX_EXPERT_MASK (maska_patch.py)
-    if (cpu) rt.cpu = 1, rt.cpu_dev = p100_cpu_dev(b.cpux);
-    else if (over && dma && (fold & 1)) rt.box = p100_dma_box(b.dma), rt.dev = p100_dma_dev(b.dma), rt.gu_bytes = L.gu_e_stride, rt.dn_bytes = L.down_e_stride;
+    if (cpu) rt.cpu = cpu_sp ? 2 : 1, rt.cpu_dev = p100_cpu_dev(b.cpux);
+    if (cpu_sp) rt.cpu_list = b.cpu_list, rt.cpu_share = cpu_share_t;
+    if (cpu_sp || (!cpu && over && dma && (fold & 1)))
+        rt.box = p100_dma_box(b.dma), rt.dev = p100_dma_dev(b.dma), rt.gu_bytes = L.gu_e_stride, rt.dn_bytes = L.down_e_stride;
     if (over && (fold & 2) && !lat) rt.xh = b.xh16;
     prof_mark(b, PK_ROUTER);
     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &w.ec : nullptr,
@@ -1803,7 +1826,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
             if (!rt.xh) p100_f32_f16(b.mixed, (size_t) T * N, b.xh16, b.st);
             ck(cudaEventRecord(b.fork2, b.st), "fork2");
             ck(cudaStreamWaitEvent(b.st3, b.fork2, 0), "fork2 wait");
-            p100_cpu_post(b.cpux, l, b.cache_list, b.topi, T, b.xh16, b.st3);
+            p100_cpu_post(b.cpux, l, cpu_sp ? b.cpu_list : b.cache_list, b.topi, T, b.xh16, b.st3);   // FNX_CPU_SHARE: the router's block sent the copier its list
             p100_cpu_swiglu(b.cpux, b.st3);   // FNX_CPU_EXACT: the card's SwiGLU of the CPU's gate|up rows, beside the card's own experts
             ck(cudaEventRecord(b.join2, b.st3), "join2");
         } else if (live && over && rt.box) {   // FNX_FOLD 1: the router's last block did both
@@ -1843,7 +1866,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         if (pf_wait && split) p100_dma_wait2(b.dma, b.st);
         p100_moe_rows_phase(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, T, b.h16, b.part, 1, b.st);
         prof_mark(b, PK_CACHE);
-        if (cpu) {   // the CPU's rows instead of a copy and a second phase (the third stream's post joins here: the rows cannot come before it)
+        if (cpu && !cpu_sp) {   // the CPU's rows instead of a copy and a second phase (the third stream's post joins here: the rows cannot come before it)
             ck(cudaStreamWaitEvent(b.st, b.join2, 0), "join2 wait");
             p100_cpu_take(b.cpux, b.part, T, false, b.st);
         } else {
@@ -1867,6 +1890,11 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
             p100_moe_rows_phase_w(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, T, b.h16, b.part, 2, b.st, p100_dma_done(b.dma, 1),
                                   p100_dma_want_ptr(b.dma), b.cache_list, lyr, p100_dma_err_ptr(b.dma));
         else p100_moe_rows_phase(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, T, b.h16, b.part, 2, b.st);
+        if (cpu_sp) {   // FNX_CPU_SHARE: the copied experts are done; now the CPU's rows
+            prof_mark(b, PK_CACHE);
+            ck(cudaStreamWaitEvent(b.st, b.join2, 0), "join2 wait");
+            p100_cpu_take(b.cpux, b.part, T, false, b.st);
+        }
         if (cpu_chk_x) ck(cudaStreamWaitEvent(b.st, b.join2, 0), "join2 wait");
         if (cpu_chk) p100_cpu_take(b.cpux, b.part, T, true, b.st);
         if (cpu_chk_x) p100_cpu_check_stages(b.cpux, b.gu, b.h16, b.st);
