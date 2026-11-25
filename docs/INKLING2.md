@@ -137,6 +137,103 @@ local path; checked with one picture a message). Limits: **greedy only** (no sam
 conversation reads only the new part, and so does a prompt that parts from the conversation earlier or comes back after
 another one ([checkpoints and parked conversations](#conversations-keep-their-place-p21-p23)).
 
+## Two reading chunks at once (`INK2_PF_ZIP`, 25 Nov; a contribution, measured on another machine)
+
+> ⚠️ Not from the machine the rest of this file is measured on. **This one:** 2 × Tesla P100 16 GB, card 0 on PCIe 3.0 x16 and
+> card 1 on a x4 link behind the chipset, an i7-7700 (4 cores), 48 GB of RAM, one NUMA node, CUDA 12.4 with g++ 11, driver
+> 580.159.03. Not run on two x16 links or on two sockets. Off by default: without the switch `build/ink2_v1` is the build before.
+
+`INK2_PF_ZIP=2` reads two consecutive chunks (2,048 tokens each) at once. Each card still has one stream; the two chunks'
+steps take turns on it, and a step ends where an exchange between the cards starts. So a chunk's exchange (18.9 MB each way,
+96 a chunk) crosses PCIe while the other chunk computes, instead of both cards waiting for it. Here, with card 1 on a x4 link, that
+takes 0.36 s off the 2.82 s of a chunk at 16k.
+
+- **The same bits.** Each chunk's launches and cuBLAS calls are `pf_card`'s, with the same sizes and in the same order
+  (`layer_pf` in three parts: up to the attention's exchange, from its sum to the experts' exchange, from that sum to the
+  layer's end). The second chunk's layer k runs after the first chunk's layer k, which is what its cache rows and convolution
+  states need. The chunks are cut as before, so nothing depends on the switch but the time.
+- **VRAM: 252 MiB a card.** The second chunk has its own copies of what lives across an exchange: the hidden state and its
+  four depth-mix states, the loop's three saved states and its fourth message, the exchanged rows and the drafter's
+  features (14 × a chunk's rows). Everything else is scratch within a step, and the other card's part of either chunk's
+  exchange comes back into the one buffer there was, ordered right after the sum before it. The engine prints what was to
+  spare beside the experts (804 MiB at 256k, 292 at 512k here, so 40 are left at 512k). **When it does not fit, the switch turns itself off** and
+  says so, so no expert goes to RAM for it (checked before the buffers are taken and again after, since the driver rounds
+  allocations up).
+- **Its exchange buffers** (two of 18 MiB a card, page-locked) are placed by `INK2_NUMA` like p41's; on one node that could
+  not be measured.
+- The chunks of a read go in pairs from its start and an odd last one goes alone; a piece below 2,048 + `INK2_PF_MIN`
+  tokens is one chunk and reads as before.
+
+The engine alone (`--tokens`, the drafter loaded, 32 tokens written after the prompt), reading in tok/s. In every row the
+last row's logits and the written tokens with the switch are the same files as 1aa0abe's build gives (`cmp`), and so are
+this build's without the switch at 256k:
+
+| Prompt | without the switch | `INK2_PF_ZIP=2` | |
+|---|---|---|---|
+| 5,003 tokens, 256k | 749.5 (this build) | **838.6** | +12 % |
+| 16,384 tokens, 256k | 726.2 (this build), 729.5 (1aa0abe) | **832.9** | +15 % |
+| 36,000 tokens, 256k | 661.7 (this build) | **750.8** | +13 % |
+| 36,000 tokens, 512k | 655.8 (1aa0abe) | **744.2** | +13 % |
+| 60,000 tokens, 512k (int8 rows from 32,768 on) | 589.9 (1aa0abe) | **661.4** | +12 % |
+
+Writing after the prompts is the same (57.9 / 57.5 tok/s after 16k, 53.0 / 53.1 after 36k). (This table is from an
+earlier build of the branch, with 270 MiB a card: before the guard's second look, the two error cases left to the loop, and
+the one buffer for the other card's part. The battery and `bench.py` below are from the final build, where reading came
+out 1-2 % faster still.)
+
+**Every step's logits.** The engine's socket with `"lhall": 1`, drafts on (MTP 3, lookup 15), a fixed number of written
+tokens, every arm a freshly loaded engine. The requests: 16 prompts read from token 0 with lengths around a chunk's edges
+(31, 500, 2,047, 2,048, 2,078, 2,079, 2,100, 2,304, 4,095, 4,096, 4,097, 4,126, 4,127, 6,399, 8,192 and 10,000 tokens), a
+20k conversation with checkpoints, its next turn, a prompt that parts at one of its checkpoints, another conversation, the
+first one back from RAM, and a 36k prompt (a 60k one at 512k); with and without the switch also a 200k one. Compared: `lh`, `lh2`, the written tokens, the drafted /
+accepted counts and the checkpoint a request went back to.
+
+| Arm | the same as 1aa0abe's build | reads of 4k to 36k tokens, tok/s |
+|---|---|---|
+| this build, no switch | 21 of 21 | 691.5 (1aa0abe: 688.2) |
+| `INK2_PF_ZIP=2` | 23 of 23 | **780.7** |
+| `INK2_PF_ZIP=2` while six busy loops load the CPU (other timing) | 21 of 21 | 790.0 |
+| `INK2_PF_ZIP=3` (the four longest edges and the conversations) | 9 of 9 | 787.6 |
+| `INK2_PF_CHUNK=1024`, both builds | 9 of 9 | 643.8 → 698.2 |
+| `INK2_XSPLIT=2`, both builds | 9 of 9 | 661.7 → 771.1 |
+| 512k, both builds, with the 60k prompt | 10 of 10 | 630.9 → 719.2 |
+
+The 200,000-token prompt (256k): 355.7 → 380.5 tok/s, the same hashes.
+
+Writing in these arms is the same within 1 % (68.6 tok/s over 1aa0abe's requests). A prompt whose second chunk
+does not fit the context (`--ctx 4000`, 4,090 tokens) ends in "context full" in both builds, and the request after it gives
+the same `lh` and `lh2`.
+
+Through the server (the earlier build), the switch off and on, each arm the same requests on a freshly started server (so that every read
+starts from the same state in both arms). Text, reasoning and the drafter's counts (drafted / accepted) were the same in
+all nine:
+
+- A 19,961-token prompt, its next turn (20 tokens read), a 12,815-token prompt, a 12-token one, and two with a picture
+  (after 3k tokens of text, where its rows fall into the second chunk, and before 6k). Reading 684.9 → 790.6, 700.2 →
+  805.5, 714.9 → 823.4 (the picture after the text) and 701.4 → 767.3 tok/s.
+- Reads that start from a checkpoint: a chat with a 7.4k-token system message (11,965 tokens read), a new chat with the same
+  system message (back to its end, 6,796 read) and the first chat's next turn with a long message (11,245 read from 7,434).
+  Reading 699.6 → 794.9, 681.6 → 772.8 and 652.8 → 735.6 tok/s.
+- `tools/bench.py` (256k), this build without the switch → with it, each on a freshly started server: fresh 74.9 → 74.9,
+  edit 78.4 → 78.4, the 34,701-token read **639.6 → 733.6**, writing after it 65.4 → 65.3 tok/s (1aa0abe's build on the same
+  morning: 74.3, 78.6, 644.3, 64.6).
+
+While a 36.7k-token prompt is read with the switch on, card 1 (the x4 one) is busy 100 % of the time and card 0 94 %
+(`nvidia-smi`, 0.5 s samples; measured before the buffers' last trim, 324 MiB then): reading is bound by card 1's compute,
+no longer by the link.
+
+**Tried and left out** (same bits each, measured on an experimental build that is not in this branch):
+
+- `INK2_PF_ZIP=3` (it is in: three chunks at once, 504 MiB a card): 787.6 tok/s against 780.7 with two in the battery. Nothing left to hide with a third chunk, and at 512k it does not fit.
+- The experts by token slices, each slice's exchange under the next slice's experts: four equal slices 679.8 tok/s at 16k
+  against 717.4 (smaller tiles), two 715.0, slices of 85 / 10 / 5 % 735.5 (+2.5 %) and 668.8 against 664.7 at 36k.
+- The attention's out projection and its exchange a slice as soon as its query blocks are done: 718.5 at 16k (one block a
+  chunk there), 661.0 against 664.7 at 36k.
+
+**Not run:** two x16 links (an exchange waits there in the same way, for the 2.99-3.40 ms this file gives for it, so a
+smaller gain is to be expected; not measured); two sockets; one card and `INK2_XSPLIT=1` (the switch says that it is off there); `src-1c/`,
+`src-tpb/` and `src-pp/` are untouched.
+
 ## Two cards on the one-card sources, the exchange by NUMA node (p38-p41, 24 Nov)
 
 `src/` (`build/ink2_v1`) is now the one-card build's code ([below](#one-p100-ink2_1c-23-nov), p30-p36: every expert in a block
@@ -709,7 +806,8 @@ off), `INK2_PARK_MIN` (1024, shorter conversations are read again), `INK2_FUSE2`
 controllers, 4 the norms and matrices; 1 the depth mixes and 8 the routing measured no gain), `INK2_Q8G` (1, the Q8 experts
 of the reading path by `k_q8_gemm5`; 0 = f32 copies and cuBLAS), `INK2_TILE_S` (1, expert tiles of 8 and 4 tokens),
 `INK2_CATM` (0, see below), `INK2_ATT_ROWS` (1, p38), `INK2_NUMA` (1, p41: the reading exchange's buffers on the writing
-card's node; 2 the other card's, 0 the scheduler's), `INK2_1C_MARGIN_MB` (150 with two cards, VRAM left after the experts).
+card's node; 2 the other card's, 0 the scheduler's), `INK2_1C_MARGIN_MB` (150 with two cards, VRAM left after the experts). `INK2_PF_ZIP` (0; 2 or 3 = so many
+reading chunks at once, see above; off by itself when its buffers do not fit beside the experts).
 Engine flags: `--model`, `--mtp`, `--draft-vocab`, `--ctx`,
 `--serve SOCK`, or `--tokens FILE [--gen N] [--logits F] [--logits-all F] [--dump DIR]` for tests (`--logits-all`: every row of the last window).
 
