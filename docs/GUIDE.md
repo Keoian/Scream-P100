@@ -1355,6 +1355,55 @@ logits byte for byte) and is slower than the cards alone at every share tried: 4
 `FNX_CPU_SHARE=25,40`, 37.3 with `40,40` and 28.9 with `60,60` against 51.8-54.8. `tune.py` keeps the path only where
 it gains, so there it leaves the profile as it was. A machine with both cards on x16 and fast CPUs is not measured.
 
+## The learned stop rule (FNX_DRAFT_STOP_ISO)
+
+The MTP chain's length is decided before drafting: the planner picks 1 to K drafts from how often each chain position
+was accepted lately and what a round costs, and `FNX_DRAFT_MIN_P` stops after a draft whose distribution was unsure.
+`FNX_DRAFT_STOP_ISO=<tables file>` (off unless set) decides draft by draft instead, as Keoian's learned stop rule does in
+their Qwen3.8-27B llama.cpp branch (`LLAMA_SPEC_STOP_ISO`): draft d is kept while
+
+    S(d) = iso_q(q_1) * ... * iso_q(q_(d-1)) * iso_p1(p1_d)  >=  theta
+
+where q_i is the probability of the token drawn at step i, p1_d the top probability of step d's distribution, and iso_q
+and iso_p1 are isotonic fits of how often the model accepts a draft (min(1, p/q) when sampling, the argmax test at
+temperature 0), made offline from a trace. The first draft below theta ends the chain and is not checked. A file holds
+a set of tables and a theta per temperature range (ours: 0 for greedy, 0.95-1.05 for thinking, every other positive
+temperature for chat); a request outside every range keeps the planner.
+
+**Exact.** The decision about draft d reads step d's distribution and the drafts before d, never d itself, so the chain's
+length is a stopping time and the p/q verify keeps the model's distribution (`split_stop_iso_test` checks this by Monte
+Carlo, and that a rule reading the drawn token's own q is biased). On our cards at temperature 0, card-only, the answers
+of 24 prompts were the same to the character with the rule on, off, and with full chains.
+
+**Our tables** (`engine/data/stop_iso_flash_next_q4.txt`): Flash-Next Q4 (bitlamas' Q4_K_XL-IQ4NL) with the q4_0 draft
+layer, K = 4, the English draft vocabulary, fit on 6,968 traced rounds with full chains (12 English chat prompts, 12
+HumanEval tasks and bench.py's fresh and long prompts, at temperature 0, 0.7 and 1.0); theta 0.375 / 0.525 / 0.45
+(greedy / chat / thinking), chosen at our round costs (22.5 ms + 7.4 ms a row). They are specific to that model, draft
+layer and vocabulary; theta to the machine. Make your own:
+
+```bash
+FNX_DRAFT_TRACE=/tmp/trace.txt FNX_DRAFT_ADAPT=0 FNX_DRAFT_MIN_P=0 ./run.sh ...   # full chains, then your usual requests
+python3 tune/stop_iso_fit.py /tmp/trace.txt --cost 1:22.5,2:31.6,3:37.7,4:45.5,5:52.0 \
+    --set think:0.95:1.05 --set chat:0.001:1e9 --set greedy:0:0 --out my.stop_iso
+```
+
+(`--cost`: your round's time by window rows; the trace has the verify and draft times of each round.)
+
+**Measured** (2 x P100 at 150 W, our Q4 file, the served profile with `FNX_CPU_EXPERTS=1`; three rounds, every run a fresh
+load; tok/s mean (min-max)):
+
+| test | planner + FNX_DRAFT_MIN_P 0.7 | FNX_DRAFT_STOP_ISO | |
+|---|---:|---:|---:|
+| bench.py fresh (temperature 0) | 59.2 (58.6-59.7) | 63.2 (62.9-63.4) | +6.7 % |
+| edit py / md | 109.1 / 118.0 | 111.7 / 116.4 | +2.3 / -1.4 % |
+| reading 38,862 tokens / writing after it | 883 / 47.7 | 884 / 47.6 | equal |
+| 24 English prompts not in the fit, temperature 0 | 66.8 (66.4-67.2) | 68.5 (68.0-69.3) | +2.6 % |
+| the same at 0.7 / top-p 0.8 / top-k 20 / presence 1.5 | 65.9 (65.5-66.3) | 66.2 (66.0-66.6) | +0.5 % |
+| the same at 1.0 / top-p 0.95 / top-k 20 | 65.9 (64.8-66.6) | 67.5 (66.6-68.9) | +2.4 % |
+
+One run with theta 0.3 for every set came within 1-2 % of these (the optimum is flat). Not measured: other machines,
+UD-Q4_K_XL, IQ3_S, the 2-bit draft layer, `--batch` above 1 (the batch decoder keeps its own drafting).
+
 ## Benchmark and compare
 
 With the server running:
