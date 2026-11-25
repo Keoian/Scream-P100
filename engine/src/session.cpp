@@ -506,16 +506,37 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     int mtp_chains = 0;
     const double min_p = cost_env("FNX_DRAFT_MIN_P", 0.0);
     double last_p = 1.0;   // how sure the draft layer was of the last draft (FNX_DRAFT_MIN_P)
+    // FNX_DRAFT_TRACE=<file> (measuring, off by default; appends): per MTP round one line for a learned stop rule's fit
+    // (strata tools/spec_stop_iso_fit.py): "req temp n acc q.. p1.. a.. M rows verify_ms draft_ms p1raw.." with, per draft,
+    // the drawn token's q, the top probability of the distribution it was drawn from (p1), the target's acceptance of it given
+    // the drafts before it (a: min(1, p/q) when sampling, 1/0 against the row's argmax at temperature 0, for every verified
+    // row) and the draft layer's own top probability at temperature 1 (p1raw); per lookup round "#L req temp rows acc
+    // verify_ms draft_ms"; per request "#R req temp top_p top_k presence". The candidates are fetched for every draft then.
+    static std::FILE* const tr_file = [] {
+        const char* f = std::getenv("FNX_DRAFT_TRACE");
+        return f != nullptr && f[0] != '\0' ? std::fopen(f, "a") : nullptr;
+    }();
+    static long tr_req_n = 0;
+    const long tr_req = tr_file ? ++tr_req_n : 0;
+    std::vector<double> tr_q, tr_p1, tr_raw;   // this round's drafts (d1 first)
+    if (tr_file) std::fprintf(tr_file, "#R\t%ld\t%g\t%g\t%d\t%g\n", tr_req, (double) s.temperature, (double) s.top_p, (int) s.top_k,
+                              (double) s.pen_present);
     // one draft from the draft layer for the token after pen_seq (the penalty window before it)
     auto draft_one = [&](int T, bool from_main, int src_row, const std::vector<int>& toks, int pos0, const std::vector<int>& pen_seq,
                          Dist& q) {
         Engine::Penalties::Row pen;
         if (pen_drafts) pen = penalty_row(pen_seq, s);
-        int d = e_.draft(T, from_main, src_row, toks, pos0, pen_drafts ? &pen : nullptr, samp_drafts || min_p > 0.0);
+        int d = e_.draft(T, from_main, src_row, toks, pos0, pen_drafts ? &pen : nullptr, samp_drafts || min_p > 0.0 || tr_file != nullptr);
         if (min_p > 0.0 && !e_.last_draft_cands.empty()) {
             double sum = 0.0;
             for (const auto& c : e_.last_draft_cands) sum += std::exp((double) c.first - (double) e_.last_draft_cands[0].first);
             last_p = 1.0 / sum;
+        }
+        double tr_rawp = 0.0;
+        if (tr_file && !e_.last_draft_cands.empty()) {
+            double sum = 0.0;
+            for (const auto& c : e_.last_draft_cands) sum += std::exp((double) c.first - (double) e_.last_draft_cands[0].first);
+            tr_rawp = 1.0 / sum;
         }
         st.draft_ms += e_.last_draft_ms, st.draft_gpu_ms += e_.last_draft_gpu_ms, ++st.draft_calls;
         chain_draft_ms += e_.last_draft_ms;
@@ -523,6 +544,16 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         if (samp_drafts) {
             q = make_dist(e_.last_draft_cands, s);
             d = draw(q, unif(rng));
+        }
+        if (tr_file) {
+            double top = tr_rawp;
+            if (samp_drafts) {
+                top = 0.0;
+                for (const double v : q.p) top = std::max(top, v);
+            }
+            tr_q.push_back(samp_drafts ? q.prob(d) : tr_rawp);
+            tr_p1.push_back(top);
+            tr_raw.push_back(tr_rawp);
         }
         return d;
     };
@@ -557,12 +588,14 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
             cost_sum[kd] = cost_sum[kd] * DECAY + ms_since(tv) + chain_draft_ms;
             cost_n[kd] = cost_n[kd] * DECAY + 1.0;
         }
+        const double tr_vms = ms_since(tv), tr_dms = chain_draft_ms;
         chain_draft_ms = 0.0;
         st.verify_ms += ms_since(tv);
         st.verify_gpu_ms += e_.last_gpu_ms;
         st.launch_ms += e_.last_launch_ms;
         st.embed_ms += e_.last_embed_ms;
         int n = 1;
+        std::vector<double> tr_a;
         if (!sample) {
             if (biased) {   // the greedy pick after the list: each row's best biased logit (verify()'s argmax is without it)
                 Engine::Penalties pen;
@@ -571,6 +604,8 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
                 for (size_t j = 0; j < rows.size(); ++j) o[j] = cand[j][0].second;
             }
             while (n < (int) rows.size() && rows[n] == o[n - 1]) ++n;
+            if (tr_file)
+                for (size_t j = 0; j + 1 < rows.size(); ++j) tr_a.push_back(rows[j + 1] == o[j] ? 1.0 : 0.0);
         } else {
             // speculative sampling: draft rows[j + 1], drawn from q_j (a fixed draft: q_j is all on it), stands with
             // probability min(1, p_j / q_j); else row j's token is drawn from max(0, p_j - q_j) normalized, and the window
@@ -585,6 +620,14 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
                 }
             }
             const auto cand = e_.top_tokens(T, pen);
+            if (tr_file)
+                for (int j = 0; j + 1 < T; ++j) {
+                    const Dist pj = make_dist(cand[(size_t) j], s);
+                    const int dr = rows[(size_t) j + 1];
+                    const Dist& qj = qs[(size_t) j];
+                    const double pd = pj.prob(dr), qd = qj.ids.empty() ? 1.0 : qj.prob(dr);
+                    tr_a.push_back(qd > 0.0 ? std::min(1.0, pd / qd) : 0.0);
+                }
             for (n = 0; n < T; ++n) {
                 Dist d = make_dist(cand[n], s);
                 if (n + 1 < T) {
@@ -618,6 +661,26 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
                 stood[(size_t) j] = stood[(size_t) j] * DECAY + (j < acc ? 1.0 : 0.0);
             }
         }
+        if (tr_file && !drafts.empty()) {
+            const int nd = (int) drafts.size(), acc = n - 1;
+            if (mtp_round && (int) tr_q.size() == nd && (int) tr_a.size() == nd) {
+                std::string ln = std::to_string(tr_req) + "\t" + std::to_string((double) s.temperature) + "\t" + std::to_string(nd) + "\t" +
+                                 std::to_string(acc);
+                char b[32];
+                for (const std::vector<double>* v : {&tr_q, &tr_p1, &tr_a}) {
+                    ln += "\t";
+                    for (int j = 0; j < nd; ++j) { std::snprintf(b, sizeof b, j ? ",%.5g" : "%.5g", (*v)[(size_t) j]); ln += b; }
+                }
+                std::snprintf(b, sizeof b, "\tM\t%d\t%.3f\t%.3f\t", nd + 1, tr_vms, tr_dms);
+                ln += b;
+                for (int j = 0; j < nd; ++j) { std::snprintf(b, sizeof b, j ? ",%.5g" : "%.5g", tr_raw[(size_t) j]); ln += b; }
+                std::fprintf(tr_file, "%s\n", ln.c_str());
+            } else {
+                std::fprintf(tr_file, "#L\t%ld\t%g\t%d\t%d\t%.3f\t%.3f\n", tr_req, (double) s.temperature, nd + 1, acc, tr_vms, tr_dms);
+            }
+        } else if (tr_file) {
+            std::fprintf(tr_file, "#L\t%ld\t%g\t1\t0\t%.3f\t%.3f\n", tr_req, (double) s.temperature, tr_vms, tr_dms);
+        }
         // emit the accepted drafts' successors in order until a stop: the window keeps the rows before the last emitted
         int used = 0;
         bool done = false;
@@ -647,6 +710,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         std::vector<int> pen_seq;   // the penalty window before the next token: the context's last pen_last_n
         if (pen_drafts) pen_seq.assign(ctx.size() > (size_t) s.pen_last_n ? ctx.end() - s.pen_last_n : ctx.begin(), ctx.end());
         Dist q1;
+        tr_q.clear(), tr_p1.clear(), tr_raw.clear();
         const int d1 = draft_one(used, true, 0, std::vector<int>(o.begin(), o.begin() + used), p, pen_seq, q1);
         mtp_round = false;
         if (!speculate) {
@@ -677,6 +741,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
             qs.push_back(std::move(q));
         }
     }
+    if (tr_file) std::fflush(tr_file);
     prompt_.clear();
     timing_ = nullptr;
     st.decode_ms = ms_since(t0);
