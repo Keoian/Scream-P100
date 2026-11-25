@@ -521,11 +521,12 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     // FNX_DRAFT_STOP_ISO=<tables file> (off by default; src/stop_iso.hpp, Keoian's LLAMA_SPEC_STOP_ISO): an MTP chain keeps
     // draft d while prod_{i<d} iso_q(q_i) * iso_p1(p1_d) >= theta, the maps fit offline on an FNX_DRAFT_TRACE trace
     // (tune/stop_iso_fit.py) for this model, draft layer and sampling; it replaces chain_len() and FNX_DRAFT_MIN_P for
-    // the requests whose temperature one of the file's sets covers. The decision about draft d reads the top probability
-    // of step d's distribution and the drafts before d, never d itself, so the output keeps the model's distribution.
+    // the requests whose sampling (temperature; top-p, top-k, presence where a set names them) a set of the file covers.
+    // The decision about draft d reads the top probability of step d's distribution and the drafts before d, never d
+    // itself, so the output keeps the model's distribution.
     // FNX_DRAFT_STOP_ISO_THETA=<theta>: every set's threshold (sweeps).
     static const stop_iso::Rule iso_rule = stop_iso::from_env("FNX_DRAFT_STOP_ISO", "session");
-    const stop_iso::Set* const iso_set = iso_rule.pick(s.temperature);
+    const stop_iso::Set* const iso_set = iso_rule.pick(s.temperature, s.top_p, (float) s.top_k, s.pen_present);
     double dp_p1 = 0.0, dp_q = 0.0;   // the last draft's step: the top probability of its distribution, the drawn token's q
     const long tr_req = tr_file ? ++tr_req_n : 0;
     std::vector<double> tr_q, tr_p1, tr_raw;   // this round's drafts (d1 first)

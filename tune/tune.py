@@ -28,6 +28,11 @@ Groups (--only):
   ple       FNX_PLE_RAM 0 / 1 (the 26.8 GiB lookup table in RAM or read from the disk), only when the RAM allows it
   stage     FNX_PF_STAGE_MIB / FNX_PF_TAIL_MIB (the prompt path's staging buffers and lent slots); not in the default set,
             as ours are at the size of the largest layer already and smaller ones were slower on ours
+  draft     FNX_DRAFT_STOP_ISO, the learned stop rule for the MTP chain (docs/GUIDE.md, "The learned stop rule"): one load
+            traces full chains (FNX_DRAFT_ADAPT=0 FNX_DRAFT_MIN_P=0 FNX_DRAFT_TRACE) over tune/stop_iso_prompts.json at its
+            samplings (none of them bench.py's prompts), tune/stop_iso_fit.py fits this model's, draft layer's and machine's
+            tables from it, and the next load measures them against the length planner; kept, the tables are written next
+            to --out (stop_iso.txt). It only chooses which drafts are checked: the logits stay the baseline's
   convcache --conversation-cache-mib, only when the baseline came close to swapping (it changes RAM, not speed)
   cpu_exact the exact CPU path: FNX_CPU_EXPERTS=1 with FNX_CPU_EXACT=1 (docs/GUIDE.md, "The exact CPU path"). The CPU computes a
             part of a window's missing experts with the cards' own arithmetic while the copy engine brings the others, so the
@@ -78,12 +83,13 @@ import bench  # noqa: E402
 
 METRICS = {"fresh": ("fresh",), "edit": ("edit_py", "edit_md"), "long": ("long_read", "long_write"), "medium": ("medium",)}
 MIN_GAIN = {"fresh": 4.0, "long_write": 4.0}   # clock-sensitive; the others take --min-gain
-GROUPS = ("prefetch", "dma", "experts", "ple", "convcache", "cpu_exact")
+GROUPS = ("prefetch", "dma", "experts", "ple", "draft", "convcache", "cpu_exact")
 # the only switches it changes: output effect "none" in docs/SWITCHES.md; the two below only with their options
 INEXACT = {"FNX_ROUTE_PRIOR": "allow_lossy", "FNX_CPU_EXPERTS": "allow_cpu_experts"}
 EXACT = {"FNX_PREFETCH", "FNX_PREFETCH_WANT", "FNX_PREFETCH_MIN_T", "FNX_PREFETCH_FILE", "FNX_DMA_SPLIT", "FNX_EXPERT_DYN_GIB",
          "FNX_EXPERT_RAM_GIB", "FNX_PF_STAGE_MIB", "FNX_PF_TAIL_MIB", "FNX_PLE_RAM", "--conversation-cache-mib",
-         "FNX_CPU_EXACT", "FNX_CPU_MIN_T", "FNX_CPU_MAX_T", "FNX_CPU_SHARE", "FNX_CPU_THREADS", "FNX_CPU_CHECK", "FNX_CPU_WARM"}
+         "FNX_CPU_EXACT", "FNX_CPU_MIN_T", "FNX_CPU_MAX_T", "FNX_CPU_SHARE", "FNX_CPU_THREADS", "FNX_CPU_CHECK", "FNX_CPU_WARM",
+         "FNX_DRAFT_STOP_ISO", "FNX_DRAFT_TRACE", "FNX_DRAFT_ADAPT", "FNX_DRAFT_MIN_P"}
 CPU_EXACT_ON = {"FNX_CPU_EXPERTS": "1", "FNX_CPU_EXACT": "1"}   # together: the CPU computes with the cards' own arithmetic (exact)
 
 
@@ -400,6 +406,11 @@ class Tuner:
         if "stage" in groups:
             s, t = int(e.get("FNX_PF_STAGE_MIB", 384)), int(e.get("FNX_PF_TAIL_MIB", 2450))
             out.append(("stage", [{"FNX_PF_STAGE_MIB": s // 2, "FNX_PF_TAIL_MIB": t - s}, {"FNX_PF_TAIL_MIB": t + 512}]))
+        if "draft" in groups:
+            if "--mtp" not in self.base["args"] or int(self.arg("--spec") or 1) < 2:
+                self.log("draft: the profile drafts with no MTP chain (--mtp, --spec 2 or more): FNX_DRAFT_STOP_ISO not tried")
+            else:   # the tables come from a trace first (draft_tables, in run)
+                out.append(("draft", [{"FNX_DRAFT_STOP_ISO": "(the tables of the draft trace)"}]))
         if "cpu_exact" in groups:
             why = self.cpu_experts_unfit(e)
             if why:
@@ -475,6 +486,43 @@ class Tuner:
         self.log(f"screen: edits by value {sc}; ahead of {cur}: {ahead[:2] or 'none'}")
         return ahead[:2]
 
+    # ------------------------------------------------------------------ the learned stop rule's tables
+    def draft_tables(self, best_changes):
+        """one load: full MTP chains traced over tune/stop_iso_prompts.json at its samplings; then tune/stop_iso_fit.py.
+        Returns the tables file, or None (logged)"""
+        spec = json.loads((HERE / "stop_iso_prompts.json").read_text(encoding="utf-8"))
+        trace = self.work / "draft-trace.txt"
+        if trace.exists():
+            trace.unlink()
+
+        def run(b):
+            n = 0
+            for smp in spec["samplings"]:
+                for k, p in enumerate(spec["prompts"]):
+                    s = dict(smp["sampling"])
+                    if s.get("temperature", 0) > 0:
+                        s["seed"] = 1000 + k
+                    b.chat([{"role": "user", "content": p}], spec["max_tokens"], effort=smp["effort"], sampling=s)
+                    n += 1
+                self.log(f"draft trace: {smp['name']} done ({len(spec['prompts'])} prompts)")
+            return {"requests": n}
+        res = self.arm("draft_trace", dict(best_changes, FNX_DRAFT_TRACE=str(trace), FNX_DRAFT_ADAPT=0, FNX_DRAFT_MIN_P=0), screen=run)
+        if "error" in res or not trace.exists():
+            self.log(f"draft: no trace ({res.get('error', 'no file')}): FNX_DRAFT_STOP_ISO not tried")
+            return None
+        out = self.work / "stop_iso.txt"
+        cmd = [sys.executable, str(HERE / "stop_iso_fit.py"), str(trace), "--cost", "auto", "--out", str(out),
+               "--report", str(self.work / "stop_iso_fit.md")]
+        for st in spec["sets"]:
+            cmd += ["--set", st]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        if r.returncode or not out.exists():
+            self.log(f"draft: the fit failed: {(r.stderr or r.stdout).strip()[-300:]}")
+            return None
+        sets = [l for l in out.read_text().splitlines() if l.startswith("set ")]
+        self.log(f"draft: tables {out}: " + "; ".join(l.split("#")[0].strip() for l in sets))
+        return out
+
     # ------------------------------------------------------------------ deciding
     def better(self, new, old):
         """(accepted, reason): faster on the mean of the tests by more than the noise, and no test slower by more than its noise"""
@@ -546,7 +594,7 @@ class Tuner:
         self.log("plan: " + "; ".join(f"{g}: " + (" | ".join(fmt(c) for c in cs) if isinstance(cs, list) else "from what the groups before kept")
                                       for g, cs in plan))
         late = {"cpu_exact_wide": 2, "cpu_exact_small": 2}
-        n = 2 + sum(len(cs) if isinstance(cs, list) else late.get(g, 1) for g, cs in plan) + 1 + (1 if any(g == "cpu_exact" for g, _ in plan) else 0)
+        n = 2 + sum(len(cs) if isinstance(cs, list) else late.get(g, 1) for g, cs in plan) + 1 + (1 if any(g == "cpu_exact" for g, _ in plan) else 0) + sum(1 for g, _ in plan if g == "draft")   # the draft group's trace load
         self.log(f"about {n} loads of 8-12 minutes each: {n * 10 // 60} h {n * 10 % 60} min (fewer with --screen)")
         if a.dry_run:
             return "dry-run"
@@ -588,6 +636,11 @@ class Tuner:
                 self.log(f"{group}: " + (" | ".join(fmt(c) for c in cands) if cands else "nothing to try (the path was not kept)"))
             if group == "prefetch_min_t" and self.env_of(best).get("FNX_PREFETCH") == "0":
                 continue   # prefetch is off: its window size means nothing
+            if group == "draft":
+                tables = self.draft_tables(best)
+                if tables is None:
+                    continue
+                cands = [{"FNX_DRAFT_STOP_ISO": str(tables)}]
             winner = None
             tried = []
             for i, c in enumerate(cands):
@@ -672,6 +725,10 @@ class Tuner:
         return True if same else None
 
     def write(self, best, tried, base, final, same):
+        if best.get("FNX_DRAFT_STOP_ISO"):   # the tables go next to the profile, which names them there
+            dst = Path(self.a.out).parent / "stop_iso.txt"
+            dst.write_bytes(Path(best["FNX_DRAFT_STOP_ISO"]).read_bytes())
+            best = dict(best, FNX_DRAFT_STOP_ISO=str(dst))
         cfg, _ = self.config("tuned", best, dump=False)
         cfg["log"] = self.base.get("log")
         out = Path(self.a.out)
@@ -682,7 +739,8 @@ class Tuner:
              "|---|---|" + "---:|" * len(metric_names(self.tests)) + "---:|---:|---|---|"]
         for r in self.results:
             if "screen" in r:
-                L.append(f"| screen | FNX_PREFETCH_FILE | edits by value: {fmt(r['screen'])} |" + " |" * (len(metric_names(self.tests)) + 3))
+                what = "FNX_DRAFT_TRACE (full chains)" if r["name"] == "draft_trace" else "FNX_PREFETCH_FILE"
+                L.append(f"| {r['name']} | {what} | {fmt(r['screen'])} |" + " |" * (len(metric_names(self.tests)) + 3))
                 continue
             m = r.get("metrics", {})
             L.append(f"| {r['name']} | {fmt(r['changes']) or '-'} | " + " | ".join(f"{m[k]:.1f}" if m.get(k) else "-" for k in metric_names(self.tests))

@@ -218,6 +218,16 @@ int main() {
                   "pick(): the first set whose window holds the temperature (1.0 -> think, 0.7 -> chat)");
             check(r.pick(0.0f) == nullptr && r.pick(-1.0f) == nullptr, "pick(): greedy (0) and outside every window -> none");
             check(std::fabs(r.sets[1].q(0.5f) - 0.4f) < 1e-6f && r.sets[1].p1(2.0f) == 1.0f, "the loaded maps interpolate and clamp");
+            const std::string keyed =
+                "stop_iso 1\nset instruct theta 0.5 temp 0.6 0.8 top_p 0.7 0.9 presence 1 2\nx 0 1\nq 0 1\np1 0 1\n"
+                "set chat theta 0.4 temp 0.001 1e9\nx 0 1\nq 0 1\np1 0 1\n";
+            stop_iso::Rule rk;
+            const bool kl = write_file(path, keyed) && stop_iso::load(path, rk, err);
+            const stop_iso::Set* k1 = kl ? rk.pick(0.7f, 0.8f, 20.0f, 1.5f) : nullptr;
+            const stop_iso::Set* k2 = kl ? rk.pick(0.7f, 0.95f, 20.0f, 1.5f) : nullptr;
+            const stop_iso::Set* k3 = kl ? rk.pick(0.7f, 0.8f, 20.0f, 0.0f) : nullptr;
+            check(k1 && k1->name == "instruct" && k2 && k2->name == "chat" && k3 && k3->name == "chat",
+                  "top_p / presence ranges: 0.7-0.8-1.5 -> instruct; top-p 0.95 or presence 0 -> chat");
             r.set_theta(0.4f);
             check(r.sets[0].theta == 0.4f && r.sets[1].theta == 0.4f, "set_theta() overrides every set");
         }
@@ -232,6 +242,8 @@ int main() {
             "stop_iso 1\nset a theta 0.1 temp 0 1\nx 0 0.5 1\nq 0 1\np1 0 1\n",   // lengths
             "stop_iso 1\nset a theta 2 temp 0 1\nx 0 1\nq 0 1\np1 0 1\n",         // theta
             "stop_iso 1\nset a theta 0.1 temp 0 1\nx 0 1\nq 0 1\np1 0 1\nz 1\n",  // unknown key
+            "stop_iso 1\nset a theta 0.1 temp 0 1 top_q 0 1\nx 0 1\nq 0 1\np1 0 1\n",  // unknown range
+            "stop_iso 1\nset a theta 0.1 temp 0 1 top_p 0.9 0.1\nx 0 1\nq 0 1\np1 0 1\n",  // lo > hi
         };
         int refused = 0;
         for (const char* t : bad) {
@@ -239,7 +251,7 @@ int main() {
             std::string e2;
             if (write_file(path, t) && !stop_iso::load(path, rb, e2) && !rb.on() && !e2.empty()) ++refused;
         }
-        check(refused == (int) (sizeof bad / sizeof bad[0]), "ten malformed files are refused, each with a reason");
+        check(refused == (int) (sizeof bad / sizeof bad[0]), "twelve malformed files are refused, each with a reason");
         stop_iso::Rule rm;
         check(!stop_iso::load("/nonexistent/stop_iso.tables", rm, err), "a missing file is refused");
         std::remove(path.c_str());

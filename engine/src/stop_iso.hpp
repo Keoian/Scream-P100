@@ -25,11 +25,13 @@
 //
 // Tables file (text, written by tune/stop_iso_fit.py; '#' starts a comment):
 //     stop_iso 1
-//     set <name> theta <theta> temp <lo> <hi>      a table pair for requests whose temperature t has lo <= t <= hi
+//     set <name> theta <theta> temp <lo> <hi> [top_p <lo> <hi>] [top_k <lo> <hi>] [presence <lo> <hi>]
+//                                                  a table pair for requests whose temperature (and, where given, top-p,
+//                                                  top-k with 0 = no cut, presence penalty) lie in those ranges
 //     x  <k values, increasing>                     the knots of both maps (2 <= k <= 64)
 //     q  <k values in [0, 1], non-decreasing>       iso_q at the knots
 //     p1 <k values in [0, 1], non-decreasing>       iso_p1 at the knots
-//     (more sets; the FIRST set whose window holds a request's temperature is used, none: the engine's own rule)
+//     (more sets; the FIRST set whose ranges hold the request's sampling is used, none: the engine's own rule)
 // Between knots the maps are linear, outside them constant (the owner's spec_iso_lookup).
 #pragma once
 
@@ -62,18 +64,22 @@ struct Set {
     std::string name;
     float theta = 0.0f;
     float t_lo = 0.0f, t_hi = 0.0f;
+    float p_lo = -1e30f, p_hi = 1e30f, k_lo = -1e30f, k_hi = 1e30f, pr_lo = -1e30f, pr_hi = 1e30f;   // unset: any
     Map q, p1;
-    bool serves(float temperature) const { return temperature >= t_lo && temperature <= t_hi; }
+    bool serves(float temperature, float top_p = 1.0f, float top_k = 0.0f, float presence = 0.0f) const {
+        return temperature >= t_lo && temperature <= t_hi && top_p >= p_lo && top_p <= p_hi && top_k >= k_lo && top_k <= k_hi &&
+               presence >= pr_lo && presence <= pr_hi;
+    }
 };
 
 struct Rule {
     std::vector<Set> sets;
     std::string path;
     bool on() const { return !sets.empty(); }
-    /// The set for a request at `temperature` (the first whose window holds it); nullptr: the engine's own rule.
-    const Set* pick(float temperature) const {
+    /// The set for a request's sampling (the first whose ranges hold it); nullptr: the engine's own rule.
+    const Set* pick(float temperature, float top_p = 1.0f, float top_k = 0.0f, float presence = 0.0f) const {
         for (const Set& s : sets)
-            if (s.theta > 0.0f && s.serves(temperature)) return &s;
+            if (s.theta > 0.0f && s.serves(temperature, top_p, top_k, presence)) return &s;
         return nullptr;
     }
     /// Every set's theta replaced (a sweep: <switch>_THETA); theta <= 0 leaves them.
@@ -86,8 +92,16 @@ struct Rule {
         std::string out;
         char b[160];
         for (const Set& s : sets) {
-            std::snprintf(b, sizeof b, "%s%s theta %.3g temp %.3g..%.3g (%zu knots)", out.empty() ? "" : ", ", s.name.c_str(),
-                          (double) s.theta, (double) s.t_lo, (double) s.t_hi, s.q.x.size());
+            std::snprintf(b, sizeof b, "%s%s theta %.3g temp %.3g..%.3g", out.empty() ? "" : ", ", s.name.c_str(),
+                          (double) s.theta, (double) s.t_lo, (double) s.t_hi);
+            out += b;
+            const struct { const char* k; float lo, hi; } extra[] = {{"top_p", s.p_lo, s.p_hi}, {"top_k", s.k_lo, s.k_hi}, {"presence", s.pr_lo, s.pr_hi}};
+            for (const auto& e : extra)
+                if (e.lo > -1e29f || e.hi < 1e29f) {
+                    std::snprintf(b, sizeof b, " %s %.3g..%.3g", e.k, (double) e.lo, (double) e.hi);
+                    out += b;
+                }
+            std::snprintf(b, sizeof b, " (%zu knots)", s.q.x.size());
             out += b;
         }
         return out;
@@ -164,6 +178,15 @@ inline bool load(const std::string& path, Rule& out, std::string& err) {
                 return fail("expected 'set <name> theta <theta> temp <lo> <hi>'");
             if (!std::isfinite(s.theta) || s.theta < 0.0f || s.theta > 1.0f || !(s.t_lo <= s.t_hi))
                 return fail("theta must be in [0, 1] and lo <= hi");
+            std::string k;
+            while (ls >> k) {
+                float lo, hi;
+                if (!(ls >> lo >> hi) || !(lo <= hi)) return fail("'" + k + "' needs <lo> <hi> with lo <= hi");
+                if (k == "top_p") s.p_lo = lo, s.p_hi = hi;
+                else if (k == "top_k") s.k_lo = lo, s.k_hi = hi;
+                else if (k == "presence") s.pr_lo = lo, s.pr_hi = hi;
+                else return fail("unknown range '" + k + "' (top_p, top_k, presence)");
+            }
             r.sets.push_back(std::move(s));
             continue;
         }

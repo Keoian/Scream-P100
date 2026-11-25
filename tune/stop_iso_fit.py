@@ -17,10 +17,17 @@ TRACE (one line per verify round of an MTP chain, tab-separated; '#' lines are s
         every row of a window, so a is known past the first rejection too; a '-' (unknown) falls back to the outcome
         (1 before acc, 0 at acc, the rows after it unused).
 For the fit and the simulation the chain must NOT have been cut by a stop rule while tracing (draft the full K): a
-rule-cut trace only shows the drafts the old rule liked.
+rule-cut trace only shows the drafts the old rule liked. FNX_DRAFT_TRACE's other lines are used too: "#R req temp top_p
+top_k presence" gives each request's sampling (for sets with top_p / top_k / presence ranges), "#L req temp rows acc
+verify_ms draft_ms" a lookup round's time (for --cost auto); its MTP lines carry "M rows verify_ms draft_ms" after a.
 
 COST: --cost "1:22.2,2:29.7,..." = a round's time (ms) by window rows (1 + drafts), this machine's; the simulation
-prices a round that keeps L drafts at cost[L + 1].
+prices a round that keeps L drafts at cost[L + 1]. --cost auto: from the trace's own verify ms: the mean
+of 1-row rounds and of full chains, the widths between on the line through them, plus the mean ms of a draft call a draft
+(FNX_DRAFT_TRACE's columns 8-10).
+
+SETS: --set name:lo:hi[,top_p=lo:hi][,top_k=lo:hi][,presence=lo:hi], in priority order: a round goes to the first set
+whose ranges hold its request's sampling (top_k 0 = no cut).
 
     stop_iso_fit.py TRACE... --cost 1:22.2,2:29.7,3:34.5,4:41.1,5:51.1 --set think:0.95:1.05 --set chat:0.001:1e9 \
         --out model.stop_iso [--theta 0.05:0.40:0.025] [--report report.md]
@@ -89,11 +96,21 @@ def lookup(tab, x):   # the engine's Map (stop_iso.hpp), in double
     return tab[-1]
 
 
-def read(paths):
+def read(paths, timing=None):
+    """the MTP rounds; `timing` (a list) also gets (rows, verify ms, draft ms, drafts) of every traced round"""
     rounds = []
     for path in paths:
+        samp = {}
         with open(path, errors="replace") as f:
             for ln, line in enumerate(f, 1):
+                if line.startswith("#R\t"):
+                    c = line.rstrip("\n").split("\t")
+                    samp[c[1]] = (float(c[2]), float(c[3]), float(c[4]), float(c[5]))
+                    continue
+                if line.startswith("#L\t") and timing is not None:
+                    c = line.rstrip("\n").split("\t")
+                    timing.append((int(c[3]), float(c[5]), float(c[6]), 0))
+                    continue
                 if not line.strip() or line.startswith("#"):
                     continue
                 c = line.rstrip("\n").split("\t")
@@ -109,8 +126,54 @@ def read(paths):
                 p1 = [float(v) for v in lists[1]]
                 a = [(1.0 if j < acc else 0.0) if v == "-" else float(v) for j, v in enumerate(lists[2])]
                 known = [v != "-" for v in lists[2]]
-                rounds.append(dict(req=f"{path}:{c[0]}", temp=float(c[1]), n=n, acc=acc, q=q, p1=p1, a=a, known=known))
+                t, tp, tk, pr = samp.get(c[0], (float(c[1]), 1.0, 0.0, 0.0))
+                rounds.append(dict(req=f"{path}:{c[0]}", temp=t, top_p=tp, top_k=tk, presence=pr, n=n, acc=acc, q=q, p1=p1, a=a,
+                                   known=known))
+                if timing is not None and len(c) >= 11 and c[7] == "M":
+                    timing.append((int(c[8]), float(c[9]), float(c[10]), n))
     return rounds
+
+
+def auto_cost(timing, top):
+    """rows -> ms from the trace's own rounds: the mean verify ms of 1-row rounds (each request's first) and of full
+    chains (top rows), the rows between on the line through those two (a line through every round, lookup windows of up
+    to 16 rows included, bends with their cost and prices short windows far too low), plus a draft call per draft"""
+    by = {}
+    for r, v, _, _ in timing:
+        if r <= top:
+            by.setdefault(r, []).append(v)
+    drafts = sum(d for _, _, _, d in timing)
+    call = sum(dm for _, _, dm, d in timing if d) / drafts if drafts else 0.0
+    if len(by.get(1, [])) >= 10 and len(by.get(top, [])) >= 10:
+        c1, ct = sum(by[1]) / len(by[1]), sum(by[top]) / len(by[top])
+        b = (ct - c1) / (top - 1)
+        a0 = c1 - b
+    else:
+        pts = [(r, v) for r, vs in by.items() for v in vs]
+        if len(pts) < 20 or len(by) < 2:
+            sys.exit("--cost auto: the trace needs rounds of 1 row and of full chains (or 20 rounds of two widths)")
+        n = len(pts)
+        mx, my = sum(x for x, _ in pts) / n, sum(y for _, y in pts) / n
+        b = sum((x - mx) * (y - my) for x, y in pts) / sum((x - mx) ** 2 for x, _ in pts)
+        a0 = my - b * mx
+    return {r: a0 + b * r + (r - 1) * call for r in range(1, top + 1)}, (a0, b, call)
+
+
+def parse_set(spec):
+    head, *extra = spec.split(",")
+    name, lo, hi = head.split(":")
+    rng = {"temp": (float(lo), float(hi))}
+    for e in extra:
+        k, v = e.split("=")
+        a, b = v.split(":")
+        if k not in ("top_p", "top_k", "presence"):
+            sys.exit(f"--set {spec}: unknown range {k}")
+        rng[k] = (float(a), float(b))
+    return name, rng
+
+
+def holds(rng, r):
+    return all(lo <= r[k] <= hi for k, (lo, hi) in rng.items())
 
 
 def survival_kept(r, tq, tp, theta):
@@ -151,26 +214,32 @@ def simulate(rounds, cost, keep):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("trace", nargs="+")
-    ap.add_argument("--cost", required=True, help="rows:ms,... a round's time by window rows (1 + drafts)")
-    ap.add_argument("--set", action="append", required=True, help="name:lo:hi (temperature window), in priority order")
+    ap.add_argument("--cost", required=True, help="rows:ms,... a round's time by window rows (1 + drafts), or auto")
+    ap.add_argument("--set", action="append", required=True,
+                    help="name:lo:hi[,top_p=lo:hi][,top_k=lo:hi][,presence=lo:hi] (temperature and other ranges), in priority order")
     ap.add_argument("--out", required=True, help="the tables file to write (stop_iso 1)")
     ap.add_argument("--theta", default="0.025:0.50:0.025", help="lo:hi:step of the theta grid")
     ap.add_argument("--min-p", default="0.3,0.5,0.7", help="p1 cut-offs to compare against (keep while p1 >= p)")
     ap.add_argument("--test-share", type=float, default=0.25, help="share of requests held out for the report")
     ap.add_argument("--report", help="write the comparison as markdown here too")
     a = ap.parse_args()
-    cost = {int(k): float(v) for k, v in (kv.split(":") for kv in a.cost.split(","))}
-    sets = []
-    for s in a.set:
-        name, lo, hi = s.split(":")
-        sets.append((name, float(lo), float(hi)))
+    sets = [parse_set(s) for s in a.set]
     lo, hi, st = (float(v) for v in a.theta.split(":"))
     grid = [round(lo + i * st, 6) for i in range(int(round((hi - lo) / st)) + 1)]
-    rounds = read(a.trace)
-    lines = [f"# stop_iso_fit.py: {len(rounds)} rounds from {', '.join(a.trace)}", f"# cost (ms by rows): {a.cost}"]
-    out = ["stop_iso 1", f"# fit by tune/stop_iso_fit.py on {len(rounds)} traced rounds; cost {a.cost}"]
-    for name, tlo, thi in sets:
-        rs = [r for r in rounds if next((n for n, l, h in sets if l <= r["temp"] <= h), None) == name]
+    timing = []
+    rounds = read(a.trace, timing)
+    if a.cost == "auto":
+        K = max((r["n"] for r in rounds), default=4)
+        cost, (c0, c1, call) = auto_cost(timing, K + 1)
+        cost_txt = f"auto: verify {c0:.1f} + {c1:.2f} ms a row, {call:.2f} ms a draft call -> " + ",".join(f"{k}:{v:.1f}" for k, v in cost.items())
+    else:
+        cost = {int(k): float(v) for k, v in (kv.split(":") for kv in a.cost.split(","))}
+        cost_txt = a.cost
+    lines = [f"# stop_iso_fit.py: {len(rounds)} rounds from {', '.join(a.trace)}", f"# cost (ms by rows): {cost_txt}"]
+    out = ["stop_iso 1", f"# fit by tune/stop_iso_fit.py on {len(rounds)} traced rounds; cost {cost_txt}"]
+    for name, rng in sets:
+        tlo, thi = rng["temp"]
+        rs = [r for r in rounds if next((n for n, g in sets if holds(g, r)), None) == name]
         if not rs:
             lines.append(f"\n## set {name} ({tlo}..{thi}): no rounds, not written")
             continue
@@ -208,7 +277,8 @@ def main():
         lines.append("|---|" + "---:|" * len(KNOTS))
         lines.append("| iso_q | " + " | ".join(f"{v:.3f}" for v in tq) + " |")
         lines.append("| iso_p1 | " + " | ".join(f"{v:.3f}" for v in tp) + " |")
-        out += [f"set {name} theta {best:g} temp {tlo:g} {thi:g}   # best on dev; {len(ya)} drafts",
+        keys = "".join(f" {k} {lo_:g} {hi_:g}" for k, (lo_, hi_) in rng.items() if k != "temp")
+        out += [f"set {name} theta {best:g} temp {tlo:g} {thi:g}{keys}   # best on dev; {len(ya)} drafts",
                 "x " + " ".join(f"{k:g}" for k in KNOTS),
                 "q " + " ".join(f"{v:.4f}" for v in tq),
                 "p1 " + " ".join(f"{v:.4f}" for v in tp)]
