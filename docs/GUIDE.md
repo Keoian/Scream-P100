@@ -1367,8 +1367,9 @@ their Qwen3.8-27B llama.cpp branch (`LLAMA_SPEC_STOP_ISO`): draft d is kept whil
 where q_i is the probability of the token drawn at step i, p1_d the top probability of step d's distribution, and iso_q
 and iso_p1 are isotonic fits of how often the model accepts a draft (min(1, p/q) when sampling, the argmax test at
 temperature 0), made offline from a trace. The first draft below theta ends the chain and is not checked. A file holds
-a set of tables and a theta per temperature range (ours: 0 for greedy, 0.95-1.05 for thinking, every other positive
-temperature for chat); a request outside every range keeps the planner.
+sets of tables, each with its theta and the sampling it serves: a temperature range and, where given, top-p, top-k and
+presence-penalty ranges (`set instruct theta 0.45 temp 0.6 0.8 top_p 0.7 0.9 presence 1 2`). A request gets the first set
+whose ranges hold its sampling; a request that no set covers keeps the planner.
 
 **Exact.** The decision about draft d reads step d's distribution and the drafts before d, never d itself, so the chain's
 length is a stopping time and the p/q verify keeps the model's distribution (`split_stop_iso_test` checks this by Monte
@@ -1379,15 +1380,22 @@ of 24 prompts were the same to the character with the rule on, off, and with ful
 layer, K = 4, the English draft vocabulary, fit on 6,968 traced rounds with full chains (12 English chat prompts, 12
 HumanEval tasks and bench.py's fresh and long prompts, at temperature 0, 0.7 and 1.0); theta 0.375 / 0.525 / 0.45
 (greedy / chat / thinking), chosen at our round costs (22.5 ms + 7.4 ms a row). They are specific to that model, draft
-layer and vocabulary; theta to the machine. Make your own:
+layer and vocabulary; theta to the machine. Make your own with the tuner (one load traces, the next measures; see
+[tune/README.md](../tune/README.md)):
+
+```bash
+python3 tune/tune.py --data /data/flash-next --only draft    # writes DATA/stop_iso.txt and a profile that names it, if it wins
+```
+
+or by hand, from your own requests:
 
 ```bash
 FNX_DRAFT_TRACE=/tmp/trace.txt FNX_DRAFT_ADAPT=0 FNX_DRAFT_MIN_P=0 ./run.sh ...   # full chains, then your usual requests
-python3 tune/stop_iso_fit.py /tmp/trace.txt --cost 1:22.5,2:31.6,3:37.7,4:45.5,5:52.0 \
-    --set think:0.95:1.05 --set chat:0.001:1e9 --set greedy:0:0 --out my.stop_iso
+python3 tune/stop_iso_fit.py /tmp/trace.txt --cost auto \
+    --set thinking:0.95:1.05 --set chat:0.001:1e9 --set greedy:0:0 --out my.stop_iso
 ```
 
-(`--cost`: your round's time by window rows; the trace has the verify and draft times of each round.)
+(`--cost auto` prices the rounds from the trace's own times; `--set name:lo:hi,top_p=lo:hi,presence=lo:hi` adds ranges.)
 
 **Measured** (2 x P100 at 150 W, our Q4 file, the served profile with `FNX_CPU_EXPERTS=1`; three rounds, every run a fresh
 load; tok/s mean (min-max)):

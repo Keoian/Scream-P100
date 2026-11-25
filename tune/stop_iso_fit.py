@@ -218,7 +218,7 @@ def main():
     ap.add_argument("--set", action="append", required=True,
                     help="name:lo:hi[,top_p=lo:hi][,top_k=lo:hi][,presence=lo:hi] (temperature and other ranges), in priority order")
     ap.add_argument("--out", required=True, help="the tables file to write (stop_iso 1)")
-    ap.add_argument("--theta", default="0.025:0.50:0.025", help="lo:hi:step of the theta grid")
+    ap.add_argument("--theta", default="0.025:0.95:0.025", help="lo:hi:step of the theta grid (a card that copies its missing experts in, at 15 ms or more a row, wants a high theta)")
     ap.add_argument("--min-p", default="0.3,0.5,0.7", help="p1 cut-offs to compare against (keep while p1 >= p)")
     ap.add_argument("--test-share", type=float, default=0.25, help="share of requests held out for the report")
     ap.add_argument("--report", help="write the comparison as markdown here too")
