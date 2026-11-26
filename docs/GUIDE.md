@@ -1376,11 +1376,17 @@ length is a stopping time and the p/q verify keeps the model's distribution (`sp
 Carlo, and that a rule reading the drawn token's own q is biased). On our cards at temperature 0, card-only, the answers
 of 24 prompts were the same to the character with the rule on, off, and with full chains.
 
-**Our tables** (`engine/data/stop_iso_flash_next_q4.txt`): Flash-Next Q4 (bitlamas' Q4_K_XL-IQ4NL) with the q4_0 draft
-layer, K = 4, the English draft vocabulary, fit on 6,968 traced rounds with full chains (12 English chat prompts, 12
-HumanEval tasks and bench.py's fresh and long prompts, at temperature 0, 0.7 and 1.0); theta 0.375 / 0.525 / 0.45
-(greedy / chat / thinking), chosen at our round costs (22.5 ms + 7.4 ms a row). They are specific to that model, draft
-layer and vocabulary; theta to the machine. Make your own with the tuner (one load traces, the next measures; see
+**Tables** (`engine/data/`; add `"FNX_DRAFT_STOP_ISO": "<release>/engine/data/<file>"` to the profile's `"env"`):
+
+| file | profile | thinking / chat / greedy theta | how |
+|---|---|---|---|
+| `stop_iso_flash_next_iq3s.txt` | IQ3_S 512k (the 2-bit draft layer) | 0.425 / 0.375 / 0.5 | written by `tune.py --only draft` on our machine |
+| `stop_iso_flash_next_ud_q4_k_xl.txt` | UD-Q4_K_XL 512k (the q4_0 draft layer, no CPU path) | 0.6 / 0.55 / 0.6 | fit on 19,072 traced rounds at six samplings |
+| `stop_iso_flash_next_q4.txt` | bitlamas' Q4_K_XL-IQ4NL with `FNX_CPU_EXPERTS=1` and the English draft vocabulary | 0.45 / 0.525 / 0.375 | our own served setup |
+
+All three use the profile's draft vocabulary (the first two the Slovenian one) and K = 4. They are specific to the model, the
+draft layer and the vocabulary, and theta is specific to the machine (a profile that copies its missing experts in pays
+about 16 ms a row here and wants a high theta). Make your own with the tuner (one load traces, the next measures; see
 [tune/README.md](../tune/README.md)):
 
 ```bash
@@ -1397,20 +1403,39 @@ python3 tune/stop_iso_fit.py /tmp/trace.txt --cost auto \
 
 (`--cost auto` prices the rounds from the trace's own times; `--set name:lo:hi,top_p=lo:hi,presence=lo:hi` adds ranges.)
 
-**Measured** (2 x P100 at 150 W, our Q4 file, the served profile with `FNX_CPU_EXPERTS=1`; three rounds, every run a fresh
-load; tok/s mean (min-max)):
+**Do top-p and presence need their own tables?** Not on our trace of UD-Q4_K_XL at six samplings (the card's thinking
+1.0 / 0.95 / 20 and instruct 0.7 / 0.8 / 20 / presence 1.5, greedy, and 0.7 / 0.95 / presence 0, 1.0 / 0.95 / presence 1.5,
+0.6 / 0.95): each sampling's own tables beat those of the set it falls in by at most 0.2 % (simulated on held-out
+requests). So the files keep three sets.
 
-| test | planner + FNX_DRAFT_MIN_P 0.7 | FNX_DRAFT_STOP_ISO | |
-|---|---:|---:|---:|
-| bench.py fresh (temperature 0) | 59.2 (58.6-59.7) | 63.2 (62.9-63.4) | +6.7 % |
-| edit py / md | 109.1 / 118.0 | 111.7 / 116.4 | +2.3 / -1.4 % |
-| reading 38,862 tokens / writing after it | 883 / 47.7 | 884 / 47.6 | equal |
-| 24 English prompts not in the fit, temperature 0 | 66.8 (66.4-67.2) | 68.5 (68.0-69.3) | +2.6 % |
-| the same at 0.7 / top-p 0.8 / top-k 20 / presence 1.5 | 65.9 (65.5-66.3) | 66.2 (66.0-66.6) | +0.5 % |
-| the same at 1.0 / top-p 0.95 / top-k 20 | 65.9 (64.8-66.6) | 67.5 (66.6-68.9) | +2.4 % |
+**Same bits** (IQ3_S 512k, temperature 0): the first-token logits of 42 requests (bench.py fresh and edit, 24 other prompts)
+were a build of main's bit for bit with the switch off, and with it on; the answers of the 24 were the same to the
+character in both. On bitlamas' file, card-only: the answers of 24 prompts were the same with the rule on, off and with
+full chains.
 
-One run with theta 0.3 for every set came within 1-2 % of these (the optimum is flat). Not measured: other machines,
-UD-Q4_K_XL, IQ3_S, the 2-bit draft layer, `--batch` above 1 (the batch decoder keeps its own drafting).
+**Measured** (2 x P100 at 150 W; three rounds a profile, every run a fresh load; tok/s mean (min-max); bench.py's tests
+and 24 other prompts, 12 English chat and 12 HumanEval tasks, none of them in any fit; "thinking" and "instruct" are the
+model card's two settings, instruct with thinking off):
+
+| test | IQ3_S 512k: planner | FNX_DRAFT_STOP_ISO | | UD-Q4_K_XL 512k: planner | FNX_DRAFT_STOP_ISO | |
+|---|---:|---:|---:|---:|---:|---:|
+| bench.py fresh (temperature 0) | 59.4 (59.2-59.5) | 62.1 (62.0-62.2) | +4.6 % | 39.2 (38.8-39.7) | 39.7 (39.7-39.8) | +1.5 % |
+| edit py | 77.6 (77.5-77.7) | 76.8 (76.8-76.8) | -1.0 % | 37.5 (37.5-37.5) | 37.4 (37.0-37.7) | -0.2 % |
+| edit md | 80.5 (80.0-80.7) | 80.6 (80.1-81.0) | +0.2 % | 37.6 (37.5-37.6) | 37.9 (37.7-38.0) | +0.8 % |
+| reading 38,862 tokens | 940 | 940 | equal | 826 (771-902) | 783 (710-863) | (two load states) |
+| writing after it | 52.5 (52.0-53.0) | 56.7 (56.6-56.9) | +7.9 % | 36.9 (36.4-37.3) | 37.8 (37.6-38.0) | +2.6 % |
+| 24 prompts, temperature 0 | 57.6 (57.5-57.6) | 59.8 (59.8-59.9) | +3.9 % | 34.8 (34.4-35.2) | 34.8 (34.7-35.1) | 0.0 % |
+| the same, thinking | 56.3 (56.3-56.4) | 57.7 (57.5-57.9) | +2.4 % | 33.5 (33.4-33.7) | 33.5 (33.4-33.8) | +0.1 % |
+| the same, instruct | 57.9 (57.7-58.0) | 59.4 (59.3-59.6) | +2.6 % | 34.1 (33.8-34.6) | 33.7 (33.6-33.9) | -1.1 % |
+
+On IQ3_S the rule wins wherever the MTP chain writes and loses 1 % in the .py edit (drafted mostly by prompt lookup). On
+UD-Q4_K_XL, whose rows cost twice as much here, the planner is already as good: only bench.py's fresh and writing after
+the long read move. The tuner's run on IQ3_S (two baselines, the trace, the candidate, a final run; 51 minutes) kept it:
+fresh +4.5 %, writing after the long read +8.4 %, edits -0.7 / +0.3 %, logits the baseline's. On bitlamas' file with
+`FNX_CPU_EXPERTS=1` (our own served setup, English prompts outside the fit): temperature 0 +2.6 %, thinking +2.4 %,
+0.7 / 0.8 +0.5 %, edits +2.3 / -1.4 %. One run with theta 0.3 for every set came within 1-2 % of the fitted thetas there
+(the optimum is flat). Not measured: other machines, Edge0-145B, the 64 GB and 32 GB modes, `--batch` above 1 (the
+batch decoder keeps its own drafting).
 
 ## Benchmark and compare
 
