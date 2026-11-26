@@ -4,7 +4,7 @@
 
 **Big MoE models on two retired Tesla P100s. Loud fans, fast tokens.**
 
-[![Inkling 2 Mini on two Tesla P100: 84 tok/s writing, 965 tok/s reading, an engine of its own](docs/inkling2-banner.jpg)](#-inkling-2-mini-an-engine-of-its-own)
+[![Inkling 2 Mini on two Tesla P100: 97 tok/s writing, 980 tok/s reading, an engine of its own](docs/inkling2-banner.jpg)](#-inkling-2-mini-an-engine-of-its-own)
 
 Qwen3.8-Flash-Next and Edge0-145B with a 512k context on a pair of 2016 server cards,<br>
 and Thinking Machines' **Inkling 2 Mini** on an engine of its own, `ink2`.<br>
@@ -345,6 +345,9 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
   On 56 prompts at 512k (185 W a card): 79.9 → **91.6 tok/s** with drafts and 62.6 → **72.4** without, every answer the same;
   at a depth of 240k tokens 27.3 → 33.3 without drafts (+22 %); on the shared test set fresh writing 71.4 → 81.4 and edits
   139 → 171; reading as before. Every change has a switch whose old value runs the old code; the drafter is the same.
+
+  [![Inkling 2 Mini, patches p47-p57: writing 79.9 to 91.6 tok/s at 512k with the same output, 185 W a card](docs/inkling2-patches-185w.jpg)](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#writing-faster-the-argmax-on-the-cards-and-less-waiting-p47-p57-26-nov)
+
 - **24 Nov 2026 (morning):** 🦑 **Inkling 2 Mini reads 3 % faster on every load** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#two-cards-on-the-one-card-sources-the-exchange-by-numa-node-p38-p41-24-nov)
   (p38-p41, the same bits). On a two-socket server with a card on each, the reading exchange's page-locked buffers landed on
   whichever NUMA node the loading thread ran on, and reading 4k / 30k prompts was 947 / 828 or up to 984 / 851 tok/s by the
