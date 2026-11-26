@@ -137,11 +137,13 @@ local path; checked with one picture a message). Limits: **greedy only** (no sam
 conversation reads only the new part, and so does a prompt that parts from the conversation earlier or comes back after
 another one ([checkpoints and parked conversations](#conversations-keep-their-place-p21-p23)).
 
-## Two reading chunks at once (`INK2_PF_ZIP`, 25 Nov; a contribution, measured on another machine)
+## Two reading chunks at once (`INK2_PF_ZIP`, 25-26 Nov; a contribution, measured on two other machines)
 
-> ⚠️ Not from the machine the rest of this file is measured on. **This one:** 2 × Tesla P100 16 GB, card 0 on PCIe 3.0 x16 and
-> card 1 on a x4 link behind the chipset, an i7-7700 (4 cores), 48 GB of RAM, one NUMA node, CUDA 12.4 with g++ 11, driver
-> 580.159.03. Not run on two x16 links or on two sockets. Off by default: without the switch `build/ink2_v1` is the build before.
+> ⚠️ Not from the machine the rest of this file is measured on, but from two others. **A:** 2 × Tesla P100 16 GB, card 0 on
+> PCIe 3.0 x16 and card 1 on a x4 link behind the chipset, an i7-7700 (4 cores), 48 GB of RAM, one NUMA node, CUDA 12.4 with
+> g++ 11, driver 580.159.03; everything below is from A unless it says B. **B** ([below](#a-second-machine-x8--x16-two-sockets)):
+> 2 × Tesla P100 at 150 W, card 0 on x8 (node 0) and card 1 on x16 (node 1), 2 × Xeon E5-2696 v3, 125 GB, CUDA 12.8 with
+> g++ 14. Not run on two x16 links or above 150 W. Off by default: without the switch `build/ink2_v1` is the build before.
 
 `INK2_PF_ZIP=2` reads two consecutive chunks (2,048 tokens each) at once. Each card still has one stream; the two chunks'
 steps take turns on it, and a step ends where an exchange between the cards starts. So a chunk's exchange (18.9 MB each way,
@@ -159,8 +161,8 @@ takes 0.36 s off the 2.82 s of a chunk at 16k.
   spare beside the experts (804 MiB at 256k, 292 at 512k here, so 40 are left at 512k). **When it does not fit, the switch turns itself off** and
   says so, so no expert goes to RAM for it (checked before the buffers are taken and again after, since the driver rounds
   allocations up).
-- **Its exchange buffers** (two of 18 MiB a card, page-locked) are placed by `INK2_NUMA` like p41's; on one node that could
-  not be measured.
+- **Its exchange buffers** (two of 18 MiB a card, page-locked) are placed by `INK2_NUMA` like p41's. On B (two nodes) they
+  landed where each setting says, and the three settings read within 0.4 % of each other.
 - The chunks of a read go in pairs from its start and an odd last one goes alone; a piece below 2,048 + `INK2_PF_MIN`
   tokens is one chunk and reads as before.
 
@@ -222,6 +224,35 @@ While a 36.7k-token prompt is read with the switch on, card 1 (the x4 one) is bu
 (`nvidia-smi`, 0.5 s samples; measured before the buffers' last trim, 324 MiB then): reading is bound by card 1's compute,
 no longer by the link.
 
+### A second machine: x8 + x16, two sockets
+
+B: 2 × Tesla P100 16 GB capped at 150 W (77-79 °C at most), card 0 on PCIe 3.0 x8 on node 0, card 1 on x16 on node 1, 2 ×
+Xeon E5-2696 v3 (36 cores), 125 GB, CUDA 12.8, g++ 14 (`HOST_CXX=g++-14`), driver 580.178.04. Both builds from clean clones
+with `build.sh` (1aa0abe and this branch), the files from `setup.sh` on a box that did not have them. One load an arm.
+
+- **Bits:** the same battery as above, against 1aa0abe's build: no switch 21 of 21, `INK2_PF_ZIP=2` 22 of 22 and again 21 of
+  21, `INK2_PF_ZIP=3` 9 of 9, `INK2_NUMA=0` and `=2` with the switch 9 of 9 each, 512k without the switch 21 of 21 and with it
+  22 of 22 (with a 60k prompt). Every hash the same.
+- **Reading, request by request:** with the switch 3.4-5.5 % faster than 1aa0abe at 256k (the 36k read 725.4 → 755.5 tok/s) and
+  3.5-8.0 % at 512k (the 60k read 634.6 → 662.4). Without the switch at 512k within 0.5 % of 1aa0abe; at 256k it read
+  1.6-2.5 % slower in the battery, but it ran second, on cards up to 5 °C warmer and 15-18 MHz slower than 1aa0abe's arm, and
+  through the server (below, each from cool cards) the two are the same.
+- **`tools/bench.py`** (256k, each on a freshly started server, cards at or below 60 °C):
+
+  | | 1aa0abe | this build, no switch | `INK2_PF_ZIP=2` |
+  |---|---|---|---|
+  | fresh | 81.6 | 81.5 | 81.6 |
+  | edit | 85.1 | 85.2 | 85.1 |
+  | the 34,701-token read | 709.5 | 711.3 | **753.0** (+6.1 %) |
+  | writing after it | 69.7 | 69.9 | 70.2 |
+
+- **Why less than on A:** while a 44k prompt is read without the switch, card 0 (x8) is busy 99 % of the time and card 1 (x16)
+  96 %, at 100 % in only 19 % of the samples: card 1 waits for the exchanges. With the switch both are busy 99 % (card 1 at
+  100 % in 98 % of the samples), 671.6 → 710.6 tok/s. The exchange was a shorter wait on x8 / x16 than on A's x4.
+- **VRAM:** 800 MiB to spare beside the experts at 256k, 288 at 512k (36 left with the switch); no expert in RAM in any arm.
+- **The exchange buffers by node:** `INK2_NUMA=1` put card 0's on node 0 and card 1's on node 1, `=0` both cards' on node 0,
+  `=2` each on the other card's node, as the engine's lines say; the reads: 801.5, 803.0 and 804.4 tok/s (short set).
+
 **Tried and left out** (same bits each, measured on an experimental build that is not in this branch):
 
 - `INK2_PF_ZIP=3` (it is in: three chunks at once, 504 MiB a card): 787.6 tok/s against 780.7 with two in the battery. Nothing left to hide with a third chunk, and at 512k it does not fit.
@@ -230,9 +261,9 @@ no longer by the link.
 - The attention's out projection and its exchange a slice as soon as its query blocks are done: 718.5 at 16k (one block a
   chunk there), 661.0 against 664.7 at 36k.
 
-**Not run:** two x16 links (an exchange waits there in the same way, for the 2.99-3.40 ms this file gives for it, so a
-smaller gain is to be expected; not measured); two sockets; one card and `INK2_XSPLIT=1` (the switch says that it is off there); `src-1c/`,
-`src-tpb/` and `src-pp/` are untouched.
+**Not run:** two x16 links, and anything above 150 W on B (the gain should be smaller there than B's 4-8 %, by how B's x16 card
+waited; not measured); one card and `INK2_XSPLIT=1` (the switch says that it is off there); a second load of each arm on B;
+`src-1c/`, `src-tpb/` and `src-pp/` are untouched.
 
 ## Two cards on the one-card sources, the exchange by NUMA node (p38-p41, 24 Nov)
 
