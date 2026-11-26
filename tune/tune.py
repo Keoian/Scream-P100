@@ -28,20 +28,20 @@ Groups (--only):
   ple       FNX_PLE_RAM 0 / 1 (the 26.8 GiB lookup table in RAM or read from the disk), only when the RAM allows it
   stage     FNX_PF_STAGE_MIB / FNX_PF_TAIL_MIB (the prompt path's staging buffers and lent slots); not in the default set,
             as ours are at the size of the largest layer already and smaller ones were slower on ours
-  draft     FNX_DRAFT_STOP_ISO, the learned stop rule for the MTP chain (docs/GUIDE.md, "The learned stop rule"): one load
-            traces full chains (FNX_DRAFT_ADAPT=0 FNX_DRAFT_MIN_P=0 FNX_DRAFT_TRACE) over tune/stop_iso_prompts.json at its
-            samplings (none of them bench.py's prompts), tune/stop_iso_fit.py fits this model's, draft layer's and machine's
-            tables from it, and the next load measures them against the length planner; kept, the tables are written next
-            to --out (stop_iso.txt). It only chooses which drafts are checked: the logits stay the baseline's
   convcache --conversation-cache-mib, only when the baseline came close to swapping (it changes RAM, not speed)
   cpu_exact the exact CPU path: FNX_CPU_EXPERTS=1 with FNX_CPU_EXACT=1 (docs/GUIDE.md, "The exact CPU path"). The CPU computes a
             part of a window's missing experts with the cards' own arithmetic while the copy engine brings the others, so the
             answers are the starting profile's bit for bit and the group needs no option. It finds FNX_CPU_SHARE=A,B (the CPU's
             per cent of the misses in a window of 1 row and of 16): A of 50, 30, 70 with check.py's guess for B, then B ±15,
             then A ±10; then FNX_CPU_WARM=1, FNX_CPU_MIN_T=3 and FNX_CPU_THREADS on both hyperthreads (alone, and with B +15:
-            more threads pay only when the CPU has more to do), each kept only if it gains. Last in the default set. A second
+            more threads pay only when the CPU has more to do), each kept only if it gains. In the default set, before draft. A second
             run from the tuned profile goes on from where the first stopped. A profile that keeps it is loaded once more with FNX_CPU_CHECK=1 (every row the
             CPU computed against the card's own, on both cards) and is written only if no value differed in a bit
+  draft     FNX_DRAFT_STOP_ISO, the learned stop rule for the MTP chain (docs/GUIDE.md, "The learned stop rule"): one load
+            traces full chains (FNX_DRAFT_ADAPT=0 FNX_DRAFT_MIN_P=0 FNX_DRAFT_TRACE) over tune/stop_iso_prompts.json at its
+            samplings (none of them bench.py's prompts), tune/stop_iso_fit.py fits this model's, draft layer's and machine's
+            tables from it, and the next load measures them against the length planner; kept, the tables are written next
+            to --out (stop_iso.txt). It only chooses which drafts are checked: the logits stay the baseline's
 FNX_ROUTE_PRIOR (lossy: other answers) is tried only with --allow-lossy, and the logits then differ by design.
 FNX_CPU_EXPERTS=1 (the experts that are not in VRAM computed on the CPU; docs/GUIDE.md, "Missing experts on the CPU") is
 tried only with --allow-cpu-experts, last, on top of what the exact groups kept: it is for a machine whose cards
@@ -83,7 +83,7 @@ import bench  # noqa: E402
 
 METRICS = {"fresh": ("fresh",), "edit": ("edit_py", "edit_md"), "long": ("long_read", "long_write"), "medium": ("medium",)}
 MIN_GAIN = {"fresh": 4.0, "long_write": 4.0}   # clock-sensitive; the others take --min-gain
-GROUPS = ("prefetch", "dma", "experts", "ple", "draft", "convcache", "cpu_exact")
+GROUPS = ("prefetch", "dma", "experts", "ple", "convcache", "cpu_exact", "draft")
 # the only switches it changes: output effect "none" in docs/SWITCHES.md; the two below only with their options
 INEXACT = {"FNX_ROUTE_PRIOR": "allow_lossy", "FNX_CPU_EXPERTS": "allow_cpu_experts"}
 EXACT = {"FNX_PREFETCH", "FNX_PREFETCH_WANT", "FNX_PREFETCH_MIN_T", "FNX_PREFETCH_FILE", "FNX_DMA_SPLIT", "FNX_EXPERT_DYN_GIB",
@@ -406,17 +406,17 @@ class Tuner:
         if "stage" in groups:
             s, t = int(e.get("FNX_PF_STAGE_MIB", 384)), int(e.get("FNX_PF_TAIL_MIB", 2450))
             out.append(("stage", [{"FNX_PF_STAGE_MIB": s // 2, "FNX_PF_TAIL_MIB": t - s}, {"FNX_PF_TAIL_MIB": t + 512}]))
-        if "draft" in groups:
-            if "--mtp" not in self.base["args"] or int(self.arg("--spec") or 1) < 2:
-                self.log("draft: the profile drafts with no MTP chain (--mtp, --spec 2 or more): FNX_DRAFT_STOP_ISO not tried")
-            else:   # the tables come from a trace first (draft_tables, in run)
-                out.append(("draft", [{"FNX_DRAFT_STOP_ISO": "(the tables of the draft trace)"}]))
         if "cpu_exact" in groups:
             why = self.cpu_experts_unfit(e)
             if why:
                 self.log(f"cpu_exact: FNX_CPU_EXACT not tried: {why}")
             else:
                 out += self.plan_cpu_exact(e, hint or {})
+        if "draft" in groups:
+            if "--mtp" not in self.base["args"] or int(self.arg("--spec") or 1) < 2:
+                self.log("draft: the profile drafts with no MTP chain (--mtp, --spec 2 or more): FNX_DRAFT_STOP_ISO not tried")
+            else:   # the tables come from a trace first (draft_tables, in run)
+                out.append(("draft", [{"FNX_DRAFT_STOP_ISO": "(the tables of the draft trace)"}]))
         if self.a.allow_cpu_experts:
             why = self.cpu_experts_unfit(e)
             if why:
@@ -594,7 +594,8 @@ class Tuner:
         self.log("plan: " + "; ".join(f"{g}: " + (" | ".join(fmt(c) for c in cs) if isinstance(cs, list) else "from what the groups before kept")
                                       for g, cs in plan))
         late = {"cpu_exact_wide": 2, "cpu_exact_small": 2}
-        n = 2 + sum(len(cs) if isinstance(cs, list) else late.get(g, 1) for g, cs in plan) + 1 + (1 if any(g == "cpu_exact" for g, _ in plan) else 0) + sum(1 for g, _ in plan if g == "draft")   # the draft group's trace load
+        n = 2 + sum(len(cs) if isinstance(cs, list) else late.get(g, 1) for g, cs in plan) + 1 + (1 if any(g == "cpu_exact" for g, _ in plan) else 0) \
+            + sum(1 for g, _ in plan if g == "draft")   # the draft group's trace load
         self.log(f"about {n} loads of 8-12 minutes each: {n * 10 // 60} h {n * 10 % 60} min (fewer with --screen)")
         if a.dry_run:
             return "dry-run"
