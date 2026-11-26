@@ -10,7 +10,7 @@ Qwen3.8-Flash-Next and Edge0-145B with a 512k context on a pair of 2016 server c
 and Thinking Machines' **Inkling 2 Mini** on an engine of its own, `ink2`.<br>
 Built and measured for exactly **two Tesla P100 16 GB, each on its own PCIe 3.0 x16 link**.<br>
 Flash-Next IQ3_S: **~67 tok/s writing · 110+ tok/s edits · ~1,000 tok/s reading a 38k-token prompt**.<br>
-Inkling 2 Mini (`ink2`, exact): **~97 tok/s writing · ~100 tok/s Koda edits · ~980 tok/s reading · a chat's next turn in under a second · 256k or 512k context · pictures**.
+Inkling 2 Mini (`ink2`, exact): **~97 tok/s writing · ~100 tok/s Koda edits · ~1,030 tok/s reading · a chat's next turn in under a second · 256k or 512k context · pictures**.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![GPU: 2× Tesla P100](https://img.shields.io/badge/GPU-2%C3%97%20Tesla%20P100%2016%20GB-76b900?logo=nvidia&logoColor=white)
@@ -24,7 +24,7 @@ Inkling 2 Mini (`ink2`, exact): **~97 tok/s writing · ~100 tok/s Koda edits · 
 </div>
 
 > 🦑 **New: Inkling 2 Mini on the same two P100s**, with an engine of its own (`ink2`): the whole model in VRAM, every sum
-> exact, ~97 tok/s writing with its DSpark drafter (15 % faster since 26 Nov), ~980 tok/s reading, a 256k or a 512k context and pictures; llama.cpp
+> exact, ~97 tok/s writing with its DSpark drafter (15 % faster since 26 Nov), ~1,030 tok/s reading (5 % faster since 26 Nov, midday), a 256k or a 512k context and pictures; llama.cpp
 > did 13 / 143 on the same cards. **A chat keeps its place:** the next turn reads only its new messages (0.76 s to the first
 > byte instead of ~20 s on a 16k chat), other conversations wait in RAM, and **since 23 Nov such short reads are 18-22 %
 > faster** (128 new tokens in 336 ms instead of 409). **And since 23 Nov on one P100 too** ([`ink2_1c`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#one-p100-ink2_1c-23-nov)): 40 tok/s
@@ -52,7 +52,7 @@ and reads at about **1,000**.
 ## ✨ Highlights
 
 - 🦑 **Inkling 2 Mini on an engine of its own (`ink2`):** the whole model in VRAM, every sum exact, **97.2 tok/s writing,
-  980 tok/s reading, ~100 tok/s on code edits**, 256k or 512k context, pictures, and a chat's next turn in 0.76 s. llama.cpp
+  1,031 tok/s reading, ~100 tok/s on code edits**, 256k or 512k context, pictures, and a chat's next turn in 0.76 s. llama.cpp
   does 13.0 / 143 on the same two cards. [Numbers](#inkling-2-mini-ink2-on-the-same-two-cards) · [what it is](#-inkling-2-mini-an-engine-of-its-own).
 - 🧠 **Big MoE on old iron:** Qwen3.8-Flash-Next (IQ3_S or UD-Q4_K_XL) and Edge0-145B (6.6B active) on two 16 GB cards.
 - ⚡ **Fast drafting:** the MTP draft layer plus prompt lookup of up to 15 tokens. On IQ3_S with 96 GB of RAM, code and
@@ -150,7 +150,7 @@ across the same two cards, its greedy outputs match ours:
 | ✍️ Fresh writing, no drafts | 13.0 tok/s | **72.2 tok/s** |
 | ✍️ Fresh writing, DSpark drafts + prompt lookup | not available | **97.2 tok/s** |
 | ✏️ Code edits (a file repeated with a change / Koda's 26 edit tasks) | not measured | **100.7 / 97.4 tok/s** |
-| 📖 Reading a 4k / 14k / 40k-token prompt | 143 / 119 / not measured | **980 / 917 / 798 tok/s** |
+| 📖 Reading a 4k / 14k / 40k-token prompt | 143 / 119 / not measured | **1,031 / 917 / 798 tok/s** |
 | 💬 A chat's next turn (a 16k-token chat, first byte) | not measured | **0.76 s** (~20 s without checkpoints) |
 | Context | 32k measured | **256k or 512k** (needle found at 239k / 496k) |
 | VRAM a card | 14.0-14.5 GB | 8.9 GB writing only, 15.2 GiB with the drafter at 256k or 512k |
@@ -217,7 +217,7 @@ Thinking Machines' **Inkling 2 Mini** (26.4B looped MoE: layers 6-17 run three t
 P100 16 GB with an **engine of its own**, `ink2` (`engine-inkling2/`): both cards on every layer at once, and here the whole
 model fits in VRAM (8.9 GB a card), so nothing streams over PCIe. Xylolabs's NVFP4-Q8_0 GGUF with Unsloth's DSpark drafter
 (the model's MTP). On our machine, everything exact: **72.2 tok/s** writing without drafts and **97.2** with them (26 Nov),
-**~100 tok/s** on Koda's edit tasks, **~980 tok/s** reading a 4k prompt (917 at 14k, 796 at 37.6k, at either context). Two
+**~100 tok/s** on Koda's edit tasks, **~1,030 tok/s** reading a 4k prompt (917 at 14k, 796 at 37.6k, at either context). Two
 context options: **256k** (the KV cache in f16; a needle found at 239k) or **512k** (the long part of the KV cache in int8,
 the first 32k tokens bit for bit as 256k, the same speed; a needle found at 496k). llama.cpp did 13.0 tok/s writing and 143
 reading on the same cards; its greedy outputs match ours. On the test set of our Flash-Next builds it writes fresh answers
@@ -330,7 +330,7 @@ settles. What has and has not been tested is in [Known limitations](docs/GUIDE.m
 | [tune/README.md](tune/README.md) | `check.py` and `tune.py`: diagnose and tune your own machine |
 | [Branch `poc-4x-p100`](https://github.com/Megla123/Scream-P100/tree/poc-4x-p100/docs/POC-4X.md) | ⚠️ **Unverified proof of concept**, never run on four cards: a build for four P100 behind one PCIe switch (`build.sh --4x`) |
 | [Branch `m40-2x`](https://github.com/Megla123/Scream-P100/blob/m40-2x/docs/M40.md) | ⚠️ **Test build** for two Tesla M40 24 GB (sm_52), measured on one machine only: IQ3_XXS, 256k, 32 GB of RAM (`build.sh --m40`) |
-| [Branch `inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md) | Thinking Machines' Inkling 2 Mini on the same two P100, an engine of its own (`ink2`), measured on one machine only: the whole model in VRAM, exact, ~97 tok/s writing, ~980 tok/s reading, 256k or 512k context, pictures, a chat's next turn in under a second (`engine-inkling2/`); also on **one P100** (`ink2_1c`): 40 tok/s writing within 8 GB of RAM, 48 lossy within 6 GB; **several chats at once** (test builds `ink2_tpb` / `ink2_pp`): 136 tok/s in all with 4 agents, 162-166 with 6 |
+| [Branch `inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md) | Thinking Machines' Inkling 2 Mini on the same two P100, an engine of its own (`ink2`), measured on one machine only: the whole model in VRAM, exact, ~97 tok/s writing, ~1,030 tok/s reading, 256k or 512k context, pictures, a chat's next turn in under a second (`engine-inkling2/`); also on **one P100** (`ink2_1c`): 40 tok/s writing within 8 GB of RAM, 48 lossy within 6 GB; **several chats at once** (test builds `ink2_tpb` / `ink2_pp`): 136 tok/s in all with 4 agents, 162-166 with 6 |
 | [Branch `hy4-test`](https://github.com/Megla123/Scream-P100/blob/hy4-test/docs/HY4.md) | ⚠️ **Test build** for Tencent Hy4 flash on the same two P100, an engine of its own, measured on one machine only: IQ3_XXS, 64k, 96 GB of RAM, 337 / 442 tok/s reading (`engine-hy4/`) |
 | [NOTICE.md](NOTICE.md) · [docs/PROVENANCE.md](docs/PROVENANCE.md) · [docs/upstream-v0.2.10.diff](docs/upstream-v0.2.10.diff) | What is ours and what is Strata's, file by file and line by line |
 
@@ -338,6 +338,13 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
 
 ## 📰 News
 
+- **26 Nov 2026 (midday):** 🦑 **Inkling 2 Mini reads over 1,000 tok/s and writes up to 16 % faster deep into a long
+  context** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#attention-at-depth-and-two-reading-chunks-at-once-p59-p61-pr-15-26-nov)
+  (the same bits). Keoian's [#15](https://github.com/Megla123/Scream-P100/pull/15) reads two chunks of a prompt at once, so
+  one chunk's exchange between the cards crosses PCIe while the other computes: on our two x16 cards at 185 W 981 → **1,031
+  tok/s** at 4k, +3.7 % at 30k, and it is on by default now. A draft window's rows now read the full layers' keys and values
+  once instead of once a row, and the attention's parts are joined by more blocks: writing with drafts at a depth of 64k /
+  128k / 240k tokens 76.7 / 46.0 / 33.2 → **81.2 / 50.8 / 38.4 tok/s**. Short prompts write as before, every answer the same.
 - **26 Nov 2026:** 🦑 **Inkling 2 Mini writes 15 % faster** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#writing-faster-the-argmax-on-the-cards-and-less-waiting-p47-p57-26-nov)
   (p47-p57, the same bits). Each card now picks the next token itself instead of sending 0.4 MB of logits a row to the host,
   the cards swap a single token's values as 8-byte words with a sequence number (no fence, no flag), a full-attention
