@@ -4,7 +4,7 @@
 
 **Big MoE models on two retired Tesla P100s. Loud fans, fast tokens.**
 
-[![Inkling 2 Mini on two Tesla P100: 97 tok/s writing, 980 tok/s reading, an engine of its own](docs/inkling2-banner.jpg)](#-inkling-2-mini-an-engine-of-its-own)
+[![Inkling 2 Mini on two Tesla P100: 97 tok/s writing, 1,031 tok/s reading, an engine of its own](docs/inkling2-banner.jpg)](#-inkling-2-mini-an-engine-of-its-own)
 
 Qwen3.8-Flash-Next and Edge0-145B with a 512k context on a pair of 2016 server cards,<br>
 and Thinking Machines' **Inkling 2 Mini** on an engine of its own, `ink2`.<br>
@@ -345,6 +345,9 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
   tok/s** at 4k, +3.7 % at 30k, and it is on by default now. A draft window's rows now read the full layers' keys and values
   once instead of once a row, and the attention's parts are joined by more blocks: writing with drafts at a depth of 64k /
   128k / 240k tokens 76.7 / 46.0 / 33.2 → **81.2 / 50.8 / 38.4 tok/s**. Short prompts write as before, every answer the same.
+
+  [![Inkling 2 Mini, p59 + p61 + PR #15: reading 981 to 1,031 tok/s at 4k, writing at 240k 33.2 to 38.4 tok/s, the same output, 185 W a card](docs/inkling2-kand9b.jpg)](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#attention-at-depth-and-two-reading-chunks-at-once-p59-p61-pr-15-26-nov)
+
 - **26 Nov 2026:** 🦑 **Inkling 2 Mini writes 15 % faster** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#writing-faster-the-argmax-on-the-cards-and-less-waiting-p47-p57-26-nov)
   (p47-p57, the same bits). Each card now picks the next token itself instead of sending 0.4 MB of logits a row to the host,
   the cards swap a single token's values as 8-byte words with a sequence number (no fence, no flag), a full-attention
