@@ -42,7 +42,7 @@ endif()
 add_subdirectory(${SCREAM_ENGINE_DIR} split)
 
 # p100_compat.h is force-included in every CUDA source (sm_60 has no dp4a or nanosleep), as in the production build
-foreach(_t strata-split-2 strata-split-3 strata-split-4 split_fnx_run split_moe_tile_test)
+foreach(_t strata-split-2 strata-split-3 strata-split-4 split_fnx_run split_moe_tile_test split_cpu_exact_gpu_test)
   if(TARGET ${_t})
     target_compile_options(${_t} PRIVATE
                            "$<$<COMPILE_LANGUAGE:CUDA>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/engine/p100_compat.h>")

@@ -1084,6 +1084,14 @@ loss (the earlier experiment on branch `cpu-experts`, another implementation wit
 machine looks like it, and `tune/tune.py --allow-cpu-experts` measures it there (on that server: kept, at fresh +38 %
 and edits +145 % and +159 % in its final run on UD-Q4_K_XL).
 
+**Bit for bit (`FNX_CPU_EXACT=1`).** The CPU's fp32 sums are close to the cards' but not the same bits, and which
+experts are in VRAM at a window depends on timing, so runs with the CPU path differ from runs without it, and from each
+other. `FNX_CPU_EXACT=1` beside the switch makes the CPU compute with the card's own arithmetic, and
+`FNX_CPU_SHARE=A,B` shares a window's missing experts between the copy engine and the CPU: the answers are then the
+cards-only profile's byte for byte, at 56 tok/s on fresh text and 101-106 on the edits with bitlamas' file (47.6 and
+54-55 without the CPU path, 60 and 110-118 with the fp32 path) on the server below. It has a section of its own:
+[The exact CPU path](#the-exact-cpu-path).
+
 It is off by default, and with it off the engine gives the same bits as before (below). It needs the copy engine's
 path (`FNX_P100_DMA=1`, the P100 row kernels: the profiles have both), a CPU with AVX2, FMA and F16C, every routed
 expert's copy in RAM (the 96 GB mode: not `--ram 64` with UD-Q4_K_XL, not `--ram 32`), and expert types its decoders
@@ -1263,6 +1271,90 @@ would give both; it is not written. With the switch off the engine is as repeata
 - Not for `FNX_SSD_EXPERTS` (the low-RAM engine: its experts' copies are not all in RAM), `FNX_LATENT` (Edge0) or types
   without a decoder; the switch says why and stays off. Not built on HIP (this repository builds for CUDA only); the new code uses the driver calls `p100_dma.cuh` uses.
 
+## The exact CPU path
+
+`FNX_CPU_EXPERTS=1` ([above](#missing-experts-on-the-cpu)) is fast, but the CPU's fp32 sums are not the cards' bits and
+a run with it differs from a run without it, and from the next run with it. `FNX_CPU_EXACT=1` beside it makes the CPU do
+the card's own arithmetic. The engine's answers are then the same profile's without any CPU switch, byte for byte: the
+same logits and the same text, whatever is in VRAM at a window and however the threads are timed. It is for the same
+machines (a card that receives its experts slowly, CPUs with cores to spare) when the bits matter: a profile that has
+to stay comparable with the cards-only one, or with somebody else's results.
+
+```json
+"env": { "FNX_CPU_EXPERTS": "1", "FNX_CPU_EXACT": "1", "FNX_CPU_SHARE": "70,75", "FNX_CPU_THREADS": "32" }
+```
+
+Those two numbers and the thread count are our server's. For another machine,
+`python3 tune/tune.py --data DATA --only cpu_exact` measures them and writes the profile (about 2.5 hours;
+[tune/README.md](../tune/README.md)); it needs no option, because the answers do not change, and it writes the profile
+only after a run that compares every row the CPU computed with the card's own.
+
+**Measured** on the server of the section above (two Tesla P100 16 GB at a 150 W cap, card 0 on PCIe 3.0 x8, one card
+at each of 2 x Xeon E5-2696 v3), 24 Nov 2026, three rounds, every run a fresh load, `bench/bench.py`, tok/s:
+
+| tok/s | cards only | `FNX_CPU_EXPERTS=1` | with `FNX_CPU_EXACT=1` and the share | exact against cards only |
+|---|---:|---:|---:|---:|
+| **File A** (bitlamas' Q4_K_XL-IQ4NL): fresh writing | 47.6 | 59.7 | 56.2 | +18 % |
+| edit py | 53.9 | 110.1 | 101.0 | +87 % |
+| edit md | 54.9 | 117.5 | 105.6 | +92 % |
+| writing after a 38,862-token read | 41.9 | 47.2 | 45.1 | +8 % |
+| **File B** (Unsloth's UD-Q4_K_XL): fresh writing | 36.8 | 52.3 | 50.9 | +38 % |
+| edit py | 37.5 | 92.8 | 82.0 | +118 % |
+| edit md | 37.5 | 97.4 | 84.0 | +124 % |
+| writing after a 38,862-token read | 34.1 | 44.2 | 42.5 | +25 % |
+
+Means of three rounds. The cards-only column is the engine before the CPU path (this one with no CPU switch gives its
+logits and its speeds), the fp32 column `FNX_CPU_EXPERTS=1` alone. On bitlamas' file two of the three cards-only runs
+had requests stalled on the host, and its fresh-writing number is the undisturbed run's
+([HANDOFF-FNX_CPU_EXACT.md](HANDOFF-FNX_CPU_EXACT.md) has every run). The exact path gives up 6-10 % against the fp32
+one on bitlamas' file and 3-14 % on UD-Q4_K_XL, and gives the cards' bits for it. Reading a prompt does not use
+either path.
+
+**How the bits are kept.** The CPU rounds each weight to fp16 as the card decodes it (Q4_K/Q5_K: fp16(q * fp16(d sc) +
+fp16(-dmin m)), one rounding), sums each 32-value run in the card's two fp16 FMA chains (the even values, the odd ones,
+16 steps each from +0), adds the run into fp32 as s + (lo + hi), and adds a gate|up row's lanes in the order of the
+warp's shuffle. An fp16 FMA is done in fp32 registers: a product of two fp16 values is exact in fp32; with the rounding
+mode set toward zero one FMA gives the truncated sum and a second one says whether anything was cut off; the last bit
+is set if so (the sum rounded to odd), and the conversion to fp16 rounds that to nearest. That is the correctly rounded
+fp16 result, which is what the card's HFMA2 gives. The SwiGLU between gate|up and down cannot be done on a CPU (the
+card's `__expf` and division under `--use_fast_math` are approximations of its own), so the card does it: it fetches the
+CPU's gate|up sums from mapped host memory, computes h with the expression it uses for its own experts and posts it
+back, each way with a sum the other side checks, and the CPU computes down from it.
+[HANDOFF-FNX_CPU_EXACT.md](HANDOFF-FNX_CPU_EXACT.md) has the argument, the tests and what was tried.
+
+**The share.** The exact sums cost the CPU about twice the fp32 ones (111 against 50 us an expert in a 16-row window
+here), so it does not pay to give the CPU every missing expert. `FNX_CPU_SHARE=A,B` shares them: the planner gives a
+part of the layer's missing experts slots, as without the CPU path, and lists the others for the CPU; the copies, the
+cards' second phase for the copied ones and the CPU's list then run at the same time. The CPU gets the experts that
+the fewest rows use (a copy costs the same however many rows use the expert, the CPU's work grows with them): A per
+cent of the missing ones in a window of 1 row, B per cent in one of 16, a line between. The copied experts stay in
+VRAM, so the cache keeps following the text. Every pair of numbers gives the same bits; they change only the speed.
+Without `FNX_CPU_SHARE` the CPU takes every missing expert, which was slower than no CPU path at all on fresh text here
+(37.9 tok/s against 47.6, one run of an earlier build of these kernels). `FNX_CPU_THREADS` above the cores of a card's
+CPU puts the extra threads on the cores' second hyperthreads; 32 was worth 4-7 % on the edits here, together with the
+larger 16-row share.
+
+**Checking it on your machine.** `FNX_CPU_CHECK=1` beside the switches makes the copy engine and the cards compute
+every window as without the path and compares each row the CPU computed with the card's own; the log's report counts
+the values that are not bit for bit (`0 values`), by stage. `tune.py` runs this for the profile it writes. The two test
+programs (`split_cpu_exact_test`, and `split_cpu_exact_gpu_test 0` and `1` with the cards free; build with
+`-DSTRATA_BUILD_TESTS=ON`) check the CPU's step against an integer oracle and the card's operations and kernels against
+the CPU's. Here: `FNX_CPU_CHECK=1` found 0 values that are not the card's bits in 3.2 million rows a card on bitlamas'
+file and 3.3 million on UD-Q4_K_XL; `bench.py`'s 27 first-token logits were the cards-only run's byte for byte in each
+of three rounds on each file; HumanEval's 164 greedy answers were the cards-only run's, text for text, on both, and so
+were eight greedy answers under `FNX_VRAM_CHURN=600` and the picture sequence with `--vram-elastic`; the check with a
+control vector (`FNX_CVEC`) found 0 values on both; and the decode-path yardstick's file was the cards-only run's on
+both.
+
+**Limits.** What `FNX_CPU_EXPERTS` needs (above), and gate|up Q4_K or Q5_K with down IQ4_NL, Q5_1 or Q8_0
+(UD-Q4_K_XL's types and bitlamas' Q4_K_XL-IQ4NL's), `FNX_ROW_G` 1, 2, 4 or 8 and `FNX_ROWS_G2` unset, as the profiles
+have them; otherwise the engine says why at the load and keeps the fp32 path. Slower than the fp32 path. And it pays
+only on a machine like the one above: on the maintainer's (both cards on x16, 2 x Xeon Bronze 3106 with 8 cores a
+socket at 1.7 GHz; their measurement of 24 Nov 2026) it gives the cards' bits too (`FNX_CPU_CHECK=1` 0 values, the
+logits byte for byte) and is slower than the cards alone at every share tried: 41.9 tok/s of fresh text with
+`FNX_CPU_SHARE=25,40`, 37.3 with `40,40` and 28.9 with `60,60` against 51.8-54.8. `tune.py` keeps the path only where
+it gains, so there it leaves the profile as it was. A machine with both cards on x16 and fast CPUs is not measured.
+
 ## Benchmark and compare
 
 With the server running:
@@ -1383,7 +1475,9 @@ python3 tune/tune.py --data /data/flash-next --screen           # 2-3 hours, one
   `--coder`'s expert mask is never changed.
   `FNX_CPU_EXPERTS=1` (see "Missing experts on the CPU") is tried only with `--allow-cpu-experts`: `check.py` names the
   machines it is for (a card on a link of x8 or x4, or otherwise slow to copy to, and CPUs with AVX2 and cores to spare),
-  and it is not bit-exact, so nothing tries or writes it unasked.
+  and it is not bit-exact, so nothing tries or writes it unasked. With `FNX_CPU_EXACT=1` and `FNX_CPU_SHARE` beside it the
+  path gives the cards' bits, and the group `cpu_exact` measures that one without an option
+  ([The exact CPU path](#the-exact-cpu-path)): on our server it kept it on both files.
 - **On our machine** (13 Nov 2026, a test window, the IQ3_S 512k profile at `FNX_ROUTE_PRIOR=0`, engine `c213636c`):
   `check.py` measured 12.3 GB/s to each card, the same from the other CPU's memory and with both cards at once, Gen3 x16
   while copying, and found no bottleneck. `tune.py --screen --only prefetch,dma` took 7 loads (about 70 minutes): the
