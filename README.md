@@ -338,6 +338,11 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
 
 ## 📰 News
 
+- **26 Nov 2026 (afternoon):** 🦑 **Inkling 2 Mini's server breaks a loop across turns** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#loops-in-the-reasoning-the-answer-or-a-tool-call):
+  when a coding agent's conversation ends in the same tool call with the same result 3 times (`INK2_LOOP_TURNS`), the
+  model gets a system message that it is looping, and the same call written anyway is dropped. On a real 17-times loop
+  rebuilt from an agent's database, the model changed its approach at 3, 4 and 10 repeats; other requests are unchanged.
+
 - **26 Nov 2026 (midday):** 🦑 **Inkling 2 Mini reads over 1,000 tok/s and writes up to 16 % faster deep into a long
   context** on branch [`inkling2`](https://github.com/Megla123/Scream-P100/blob/inkling2/docs/INKLING2.md#attention-at-depth-and-two-reading-chunks-at-once-p59-p61-pr-15-26-nov)
   (the same bits). Keoian's [#15](https://github.com/Megla123/Scream-P100/pull/15) reads two chunks of a prompt at once, so
